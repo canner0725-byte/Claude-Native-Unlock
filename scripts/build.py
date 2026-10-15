@@ -11,7 +11,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 
 
 def run(*args):
@@ -39,7 +39,7 @@ def build():
     macos.mkdir(parents=True)
     resources.mkdir()
     shutil.copytree(work/'frozen/NativeUnlockBackend', resources/'Backend', symlinks=True)
-    run('/usr/bin/swiftc', '-O', ROOT/'app/NativeUnlock.swift', '-o', macos/'ClaudeNativeUnlock')
+    run('/usr/bin/swiftc', '-O', '-target', 'arm64-apple-macos15.0', ROOT/'app/NativeUnlock.swift', '-o', macos/'ClaudeNativeUnlock')
     run('/usr/bin/swiftc', ROOT/'app/GenerateIcon.swift', '-o', work/'GenerateIcon')
     run(work/'GenerateIcon', work/'AppIcon.iconset')
     run('/usr/bin/iconutil', '-c', 'icns', work/'AppIcon.iconset', '-o', resources/'AppIcon.icns')
@@ -66,7 +66,7 @@ def build():
         'CFBundleName': 'Claude Native Unlock',
         'CFBundleDisplayName': 'Claude 原生助手',
         'CFBundleExecutable': 'ClaudeNativeUnlock',
-        'CFBundlePackageType': 'APPL', 'CFBundleVersion': '12',
+        'CFBundlePackageType': 'APPL', 'CFBundleVersion': '13',
         'CFBundleShortVersionString': VERSION, 'CFBundleIconFile': 'AppIcon',
         'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '15.0',
         'NSHumanReadableCopyright': 'Copyright © 2026 Claude Native Unlock contributors',

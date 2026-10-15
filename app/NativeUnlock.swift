@@ -262,8 +262,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showWindow()
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Claude 原生助手",
-            .applicationVersion: "0.3.0",
-            .version: "12",
+            .applicationVersion: "0.3.1",
+            .version: "13",
             .credits: NSAttributedString(string: "独立开源项目，与 Anthropic 无隶属关系。\n仅解除已适配版本的原生功能可用性条件。")
         ])
     }
@@ -395,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openButton.isEnabled = supported && !recoveryRequired
         statusLabel.stringValue = result["message"] as? String ?? "检测完成"
         statusLabel.textColor = supported ? .labelColor : .systemOrange
-        versionLabel.stringValue = "Claude \(result["version"] as? String ?? "未知") · 原生助手 0.3.0"
+        versionLabel.stringValue = "Claude \(result["version"] as? String ?? "未知") · 原生助手 0.3.1"
         if (command == "enable" || command == "update") && enabled { showPermissionGuide() }
         execute("status", backend: "native_cli_unlock")
     }
