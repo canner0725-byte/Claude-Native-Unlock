@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Build a self-contained arm64 macOS application and distributable archives."""
+import hashlib
+import importlib.metadata
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+VERSION = '0.3.0'
+
+
+def run(*args):
+    subprocess.run([str(a) for a in args], cwd=ROOT, check=True)
+
+
+def build():
+    if sys.platform != 'darwin' or os.uname().machine != 'arm64':
+        raise SystemExit('当前仅构建已验证的 Apple Silicon 版本。')
+    import PyInstaller  # Build-time dependency only.
+    work = ROOT / 'build' / str(time.time_ns())
+    work.mkdir(parents=True)
+    dist = ROOT / 'dist'
+    dist.mkdir(exist_ok=True)
+    app = dist / 'Claude Native Unlock.app'
+    if app.exists():
+        app.rename(work / 'previous.app')
+    run(sys.executable, '-m', 'PyInstaller', '--onedir', '--name', 'NativeUnlockBackend',
+        '--noupx', '--target-arch', 'arm64', '--paths', ROOT/'src',
+        '--distpath', work/'frozen', '--workpath', work/'pyinstaller',
+        '--specpath', work, ROOT/'src/backend.py')
+    contents = app / 'Contents'
+    macos = contents / 'MacOS'
+    resources = contents / 'Resources'
+    macos.mkdir(parents=True)
+    resources.mkdir()
+    shutil.copytree(work/'frozen/NativeUnlockBackend', resources/'Backend', symlinks=True)
+    run('/usr/bin/swiftc', '-O', ROOT/'app/NativeUnlock.swift', '-o', macos/'ClaudeNativeUnlock')
+    run('/usr/bin/swiftc', ROOT/'app/GenerateIcon.swift', '-o', work/'GenerateIcon')
+    run(work/'GenerateIcon', work/'AppIcon.iconset')
+    run('/usr/bin/iconutil', '-c', 'icns', work/'AppIcon.iconset', '-o', resources/'AppIcon.icns')
+    for name in ['使用说明.html', 'THIRD_PARTY_NOTICES.md']:
+        shutil.copy2(ROOT/name, resources/name)
+    shutil.copy2(ROOT/'LICENSE', resources/'LICENSE')
+    # Keep the redistributable runtime's license with the product.
+    licenses = resources/'ThirdPartyLicenses'
+    licenses.mkdir()
+    distribution = importlib.metadata.distribution('PyInstaller')
+    for entry in distribution.files or []:
+        if str(entry).endswith(('COPYING.txt', 'COPYING', 'LICENSE.txt')):
+            candidate = distribution.locate_file(entry)
+            if candidate.is_file():
+                shutil.copy2(candidate, licenses/('PyInstaller-'+candidate.name))
+    python_license = Path(sys.base_prefix)/'LICENSE.txt'
+    if not python_license.exists():
+        python_license = Path(sys.base_prefix)/'LICENSE'
+    if not python_license.exists():
+        python_license = ROOT/'licenses/Python-LICENSE.txt'
+    shutil.copy2(python_license, licenses/'Python-LICENSE.txt')
+    (contents/'Info.plist').write_bytes(plistlib.dumps({
+        'CFBundleIdentifier': 'local.claude.native-unlock',
+        'CFBundleName': 'Claude Native Unlock',
+        'CFBundleDisplayName': 'Claude 原生助手',
+        'CFBundleExecutable': 'ClaudeNativeUnlock',
+        'CFBundlePackageType': 'APPL', 'CFBundleVersion': '12',
+        'CFBundleShortVersionString': VERSION, 'CFBundleIconFile': 'AppIcon',
+        'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '15.0',
+        'NSHumanReadableCopyright': 'Copyright © 2026 Claude Native Unlock contributors',
+    }))
+    # Nested Python binaries are already ad-hoc signed by PyInstaller.
+    run('/usr/bin/codesign', '--force', '--sign', '-', app)
+    run('/usr/bin/codesign', '--verify', '--deep', '--strict', app)
+    archive = dist/f'Claude-Native-Unlock-{VERSION}-arm64.zip'
+    if archive.exists():
+        archive.rename(work/archive.name)
+    run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
+    image_root = work/'dmg'
+    image_root.mkdir()
+    run('/bin/cp', '-cR', app, image_root/app.name)
+    (image_root/'Applications').symlink_to('/Applications')
+    image = dist/f'Claude-Native-Unlock-{VERSION}-arm64.dmg'
+    if image.exists():
+        image.rename(work/image.name)
+    run('/usr/bin/hdiutil', 'create', '-volname', 'Claude 原生助手', '-srcfolder', image_root,
+        '-format', 'UDZO', image)
+    artifacts = [archive, image]
+    (dist/'SHA256SUMS.txt').write_text(''.join(
+        hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in artifacts))
+    print(app)
+
+
+if __name__ == '__main__':
+    build()

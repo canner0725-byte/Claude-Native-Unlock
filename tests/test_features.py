@@ -1,0 +1,184 @@
+import contextlib
+import io
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]/'src'))
+import native_features as features
+
+
+class NativeConfigurationSafety(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temp.name).resolve()
+        self.data = self.root / 'data'
+        library = self.data / 'configLibrary'
+        library.mkdir(parents=True)
+        self.config = library / 'test.json'
+        self.meta = library / '_meta.json'
+        self.meta.write_text(json.dumps({'appliedId': 'test'}))
+        self.original = {'inferenceProvider': 'gateway', 'inferenceGatewayApiKey': 'SYNTHETIC-SECRET',
+                         'unrelated': {'a': 1}, 'coworkEgressAllowedHosts': ['example.test']}
+        self.config.write_text(json.dumps(self.original))
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.stack = contextlib.ExitStack()
+        for name, value in [('DATA', self.data), ('STATE', self.state)]:
+            self.stack.enter_context(patch.object(features, name, value))
+        self.stack.enter_context(patch.object(features, 'managed', return_value=False))
+        self.stack.enter_context(patch.object(features.official, 'running', return_value=False))
+        self.stack.enter_context(patch.object(features.official, 'status', return_value={
+            'supported': True, 'version': features.official.core.VERSION, 'running': False}))
+
+    def tearDown(self):
+        self.stack.close()
+        self.temp.cleanup()
+
+    def read(self):
+        return json.loads(self.config.read_text())
+
+    def test_roundtrip_preserves_secrets_and_unrelated_config(self):
+        features.change('browser')
+        self.assertEqual(self.read(), {**self.original, 'builtinBrowserEnabled': True})
+        self.assertEqual(os.stat(self.config).st_mode & 0o777, 0o600)
+        for path in self.state.iterdir():
+            self.assertNotIn('SYNTHETIC-SECRET', path.read_text())
+        features.change('browser', restore=True)
+        self.assertEqual(self.read(), self.original)
+
+    def test_restore_keeps_later_unrelated_edits(self):
+        features.change('file-analysis')
+        latest = self.read()
+        latest['unrelated'] = {'a': 2}
+        latest['inferenceGatewayApiKey'] = 'ROTATED-SYNTHETIC-SECRET'
+        self.config.write_text(json.dumps(latest))
+        features.change('file-analysis', restore=True)
+        self.assertNotIn('desktopHome', self.read())
+        self.assertEqual(self.read()['unrelated'], {'a': 2})
+        self.assertEqual(self.read()['inferenceGatewayApiKey'], 'ROTATED-SYNTHETIC-SECRET')
+
+    def test_restore_recovers_preexisting_value(self):
+        self.config.write_text(json.dumps({**self.original, 'desktopHome': 'simple'}))
+        features.change('file-analysis')
+        features.change('file-analysis', restore=True)
+        self.assertEqual(self.read()['desktopHome'], 'simple')
+
+    def test_existing_enabled_value_is_not_taken_over(self):
+        self.config.write_text(json.dumps({**self.original, 'builtinBrowserEnabled': True}))
+        before = self.config.read_bytes()
+        features.change('browser')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(list(self.state.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, '没有本工具'):
+            features.change('browser', restore=True)
+
+    def test_running_application_refuses_all_changes(self):
+        with patch.object(features.official, 'running', return_value=True):
+            for restore in [False, True]:
+                with self.assertRaisesRegex(ValueError, '退出 Claude'):
+                    features.change('browser', restore)
+        self.assertEqual(self.read(), self.original)
+
+    def test_unknown_application_refuses_configuration(self):
+        with patch.object(features.official, 'status', return_value={'supported': False}):
+            with self.assertRaisesRegex(ValueError, '校验未通过'):
+                features.change('browser')
+        self.assertEqual(self.read(), self.original)
+
+    def test_managed_or_bootstrap_configuration_refuses_changes(self):
+        with patch.object(features, 'managed', return_value=True):
+            with self.assertRaisesRegex(ValueError, '管理配置'):
+                features.change('browser')
+        self.config.write_text(json.dumps({**self.original, 'bootstrapUrl': 'https://example.test'}))
+        with self.assertRaisesRegex(ValueError, '配置服务器'):
+            features.change('browser')
+
+    def test_config_identifier_traversal_is_rejected(self):
+        self.meta.write_text(json.dumps({'appliedId': '../outside'}))
+        with self.assertRaisesRegex(ValueError, 'ID 不合法'):
+            features.change('browser')
+
+    def test_symlink_configuration_is_rejected(self):
+        other = self.root / 'elsewhere.json'
+        self.config.rename(other)
+        self.config.symlink_to(other)
+        with self.assertRaises(OSError):
+            features.change('browser')
+        self.assertEqual(json.loads(other.read_text()), self.original)
+
+    def test_concurrent_edit_is_not_overwritten(self):
+        original_read = features.active_config
+        count = 0
+
+        def read():
+            nonlocal count
+            count += 1
+            if count == 2:
+                self.config.write_text(json.dumps({**self.original, 'otherEdit': True}))
+            return original_read()
+
+        with patch.object(features, 'active_config', side_effect=read):
+            with self.assertRaisesRegex(ValueError, '操作期间变化'):
+                features.change('browser')
+        self.assertTrue(self.read()['otherEdit'])
+        self.assertNotIn('builtinBrowserEnabled', self.read())
+
+    def test_interrupted_replace_can_resume_or_restore(self):
+        write = features.atomic_write
+
+        def crash(path, value):
+            if path == self.config:
+                raise OSError('simulated crash before replace')
+            return write(path, value)
+
+        with patch.object(features, 'atomic_write', side_effect=crash):
+            with self.assertRaises(OSError):
+                features.change('browser')
+        features.change('browser')
+        self.assertTrue(self.read()['builtinBrowserEnabled'])
+        features.change('browser', restore=True)
+        self.assertEqual(self.read(), self.original)
+
+    def test_interruption_after_replace_keeps_original_recovery(self):
+        write = features.atomic_write
+        count = 0
+
+        def crash(path, value):
+            nonlocal count
+            count += 1
+            if count == 3:
+                raise OSError('simulated crash after replace')
+            return write(path, value)
+
+        with patch.object(features, 'atomic_write', side_effect=crash):
+            with self.assertRaises(OSError):
+                features.change('browser')
+        features.change('browser', restore=True)
+        self.assertEqual(self.read(), self.original)
+
+    def test_changed_owned_key_is_not_overwritten(self):
+        features.change('file-analysis')
+        self.config.write_text(json.dumps({**self.read(), 'desktopHome': 'no-vm'}))
+        with self.assertRaisesRegex(ValueError, '其他操作修改'):
+            features.change('file-analysis', restore=True)
+        self.assertEqual(self.read()['desktopHome'], 'no-vm')
+
+    def test_status_never_contains_credentials(self):
+        self.assertNotIn('SYNTHETIC-SECRET', json.dumps(features.report()))
+
+    def test_malformed_config_error_does_not_echo_credentials(self):
+        self.config.write_text('{"SYNTHETIC-SECRET": invalid}')
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['native_features.py', 'enable', 'browser']), contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                features.main()
+        self.assertNotIn('SYNTHETIC-SECRET', output.getvalue())
+
+
+if __name__ == '__main__':
+    unittest.main()
