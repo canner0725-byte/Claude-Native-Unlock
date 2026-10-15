@@ -80,4 +80,3 @@ def verify_source(app):
 def replace_once(s, old, new):
  if s.count(old) != 1: raise ValueError('Patch match count != 1: '+old[:90])
  return s.replace(old,new,1)
-

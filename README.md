@@ -1,5 +1,7 @@
 # Claude 原生助手 · Claude Native Unlock
 
+[下载安装包](https://github.com/canner0725-byte/Claude-Native-Unlock/releases/latest) · [源码仓库](https://github.com/canner0725-byte/Claude-Native-Unlock)
+
 中文原生 macOS 应用，为 Claude Desktop 第三方 API（3P）部署管理已适配的原生功能可用性。Swift / AppKit 界面，带菜单栏图标；运行所需 Python 已内置，无需安装 Python、Xcode 或打开终端。
 
 这是独立社区项目，与 Anthropic 无隶属关系。仅分发我们编写的工具；不分发 Claude 安装包、原生模块、第三方 API 密钥、会话数据或个人备份。本工具界面为中文，不代表将 Claude 本体全部汉化。
