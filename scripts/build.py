@@ -11,11 +11,27 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.1'
+VERSION = '0.3.14'
+BUILD_NUMBER = '27'
 
 
 def run(*args):
     subprocess.run([str(a) for a in args], cwd=ROOT, check=True)
+
+
+def prune_artifacts():
+    """发布后只保留当前版本的安装包，构建中间产物全部清理。"""
+    dist = ROOT / 'dist'
+    for path in dist.iterdir():
+        if (path.is_file() and path.name.startswith('Claude-Native-Unlock-')
+                and path.suffix in ('.dmg', '.zip') and f'-{VERSION}-' not in path.name):
+            path.unlink()
+    build_dir = ROOT / 'build'
+    for path in build_dir.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def build():
@@ -66,7 +82,7 @@ def build():
         'CFBundleName': 'Claude Native Unlock',
         'CFBundleDisplayName': 'Claude 原生助手',
         'CFBundleExecutable': 'ClaudeNativeUnlock',
-        'CFBundlePackageType': 'APPL', 'CFBundleVersion': '13',
+        'CFBundlePackageType': 'APPL', 'CFBundleVersion': BUILD_NUMBER,
         'CFBundleShortVersionString': VERSION, 'CFBundleIconFile': 'AppIcon',
         'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '15.0',
         'NSHumanReadableCopyright': 'Copyright © 2026 Claude Native Unlock contributors',
@@ -90,6 +106,7 @@ def build():
     artifacts = [archive, image]
     (dist/'SHA256SUMS.txt').write_text(''.join(
         hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in artifacts))
+    prune_artifacts()
     print(app)
 
 

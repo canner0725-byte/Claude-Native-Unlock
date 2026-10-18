@@ -168,8 +168,32 @@ class NativeConfigurationSafety(unittest.TestCase):
             features.change('file-analysis', restore=True)
         self.assertEqual(self.read()['desktopHome'], 'no-vm')
 
+    def test_record_from_current_42304_version_is_accepted(self):
+        record = {
+            'version': features.official.core.ADAPTER_42304['version'],
+            'configId': self.config.stem,
+            'feature': 'browser',
+            'key': 'builtinBrowserEnabled',
+            'value': True,
+            'beforePresent': False,
+            'phase': 'enabled',
+        }
+        journal = features.record_path(self.config, 'browser')
+        journal.write_text(json.dumps(record))
+        loaded = features.load_record(self.config, 'browser')
+        self.assertEqual(loaded['version'], features.official.core.ADAPTER_42304['version'])
+
     def test_status_never_contains_credentials(self):
         self.assertNotIn('SYNTHETIC-SECRET', json.dumps(features.report()))
+
+    def test_report_reuses_precomputed_application_status(self):
+        application = {'version': features.official.core.VERSION,
+                       'supported': True, 'running': False}
+        with patch.object(features.official, 'status') as status:
+            result = features.report(application)
+        status.assert_not_called()
+        self.assertTrue(result['configWritable'])
+        self.assertTrue(any(item['id'] == 'browser' for item in result['features']))
 
     def test_malformed_config_error_does_not_echo_credentials(self):
         self.config.write_text('{"SYNTHETIC-SECRET": invalid}')

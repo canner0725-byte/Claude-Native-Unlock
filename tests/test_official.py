@@ -1,5 +1,7 @@
 import pathlib
 import plistlib
+import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,123 @@ import official_unlock as official
 
 
 class OfficialSafety(unittest.TestCase):
+    def test_revision6_enable_installs_new_side_session_availability(self):
+        current = {'enabled': True, 'supported': True, 'availabilityOnly': True,
+                   'version': official.core.ADAPTER_37337['version'], 'nativeCodeStateUI': True,
+                   'nativeCodeSideSessions': False}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'update', return_value={'updated': True}) as update:
+            self.assertEqual(official.enable(), {'updated': True})
+            update.assert_called_once()
+
+    def test_revision7_enable_installs_folder_worktree_availability(self):
+        current = {'enabled': True, 'supported': True, 'availabilityOnly': True,
+                   'version': official.core.ADAPTER_37337['version'], 'nativeCodeSideSessions': True,
+                   'nativeCodeFolderWorktrees': False}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'update', return_value={'updated': True}) as update:
+            self.assertEqual(official.enable(), {'updated': True})
+            update.assert_called_once()
+
+    def test_current_folder_worktree_patch_is_idempotent(self):
+        current = {'enabled': True, 'supported': True, 'availabilityOnly': True,
+                   'version': official.core.ADAPTER_37337['version'], 'nativeCodeSideSessions': True,
+                   'nativeCodeFolderWorktrees': True, 'patchRevision': official.PATCH_REVISION}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'update') as update:
+            self.assertEqual(official.enable(), current)
+            update.assert_not_called()
+
+    def test_prompt_suggestion_setting_flag_is_added_once(self):
+        for adapter in [official.core.ADAPTER_37337, official.core.ADAPTER_42304,
+                        official.core.ADAPTER_42304_ARM64]:
+            text = official.core.main_availability(adapter)
+            self.assertEqual(text.count('2120747855:{rule:"forced",value:!0}'), 1)
+
+    def test_revision9_is_offered_update_to_revision10(self):
+        current = {'enabled': True, 'supported': True, 'patchRevision': 9,
+                   'version': official.core.ADAPTER_42304['version']}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'update', return_value={'updated': True}) as update:
+            self.assertEqual(official.enable(), {'updated': True})
+            update.assert_called_once()
+
+    def test_current_revision_update_is_idempotent(self):
+        current = {'enabled': True, 'supported': True, 'patchRevision': official.PATCH_REVISION,
+                   'version': official.core.ADAPTER_42304['version']}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'clone') as clone:
+            self.assertEqual(official.update(), current)
+            clone.assert_not_called()
+
+    def test_prepare_update_restores_patch_and_keeps_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            current = {'enabled': True, 'supported': True, 'running': False}
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'disable', return_value={'enabled': False, 'message': 'restored'}) as disable:
+                result = official.prepare_update()
+            self.assertTrue(result['preparedForUpdate'])
+            self.assertIn('官方更新', result['message'])
+            disable.assert_called_once()
+
+    def test_prepare_update_refuses_running_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            current = {'enabled': True, 'supported': True, 'running': True}
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'disable') as disable:
+                with self.assertRaisesRegex(ValueError, '退出 Claude'):
+                    official.prepare_update()
+                disable.assert_not_called()
+
+    def test_prepare_update_when_already_official(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            current = {'enabled': False, 'supported': True, 'running': False, 'version': '2.42304.0'}
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'manifest', return_value=None), \
+                 patch.object(official, 'disable') as disable:
+                result = official.prepare_update()
+            self.assertTrue(result['preparedForUpdate'])
+            self.assertIn('官方原版', result['message'])
+            disable.assert_not_called()
+
+    def test_diagnose_writes_read_only_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            app = root / 'Claude.app'
+            state = root / 'state'
+            state.mkdir()
+            (app / 'Contents/Resources').mkdir(parents=True)
+            script = (b'var P8t={1291166712:{rule:"forced",value:!0},'
+                      b'2120747855:{rule:"forced",value:!0}};')
+            header = {'files': {'.vite': {'files': {'build': {'files': {'index.js': {
+                'offset': '0', 'size': len(script)}}}}}}}
+            raw = json.dumps(header, separators=(',', ':')).encode()
+            payload = ((len(raw) + 7) // 4) * 4
+            asar = (struct.pack('<IIII', 4, payload + 4, payload, len(raw))
+                    + raw + b'\0' * (payload - 4 - len(raw)) + script)
+            (app / official.ASAR).write_bytes(asar)
+            (app / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': '99.0'}))
+            before = (app / official.ASAR).read_bytes()
+            with patch.object(official, 'TARGET', app), \
+                 patch.object(official, 'STATE', state):
+                report = official.diagnose()
+            self.assertEqual((app / official.ASAR).read_bytes(), before)
+            self.assertTrue(pathlib.Path(report['reportPath']).exists())
+            self.assertFalse(report['knownVersion'])
+            self.assertEqual(report['candidates'][0]['knownFlagCounts']['2120747855'], 1)
+            self.assertEqual(report['candidates'][0]['knownFlagDefinitions']['2120747855'], 1)
+            self.assertIn('var P8t={', report['candidates'][0]['featureTableAnchors'])
+
     def test_rollback_refuses_running_application(self):
         with patch.object(official, 'running', return_value=True), patch.object(official, 'clone') as clone:
             with self.assertRaisesRegex(ValueError, '退出 Claude'):
@@ -54,7 +173,11 @@ class OfficialSafety(unittest.TestCase):
             self.assertEqual(json.loads((state / 'manifest.json').read_text()), record)
 
     def test_update_refuses_running_application(self):
-        with patch.object(official, 'running', return_value=True), patch.object(official, 'clone') as clone:
+        current = {'enabled': True, 'supported': True, 'patchRevision': 9,
+                   'version': official.core.ADAPTER_42304['version']}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'running', return_value=True), \
+             patch.object(official, 'clone') as clone:
             with self.assertRaisesRegex(ValueError, '退出 Claude'):
                 official.update()
             clone.assert_not_called()
@@ -84,7 +207,8 @@ class OfficialSafety(unittest.TestCase):
             target.mkdir()
             (target / 'marker').write_text('previous')
             backup = state / 'official-backup-1.app'
-            backup.mkdir()
+            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             record = {'backup': str(backup), 'installedFiles': {official.ASAR: 'old'}, 'phase': 'enabled'}
             real_rename = pathlib.Path.rename
             def rename(path, destination):
@@ -94,7 +218,7 @@ class OfficialSafety(unittest.TestCase):
             with patch.object(official, 'STATE', state), patch.object(official, 'TARGET', target), \
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
-                 patch.object(official, 'status', return_value={'enabled': True, 'supported': True}), \
+                 patch.object(official, 'status', return_value={'enabled': True, 'supported': True, 'version': official.core.VERSION}), \
                  patch.object(official.core, 'verify_source'), patch.object(official, 'verify_patched'), \
                  patch.object(official.platform, 'machine', return_value='arm64'), \
                  patch.object(official.platform, 'mac_ver', return_value=('27.0.1', (), '')), \
@@ -109,6 +233,9 @@ class OfficialSafety(unittest.TestCase):
     def test_interrupted_install_exposes_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
+            backup = state / 'official-backup-1.app'
+            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             with patch.object(official, 'STATE', state), \
                  patch.object(official, 'TARGET', state / 'Missing.app'), \
                  patch.object(official, 'manifest', return_value={'backup': str(state / 'official-backup-1.app')}), \
@@ -141,6 +268,43 @@ class OfficialSafety(unittest.TestCase):
                     official.enable()
                 clone.assert_not_called()
 
+    def test_disable_42304_patched_target_uses_backup_official_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory).resolve()
+            target = state / 'Claude.app'
+            backup = state / 'official-backup-1.app'
+            for app, payload in [(target, b'patched'), (backup, b'original')]:
+                (app / 'Contents/Resources').mkdir(parents=True)
+                (app / official.ASAR).write_bytes(payload)
+                (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                    'CFBundleShortVersionString': official.core.ADAPTER_42304['version']}))
+            record = {
+                'version': official.core.ADAPTER_42304['version'],
+                'backup': str(backup),
+                'installedFiles': {official.ASAR: official.core.sha(b'patched')},
+                'phase': 'enabled',
+            }
+            official_hash = official.core.sha(b'original')
+
+            def adapter(app):
+                # 补丁版目标的 ASAR 已经改变，不能再用它判断官方指纹。
+                if app == backup:
+                    return {'version': official.core.ADAPTER_42304['version'],
+                            'asarHash': official_hash}
+                raise AssertionError('不应读取补丁版目标的适配器')
+
+            with patch.object(official, 'STATE', state), \
+                 patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'manifest', return_value=record), \
+                 patch.object(official, 'running', return_value=False), \
+                 patch.object(official.core, 'verify_source'), \
+                 patch.object(official.core, 'source_adapter', side_effect=adapter), \
+                 patch.object(official, 'verify_patched'), \
+                 patch.object(official, 'clone', side_effect=shutil.copytree):
+                result = official.disable()
+            self.assertFalse(result['enabled'])
+            self.assertEqual((target / official.ASAR).read_bytes(), b'original')
+
     def test_damaged_backup_refuses_restore(self):
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
@@ -167,6 +331,8 @@ class OfficialSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
             backup = state / 'official-backup-1.app'
+            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             target = state / 'Claude.app'
             (target / 'Contents/Resources').mkdir(parents=True)
             (target / official.ASAR).write_bytes(b'changed application')
@@ -209,6 +375,57 @@ class OfficialSafety(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, 'simulated'):
                     official.disable()
             self.assertEqual((target / 'marker').read_text(), 'patched app remains recoverable')
+
+    def test_prepare_update_finalizes_record_when_target_is_already_official(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            current = {'enabled': False, 'supported': True, 'running': False}
+            record = {'phase': 'enabled'}
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'manifest', return_value=record), \
+                 patch.object(official, 'save') as save, \
+                 patch.object(official, 'disable') as disable:
+                result = official.prepare_update()
+            self.assertTrue(result['preparedForUpdate'])
+            self.assertEqual(record['phase'], 'disabled')
+            save.assert_called_once_with(record)
+            disable.assert_not_called()
+
+    def test_prepare_update_refuses_stale_record_on_unverified_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            current = {'enabled': False, 'supported': False, 'running': False}
+            record = {'phase': 'enabled'}
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'manifest', return_value=record), \
+                 patch.object(official, 'save') as save:
+                with self.assertRaisesRegex(ValueError, '不是已校验的官方版本'):
+                    official.prepare_update()
+            save.assert_not_called()
+
+    def test_launch_opens_unsupported_official_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory).resolve() / 'Claude.app'
+            target.mkdir()
+            with patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'status',
+                              return_value={'supported': False, 'message': '未适配'}), \
+                 patch.object(official.core, 'run') as run:
+                result = official.launch()
+            self.assertTrue(result['opened'])
+            self.assertIn('尚未适配', result['message'])
+            run.assert_called_once_with('/usr/bin/open', str(target))
+
+    def test_launch_refuses_missing_application(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory).resolve() / 'Missing.app'
+            with patch.object(official, 'TARGET', missing):
+                with self.assertRaisesRegex(ValueError, '没有找到'):
+                    official.launch()
 
 
 if __name__ == '__main__':

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Version-pinned official 3P configuration; no replacement tools or service."""
+"""官方第三方 API（3P）配置的可用性开关。
+
+只改 Claude 已有配置里的四个非秘密字段，不新增执行器、服务或账号：
+- desktopHome
+- builtinBrowserEnabled
+- scheduledTasksEnabled
+- autoModeEnabled
+
+所有修改都先留恢复记录，支持原值回滚；管理员策略、配置服务器、
+符号链接和并发修改都会被拒绝。
+"""
 import argparse
 import fcntl
 import json
@@ -14,6 +24,14 @@ import official_unlock as official
 
 DATA = pathlib.Path.home() / 'Library/Application Support/Claude-3p'
 STATE = official.core.WORK / 'native-features'
+
+# 这些版本的记录可以互相读取；新增正式版适配时在这里补上版本号。
+SUPPORTED_VERSIONS = {
+    official.core.VERSION,
+    official.core.ADAPTER_37337['version'],
+    official.core.ADAPTER_42304['version'],
+}
+
 FEATURES = {
     'file-analysis': {'title': 'Chat 与高级文件分析', 'key': 'desktopHome', 'value': 'standard'},
     'browser': {'title': '官方内置浏览器', 'key': 'builtinBrowserEnabled', 'value': True},
@@ -23,7 +41,7 @@ FEATURES = {
 
 
 def safe_read(path):
-    """Reject symlinks and non-regular configuration/journal files."""
+    """只读普通文件；拒绝符号链接，避免被重定向到别处的配置。"""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as file:
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
@@ -32,6 +50,7 @@ def safe_read(path):
 
 
 def active_config():
+    """读取当前生效的配置文件和元数据；拒绝符号链接与非法 ID。"""
     library = DATA / 'configLibrary'
     if library.is_symlink() or DATA.is_symlink():
         raise ValueError('配置目录是符号链接；停止操作。')
@@ -66,6 +85,7 @@ def check_idle():
 
 
 def atomic_write(path, value):
+    """写临时文件并原子替换；权限 0600，避免其他用户读取。"""
     temp = path.with_name(path.name + '.native-unlock-' + str(time.time_ns()))
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'wb') as file:
@@ -85,12 +105,13 @@ def record_path(path, feature):
 
 
 def load_record(path, feature):
+    """读取并校验恢复记录；记录缺字段或被改动过就拒绝继续。"""
     journal = record_path(path, feature)
     if not journal.exists():
         return None
     record = json.loads(safe_read(journal))
     spec = FEATURES[feature]
-    if (record.get('version') not in (official.core.VERSION, official.core.ADAPTER_37337['version']) or record.get('configId') != path.stem
+    if (record.get('version') not in SUPPORTED_VERSIONS or record.get('configId') != path.stem
             or record.get('feature') != feature or record.get('key') != spec['key']
             or type(record.get('value')) is not type(spec['value']) or record.get('value') != spec['value']
             or record.get('phase') not in ['prepared', 'enabled', 'restored']
@@ -120,10 +141,16 @@ def effective(feature, config):
     return config.get(FEATURES[feature]['key']) is True
 
 
-def report():
-    application = official.status()
-    result = {'version': application['version'], 'supported': application['supported'],
-              'running': application['running'], 'features': [], 'message': ''}
+def report(application=None):
+    """返回 UI 需要的配置状态；不包含密钥或完整配置内容。
+
+    合并检测时可传入已经算好的正式版状态，避免重复校验签名和备份。
+    """
+    application = official.status() if application is None else application
+    result = {'version': application.get('version', '未知'),
+              'supported': application.get('supported', False),
+              'running': application.get('running', False),
+              'features': [], 'message': ''}
     try:
         path, config, _, _ = active_config()
         check_local(config)
@@ -133,27 +160,28 @@ def report():
             owned = bool(record and record['phase'] != 'restored')
             result['features'].append({'id': identifier, 'title': spec['title'],
                 'enabled': effective(identifier, config), 'canRestore': owned,
-                'message': '配置已启用 · 实际动作待验收' if effective(identifier, config) else '未启用',
+                'message': '已启用' if effective(identifier, config) else '未启用',
                 'managedByUnlocker': owned})
-        result['message'] = '官方配置可用；动作验收与配置状态分别记录。'
+        result['message'] = '官方配置可用；开关只改配置，实际功能以 Claude 为准。'
         if not application['supported'] or application.get('recoveryRequired'):
             result['configWritable'] = False
             result['message'] = application['message']
     except Exception:
         result.update(configWritable=False, message='配置无法安全读取或受管理策略控制；停止修改。')
     result['boundaries'] = [
-        {'title': '本地记忆', 'message': 'Cowork 和 Code 项目记忆已通过合成写入及跨会话读回；实际状态仍以 Claude 为准。'},
-        {'title': '历史检索', 'message': '界面本地搜索已有；Chat 跨对话工具未支持，Code 有官方会话检索。'},
-        {'title': '夜间摘要', 'message': 'Chat 3P 无原生账号夜间摘要；Code本地Auto-dream已完成独立及桌面合成整理，使用独立可用性补丁，用户开关保持。'},
-        {'title': '跳过全部审批', 'message': '本轮保留官方动作审查，只提供官方自动审批选项。'},
-        {'title': 'Claude Design', 'message': '原生路径要求官方产品身份与 Design OAuth 授权；第三方推理密钥无法提供。'},
-        {'title': 'Claude Security', 'message': '依赖官方组织服务和 GitHub 仓库连接；第三方推理 API 不能执行该服务扫描。'},
-        {'title': '联网搜索', 'message': '沿用官方 Web Search；Gateway 必须支持服务端搜索或配置内置搜索后端。'},
+        {'title': '本地记忆', 'message': 'Cowork 与 Code 的项目记忆按官方逻辑运行。'},
+        {'title': '历史检索', 'message': 'Code 有官方会话检索；Chat 的跨对话检索仍需官方账号。'},
+        {'title': '夜间摘要', 'message': 'Chat 的夜间摘要需要官方账号；Code 的自动整理使用独立可用性开关。'},
+        {'title': '跳过全部审批', 'message': '保留官方动作审查，只提供官方自动审批选项。'},
+        {'title': 'Claude Design', 'message': '需要官方 Design 授权；第三方 API 不能替代。'},
+        {'title': 'Claude Security', 'message': '需要官方组织服务与 GitHub 连接。'},
+        {'title': '联网搜索', 'message': '沿用官方 Web Search；能否使用取决于你的 API 网关。'},
     ]
     return result
 
 
 def change(feature, restore=False):
+    """开启或恢复一个功能；先写恢复记录，再改配置。"""
     if feature not in FEATURES:
         raise ValueError('不支持的功能；停止操作。')
     check_idle()

@@ -14,6 +14,7 @@ import backend
 import native_unlock as core
 import official_unlock as official
 import native_features as features
+import native_cli_unlock as cli
 
 spec = importlib.util.spec_from_file_location('migrate_state', ROOT/'scripts/migrate_state.py')
 migration = importlib.util.module_from_spec(spec)
@@ -48,6 +49,29 @@ class PortableRuntime(unittest.TestCase):
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString':'99.0'}))
             with self.assertRaisesRegex(ValueError,'Unknown version'):
                 core.source_adapter(app)
+
+
+class CombinedStatus(unittest.TestCase):
+    def test_reports_all_three_sections_in_one_call(self):
+        with patch.object(official, 'status', return_value={
+                'supported': True, 'version': '2.t', 'running': False}), \
+             patch.object(cli, 'status', return_value={'enabled': True}), \
+             patch.object(features, 'report', return_value={'features': []}) as report:
+            result = backend.status_all()
+        self.assertEqual(result['official']['version'], '2.t')
+        self.assertTrue(result['cli']['enabled'])
+        self.assertEqual(result['features']['features'], [])
+        report.assert_called_once()
+
+    def test_one_failing_section_does_not_hide_the_others(self):
+        with patch.object(official, 'status', side_effect=ValueError('synthetic failure')), \
+             patch.object(cli, 'status', return_value={'enabled': False}), \
+             patch.object(features, 'report', return_value={'features': []}):
+            result = backend.status_all()
+        self.assertIn('error', result['official'])
+        self.assertNotIn('synthetic failure', json.dumps(result))
+        self.assertFalse(result['cli']['enabled'])
+        self.assertIn('features', result)
 
 
 class RecoveryMigration(unittest.TestCase):
