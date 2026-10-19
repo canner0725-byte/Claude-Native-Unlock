@@ -183,6 +183,22 @@ class NativeConfigurationSafety(unittest.TestCase):
         loaded = features.load_record(self.config, 'browser')
         self.assertEqual(loaded['version'], features.official.core.ADAPTER_42304['version'])
 
+    def test_record_from_current_42304_2_version_is_accepted(self):
+        """官方升级到 2.42304.2 后，旧记录仍要能读，不能要求用户重开开关。"""
+        version = features.official.core.ADAPTER_42304_2['version']
+        self.assertIn(version, features.SUPPORTED_VERSIONS)
+        record = {
+            'version': version,
+            'configId': self.config.stem,
+            'feature': 'browser',
+            'key': 'builtinBrowserEnabled',
+            'value': True,
+            'beforePresent': False,
+            'phase': 'enabled',
+        }
+        features.record_path(self.config, 'browser').write_text(json.dumps(record))
+        self.assertEqual(features.load_record(self.config, 'browser')['version'], version)
+
     def test_status_never_contains_credentials(self):
         self.assertNotIn('SYNTHETIC-SECRET', json.dumps(features.report()))
 

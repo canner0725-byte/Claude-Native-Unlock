@@ -53,6 +53,21 @@ class CliVersionSelection(unittest.TestCase):
         self.assertEqual(adapter['version'], '2.1.299')
         self.assertTrue(str(target).endswith('claude.app'))
 
+    def test_42304_2_desktop_version_is_supported(self):
+        """2.42304.2 仍内置 2.1.299 的 CLI 清单，沿用同一个适配器。"""
+        self.assertIn(cli.core.ADAPTER_42304_2['version'], cli.SUPPORTED_DESKTOP_VERSIONS)
+        self.add_version('2.1.299', cli.ADAPTER_21299['subdir'])
+        desktop = self.root / 'Claude.app'
+        (desktop / 'Contents').mkdir(parents=True)
+        (desktop / 'Contents/Info.plist').write_bytes(
+            plistlib.dumps({'CFBundleShortVersionString': '2.42304.2'}))
+        with patch.object(cli.core, 'APP', desktop), \
+             patch.object(cli, 'verify_source'), \
+             patch.object(cli, 'running', return_value=False):
+            result = cli.status('test')
+        self.assertTrue(result['supported'])
+        self.assertEqual(result['version'], '2.1.299')
+
     def test_unsupported_desktop_version_has_specific_message(self):
         self.add_version('2.1.299', cli.ADAPTER_21299['subdir'])
         desktop = self.root / 'Claude.app'

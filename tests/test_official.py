@@ -42,9 +42,58 @@ class OfficialSafety(unittest.TestCase):
 
     def test_prompt_suggestion_setting_flag_is_added_once(self):
         for adapter in [official.core.ADAPTER_37337, official.core.ADAPTER_42304,
-                        official.core.ADAPTER_42304_ARM64]:
+                        official.core.ADAPTER_42304_ARM64, official.core.ADAPTER_42304_2]:
             text = official.core.main_availability(adapter)
             self.assertEqual(text.count('2120747855:{rule:"forced",value:!0}'), 1)
+
+    def test_42304_2_is_a_single_verified_build(self):
+        adapter = official.core.ADAPTER_42304_2
+        self.assertEqual(official.core.adapters_for_version('2.42304.2'), [adapter])
+        self.assertEqual(adapter['version'], '2.42304.2')
+        self.assertIn(adapter['version'], official.core.CODE_UI_VERSIONS)
+        self.assertTrue(official.core.adapters_for_version('2.42304.2')[0]['main']
+                        .startswith('.vite/build/'))
+
+    def test_42304_2_reuses_revision10_availability_unchanged(self):
+        """2.42304.2 只换锚点，可用性条件必须与已验证的 revision 10 完全一致。"""
+        new, old = official.core.ADAPTER_42304_2, official.core.ADAPTER_42304
+        self.assertEqual(official.core.main_availability(new),
+                         official.core.main_availability(old))
+        self.assertEqual(official.core.web_availability(new),
+                         official.core.web_availability(old))
+        self.assertEqual(official.PATCH_REVISION, 10)
+
+    def test_42304_2_anchors_are_distinct_and_hashes_well_formed(self):
+        adapter = official.core.ADAPTER_42304_2
+        self.assertNotEqual(adapter['featureAnchor'], adapter['webFeatureAnchor'])
+        self.assertTrue(adapter['featureAnchor'].startswith('var '))
+        self.assertIn(adapter['main'], adapter['files'])
+        for digest in [adapter['asarHash'], *adapter['files'].values(),
+                       *adapter['sourceFiles'].values()]:
+            self.assertRegex(digest, r'^[0-9a-f]{64}$')
+
+    def test_diagnose_treats_42304_2_as_known_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            app = root / 'Claude.app'
+            state = root / 'state'
+            state.mkdir()
+            (app / 'Contents/Resources').mkdir(parents=True)
+            script = b'var W8t={123929380:{rule:"forced",value:!0}};'
+            header = {'files': {'.vite': {'files': {'build': {'files': {'index.js': {
+                'offset': '0', 'size': len(script)}}}}}}}
+            raw = json.dumps(header, separators=(',', ':')).encode()
+            payload = ((len(raw) + 7) // 4) * 4
+            asar = (struct.pack('<IIII', 4, payload + 4, payload, len(raw))
+                    + raw + b'\0' * (payload - 4 - len(raw)) + script)
+            (app / official.ASAR).write_bytes(asar)
+            (app / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': '2.42304.2'}))
+            with patch.object(official, 'TARGET', app), \
+                 patch.object(official, 'STATE', state):
+                report = official.diagnose()
+            self.assertTrue(report['knownVersion'])
+            self.assertEqual(report['candidates'][0]['featureTableAnchors'], ['var W8t={'])
 
     def test_revision9_is_offered_update_to_revision10(self):
         current = {'enabled': True, 'supported': True, 'patchRevision': 9,

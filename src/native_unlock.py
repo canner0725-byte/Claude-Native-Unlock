@@ -147,8 +147,36 @@ ADAPTER_42304_ARM64 = {
  }
 }
 
+# 2.42304.2：更新器分发的 arm64 构建。本机只验证过这一种构建，
+# 如果官网同时提供 universal 包，其整包指纹不同，会被当成未知版本拒绝。
+# 功能表本身仍是 W8t（强制项）/ G8t（下发渲染进程项）两张，与 2.42304.0
+# 同名同结构；可用性条件与 revision 10 完全一致，没有新增或改写功能。
+ADAPTER_42304_2 = {
+ 'version': '2.42304.2',
+ 'asarHash': 'f0a063c8c2c7fb21eb51bca00f086e5b7355d7208e3d9f28600ea79961830907',
+ 'main': '.vite/build/index.chunk-BkhOOUzl.js',
+ 'featureAnchor': 'var W8t={',
+ # 2371478310 / 857846362：Code 原生 To-Do 等新版工作台条件。
+ # 2120747855：官方“提示建议”设置项。它只决定设置是否可见；
+ # 建议的生成、Tab 采纳和发送仍走官方原逻辑。
+ 'mainAvailability': '2371478310:{rule:"forced",value:!0},857846362:{rule:"forced",value:!0},2120747855:{rule:"forced",value:!0},',
+ 'webFeatureAnchor': 'G8t={',
+ 'webAvailability': '3264789062:{rule:"always",value:!0},3335190042:{rule:"always",value:!0},3858164079:{rule:"always",value:!0},1235690166:{rule:"always",value:!0},',
+ 'files': {
+  '.vite/build/index.pre.js': '64d923c811b5352cedb738d6644382a7ac4c822801a9aef256fdd3285429ea0e',
+  '.vite/build/index.chunk-BkhOOUzl.js': '07d785c56978eb335c933562a514b3eba79cc5f307b4cd46f7f84e2dca5c83ec',
+  '.vite/build/index.chunk-K-UfRPiV.js': '9f3f13fef1d5ea32ed0c934361f57a6d72385938223a6ad330e1540ea09aa11a',
+ },
+ 'sourceFiles': {
+  'Contents/Info.plist': '0ac620b4fb77f73ff2a313b377ed55a4518d97c9c484cd6cb753a91056c02cc2',
+  'Contents/MacOS/Claude': 'ee962f9d2235e3f636a49aac7acf5c6b005877347edcdbb2a093c9e7a46ee737',
+  'Contents/Resources/app.asar.unpacked/node_modules/@ant/claude-swift/build/Release/computer_use.node': 'da5184e4bee4c8d85fd5246caa27a62d88e99a0dec50777dd2b72aabf237fccd',
+ }
+}
+
 # 这些版本才有“新版 Code 工作台”相关界面；补丁 revision 5 起按版本判断。
-CODE_UI_VERSIONS = (ADAPTER_37337['version'], ADAPTER_42304['version'])
+CODE_UI_VERSIONS = (ADAPTER_37337['version'], ADAPTER_42304['version'],
+                    ADAPTER_42304_2['version'])
 
 
 def adapters_for_version(version):
@@ -163,6 +191,8 @@ def adapters_for_version(version):
         return [ADAPTER_37337]
     if version == ADAPTER_42304['version']:
         return [ADAPTER_42304_ARM64, ADAPTER_42304]
+    if version == ADAPTER_42304_2['version']:
+        return [ADAPTER_42304_2]
     return []
 
 

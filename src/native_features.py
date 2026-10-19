@@ -30,6 +30,7 @@ SUPPORTED_VERSIONS = {
     official.core.VERSION,
     official.core.ADAPTER_37337['version'],
     official.core.ADAPTER_42304['version'],
+    official.core.ADAPTER_42304_2['version'],
 }
 
 FEATURES = {

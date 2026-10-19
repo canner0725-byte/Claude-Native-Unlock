@@ -629,7 +629,8 @@ def diagnose():
         'bundleIdentifier': info.get('CFBundleIdentifier'),
         'asarSha256': core.sha(b),
         'asarSize': len(b),
-        'knownVersion': version in (core.VERSION, core.ADAPTER_37337['version'], core.ADAPTER_42304['version']),
+        # 直接问适配表，新增版本时不会漏改这里。
+        'knownVersion': bool(core.adapters_for_version(version)),
         'candidates': _packed_js_candidates(b, header, base),
         'sourceFiles': {},
         'message': '这是只读报告，没有修改 Claude。把报告交给维护者用于新版本适配。',

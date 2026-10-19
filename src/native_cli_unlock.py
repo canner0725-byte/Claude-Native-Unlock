@@ -8,7 +8,7 @@ Claude Code 的 Bun 单文件里有一个“功能是否可用”的判断函数
 
 已适配：
 - 2.1.295：Desktop 2.37337.1
-- 2.1.299：Desktop 2.42304.0
+- 2.1.299：Desktop 2.42304.0 / 2.42304.2（2.42304.2 仍内置 2.1.299 的清单）
 
 选择桌面端已安装的最新 CLI；如果最新版尚未适配就拒绝操作，
 不会退回旧版本制造“已启用”的假象。
@@ -64,6 +64,7 @@ SUPPORTED_DESKTOP_VERSIONS = {
     core.VERSION,
     core.ADAPTER_37337['version'],
     core.ADAPTER_42304['version'],
+    core.ADAPTER_42304_2['version'],
 }
 
 

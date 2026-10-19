@@ -11,8 +11,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.14'
-BUILD_NUMBER = '27'
+VERSION = '0.3.15'
+BUILD_NUMBER = '28'
 
 
 def run(*args):
