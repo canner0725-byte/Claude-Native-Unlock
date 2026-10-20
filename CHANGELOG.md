@@ -14,7 +14,8 @@
 - **正式安装已由用户完成并复核**：助手在 23:35:03 退出 Claude、23:35:04 替换、23:35:11 重新打开。安装后的 `/Applications/Claude.app` ASAR 为 `fe2eb96b…0c1b01`，与隔离副本验证时得到的字节完全一致；`verify_patched` 通过；九项可用性条目在已安装 bundle 中各出现一次；`status-all` 返回“补丁已安装 · 文件校验通过”，revision 10。补丁版 Claude 已正常启动并正在运行。旧 2.42304.0 官方备份与 `retired-patched-*` 已按“只保留最新版”清理，状态目录 1.4 GB → 856 MB，只剩当前 2.42304.2 官方备份。
 - **运行时解锁已由 Claude 自己的日志证实**：`~/Library/Logs/Claude-3p/main.log` 记录官方原版 2.42304.2 为 `loaded 31 features` 且 `[chicago] raw=undefined → enabled=false`，补丁版为 `loaded 36 features` 且 `raw={"enabled":true,"appScopedEnabled":true} → enabled=true appScoped=true`。差值 +5 正好是 `mainAvailability` 追加的强制项；Computer Use 子系统（live-preview / side-panel / esc / app-indicator / glow / teach / notifications）全部初始化，`computer_use.node` 从补丁后的 chunk 加载。上一轮 2.42304.0 补丁版同样是 36 / `enabled=true`。
 - 重新签名后 Claude 变为 ad-hoc 签名（`Signature=adhoc`、无 TeamIdentifier），系统权限需要重新绑定：本机权限检查报告 Claude 当前的“辅助功能 / 屏幕录制”**未授予**，需要在系统设置里重新勾选并重启 Claude，Computer Use 才能真正执行动作。这是系统权限问题，不是补丁问题。
-- 尚未验证：真实 Computer Use 动作（截图/点击）、拒绝/中断/Full control 运行时回归、2.42304.2 上的官方更新全流程。只适配了更新器 arm64 构建；若官网另有 universal 包，其整包指纹不同，会被当作未知版本拒绝。
+- **补做验证**：状态机全流程在真实 bundle 上 33 项检查全通过（打补丁前 → enable → 幂等 → prepare-update → 再 enable → 未知版本拒绝 → 篡改检测 → 旧文件清理）；CLI 补丁用官方 2.1.299 备份重建后与已安装产物的四个文件**哈希全同**，`claude --version` 正常输出；只读 `diagnose()` 对已打补丁的正式应用返回 `forcedRuleCount=34`（官方 29 + 追加 5）。重签后二进制变小 18208 字节属正常：ad-hoc 签名（484464 字节）小于官方签名（502672 字节）。
+- 尚未验证：真实 Computer Use 动作（截图/点击，被 macOS 授权挡住）、拒绝/中断/Full control 运行时回归、2.42304.2 上的官方更新全流程。只适配了更新器 arm64 构建；若官网另有 universal 包，其整包指纹不同，会被当作未知版本拒绝。
 
 ## 0.3.14 — 2026-10-18
 
