@@ -3,25 +3,27 @@ import AppKit
 // 一个窗口 + 菜单栏入口的小工具。
 // 所有真正的补丁操作都在内置 Python 后端里完成；这里只负责显示状态、
 // 收集用户意图，并把后端返回的 JSON 转成中文提示。
+//
+// 界面只保留“现在能不能用”和“点哪里”：主开关一张卡片、原生配置一列、
+// 底部两个常用按钮。更新补丁只在真的可更新时淡入；准备官方更新、系统
+// 授权说明、使用说明等低频动作用菜单栏菜单承载，窗口里不再堆文字。
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
+    var contentStack: NSStackView!
 
     // 主开关：安装 / 恢复正式版可用性补丁。
     let toggle = NSSwitch()
-    let statusLabel = NSTextField(labelWithString: "正在检测正式版…")
-    let versionLabel = NSTextField(labelWithString: "Claude /Applications/Claude.app")
+    let statusLabel = NSTextField(wrappingLabelWithString: "正在检测…")
+    let metaLabel = NSTextField(labelWithString: "正在检测…")
 
     // 底部操作。
     let openButton = NSButton(title: "打开 Claude", target: nil, action: nil)
     let refreshButton = NSButton(title: "重新检测", target: nil, action: nil)
-    let permissionButton = NSButton(title: "系统授权说明", target: nil, action: nil)
 
-    // 补丁操作。只保留“更新到最新补丁”和官方更新前恢复原版。
-    let updateButton = NSButton(title: "更新解锁补丁", target: nil, action: nil)
-    let prepareButton = NSButton(title: "为官方更新做准备", target: nil, action: nil)
+    // 只在可更新时出现。
+    let updateButton = NSButton(title: "更新补丁", target: nil, action: nil)
 
     let progress = NSProgressIndicator()
-    let actionSeparator = NSBox()
 
     // 后端最近一次检测结果。
     var enabled = false
@@ -29,7 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var officialRunning = false
     var officialSupported = false
     var backupVerified = false
-    var officialMessage = "正在检测正式版…"
+    var officialMessage = "正在检测…"
     var recoveryRequired = false
     var updateAvailable = false
     var codeMemorySupported = false
@@ -49,6 +51,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var pendingAfterQuit: (() -> Void)?
     var relaunchAfterAction = false
     var lastStatusAt = Date.distantPast
+    // 刚开启/更新补丁后，短时间内在窗口里提示一次系统权限；过期自动消失。
+    var enabledHintUntil = Date.distantPast
+    var justEnabledHint: Bool { Date() < enabledHintUntil }
 
     // 菜单栏。
     var statusItem: NSStatusItem!
@@ -64,18 +69,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         .appendingPathComponent("Library/Application Support/Claude 原生助手")
 
     let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve", "code-auto-dream"]
-    let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务", "Cowork 自动审批选项", "Code 原生自动整理可用性"]
+    let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务",
+                         "Cowork 自动审批选项", "Code 自动整理"]
+    // 说明只在悬停提示里出现，窗口里保持一行一个开关。
     let featureDescriptions = [
         "Chat 使用标准工作台，启用官方高级文件分析。",
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
         "允许官方定时任务；是否执行仍由 Claude 决定。",
         "显示 Cowork 官方自动审批选项；动作审查保留。",
-        "只解除 Code 自动整理的可用性限制；CLI 2.1.299 已适配，用户开关保持。"
+        "只解除 Code 自动整理的可用性限制；用户开关保持。"
     ]
     var featureSwitches: [NSSwitch] = []
     var featureLabels: [NSTextField] = []
+    var featureRows: [NSView] = []
     var featureEnabled: [Bool] = [false, false, false, false, false]
-    let featureSummary = NSTextField(wrappingLabelWithString: "正在检测原生配置…")
+    // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
+    let featureSummary = NSTextField(wrappingLabelWithString: "")
 
     // 版本号从 Info.plist 读取，避免以后升级时忘记改界面文案。
     var assistantVersion: String {
@@ -99,6 +108,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "打开 Claude", action: #selector(openClaude), keyEquivalent: "o").target = self
         appMenu.addItem(withTitle: "打开快捷操作菜单", action: #selector(showStatusMenu), keyEquivalent: "m").target = self
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "更新解锁补丁", action: #selector(confirmUpdate), keyEquivalent: "u").target = self
+        appMenu.addItem(withTitle: "为官方更新做准备", action: #selector(prepareUpdate), keyEquivalent: "p").target = self
+        appMenu.addItem(withTitle: "系统授权说明", action: #selector(showPermissionGuide), keyEquivalent: "").target = self
+        appMenu.addItem(withTitle: "使用说明", action: #selector(openFeatureReport), keyEquivalent: "").target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 Claude 原生助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = appMenu
         NSApp.mainMenu = menu
@@ -116,7 +130,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 主窗口。
         // 780 高度给补丁操作行和最多四行状态留出空间，避免底部按钮重叠。
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 780),
+        // 内容自己决定高度，所以先给一个够用的初始尺寸，随后按内容收敛。
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "Claude 原生助手"
         window.isReleasedWhenClosed = false
@@ -128,147 +143,200 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let content = NSView()
         window.contentView = content
 
-        let title = NSTextField(labelWithString: "Claude 官方原生功能")
-        title.font = .systemFont(ofSize: 23, weight: .semibold)
-        let subtitle = NSTextField(labelWithString: "为现有第三方 API 模式开启原生能力")
-        subtitle.textColor = .secondaryLabelColor
-        let feature = NSTextField(labelWithString: "Computer Use · Code 工作台与工作树")
-        feature.font = .systemFont(ofSize: 16, weight: .medium)
+        // 标题栏透明、标题在内容里，接近 macOS 自带设置窗口的观感。
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isMovableByWindowBackground = true
+        window.styleMask.insert(.fullSizeContentView)
+
+        // 全部内容放在一个纵向 Stack 里：改文案、隐藏元素都能平滑过渡，
+        // 窗口高度自己跟着内容走，不再靠一堆固定约束硬撑。
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.edgeInsets = NSEdgeInsets(top: 34, left: 22, bottom: 20, right: 22)
+        contentStack = stack
+
+        let title = NSTextField(labelWithString: "Claude 原生助手")
+        title.font = .systemFont(ofSize: 20, weight: .semibold)
+        metaLabel.font = .systemFont(ofSize: 11)
+        metaLabel.textColor = .tertiaryLabelColor
+
+        let header = NSStackView(views: [title, metaLabel])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 3
+
+        // 主开关卡片：一行标题 + 一行状态。
+        let mainTitle = NSTextField(labelWithString: "Computer Use")
+        mainTitle.font = .systemFont(ofSize: 15, weight: .medium)
+        mainTitle.toolTip = "安装或恢复 Computer Use、Code 工作台等原生可用性补丁。"
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.maximumNumberOfLines = 2
+        statusLabel.lineBreakMode = .byWordWrapping
 
         toggle.target = self
         toggle.action = #selector(switchChanged)
         toggle.setAccessibilityLabel("Computer Use 解锁开关")
         toggle.isEnabled = false
 
-        statusLabel.font = .systemFont(ofSize: 13)
-        statusLabel.maximumNumberOfLines = 4
-        statusLabel.lineBreakMode = .byWordWrapping
-        versionLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        versionLabel.textColor = .secondaryLabelColor
+        let mainText = NSStackView(views: [mainTitle, statusLabel])
+        mainText.orientation = .vertical
+        mainText.alignment = .leading
+        mainText.spacing = 4
+        mainText.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let mainRow = NSStackView(views: [mainText, toggle])
+        mainRow.orientation = .horizontal
+        mainRow.alignment = .centerY
+        mainRow.spacing = 16
+        mainRow.distribution = .fill
 
-        // 尽量用短句：用户需要知道“现在能不能用”和“下一步点什么”。
-        let note = NSTextField(wrappingLabelWithString:
-            "Claude 正在运行时也可以直接操作：助手会先正常退出，完成后再自动打开。\n" +
-            "首次使用请在 Claude 设置 → This computer → System 确认辅助功能、屏幕录制均为 Granted。")
-        note.font = .systemFont(ofSize: 12)
-        note.textColor = .secondaryLabelColor
-
-        for button in [openButton, refreshButton, permissionButton, updateButton, prepareButton] {
-            button.bezelStyle = .rounded
-            button.target = self
-        }
-        openButton.action = #selector(openClaude)
-        refreshButton.action = #selector(refresh)
-        permissionButton.action = #selector(showPermissionGuide)
-        updateButton.action = #selector(confirmUpdate)
-        prepareButton.action = #selector(prepareUpdate)
-        updateButton.isEnabled = false
-        prepareButton.isEnabled = false
-        toggle.toolTip = "安装或恢复 Computer Use 等原生可用性补丁。"
-        updateButton.toolTip = "把当前补丁更新到最新 revision；始终只保留最新版。"
-        prepareButton.toolTip = "恢复完整官方签名，供官方更新器使用；不会删除数据。"
-
-        featureSummary.font = .systemFont(ofSize: 12)
-        featureSummary.textColor = .secondaryLabelColor
-
-        // 五组官方配置开关。
+        // 原生配置卡片：一行一个开关，说明放在悬停提示里。
         let rows = NSStackView()
         rows.orientation = .vertical
         rows.alignment = .leading
-        rows.spacing = 12
+        rows.spacing = 0
         for (index, name) in featureTitles.enumerated() {
-            let row = NSView()
             let label = NSTextField(labelWithString: name)
-            label.font = .systemFont(ofSize: 15, weight: .medium)
+            label.font = .systemFont(ofSize: 14)
             label.toolTip = featureDescriptions[index]
-            let detail = NSTextField(labelWithString: "正在检测…")
-            detail.font = .systemFont(ofSize: 12)
-            detail.textColor = .secondaryLabelColor
+            let detail = NSTextField(labelWithString: "")
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .systemOrange
+            detail.isHidden = true
+
             let control = NSSwitch()
             control.tag = index
             control.target = self
             control.action = #selector(featureChanged(_:))
             control.setAccessibilityLabel(name + " 配置开关")
             control.isEnabled = false
+            control.controlSize = .small
             featureSwitches.append(control)
             featureLabels.append(detail)
-            for view in [label, detail, control] {
-                view.translatesAutoresizingMaskIntoConstraints = false
-                row.addSubview(view)
+
+            let text = NSStackView(views: [label, detail])
+            text.orientation = .vertical
+            text.alignment = .leading
+            text.spacing = 2
+            text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            let row = NSStackView(views: [text, control])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 16
+            row.edgeInsets = NSEdgeInsets(top: 9, left: 14, bottom: 9, right: 14)
+            if index > 0 {
+                let hairline = NSBox()
+                hairline.boxType = .separator
+                rows.addArrangedSubview(hairline)
+                hairline.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
             }
-            row.translatesAutoresizingMaskIntoConstraints = false
             rows.addArrangedSubview(row)
-            NSLayoutConstraint.activate([
-                row.widthAnchor.constraint(equalTo: rows.widthAnchor),
-                row.heightAnchor.constraint(equalToConstant: 44),
-                label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-                label.topAnchor.constraint(equalTo: row.topAnchor),
-                detail.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-                detail.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 4),
-                control.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                control.centerYAnchor.constraint(equalTo: row.centerYAnchor)
-            ])
+            row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+            featureRows.append(row)
         }
+
+        let section = NSTextField(labelWithString: "原生配置")
+        section.font = .systemFont(ofSize: 11, weight: .semibold)
+        section.textColor = .tertiaryLabelColor
+
+        featureSummary.font = .systemFont(ofSize: 11)
+        featureSummary.textColor = .systemOrange
+        featureSummary.isHidden = true
+
+        for button in [openButton, refreshButton, updateButton] {
+            button.bezelStyle = .rounded
+            button.target = self
+        }
+        openButton.action = #selector(openClaude)
+        refreshButton.action = #selector(refresh)
+        updateButton.action = #selector(confirmUpdate)
+        updateButton.toolTip = "把补丁更新到最新 revision；只保留最新版和当前官方备份。"
+        updateButton.isEnabled = false
+        // 可更新时再淡入，平时不占视觉位置。
+        updateButton.alphaValue = 0
+        updateButton.isHidden = true
 
         progress.style = .spinning
         progress.controlSize = .small
         progress.isDisplayedWhenStopped = false
-        actionSeparator.boxType = .separator
 
-        let views: [NSView] = [title, subtitle, feature, toggle, statusLabel, versionLabel, note,
-                               openButton, refreshButton, permissionButton,
-                               updateButton, prepareButton,
-                               progress, rows, featureSummary, actionSeparator]
-        for view in views {
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [openButton, refreshButton, footerSpacer,
+                                         updateButton, progress])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 10
+
+        let mainCard = makeCard(mainRow)
+        let rowsCard = makeCard(rows)
+
+        for view in [header, mainCard, section, rowsCard, featureSummary, footer] {
             view.translatesAutoresizingMaskIntoConstraints = false
-            content.addSubview(view)
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor,
+                                        constant: -44).isActive = true
         }
+        stack.setCustomSpacing(18, after: header)
+        stack.setCustomSpacing(22, after: mainCard)
+        stack.setCustomSpacing(8, after: section)
+        stack.setCustomSpacing(10, after: rowsCard)
+        stack.setCustomSpacing(16, after: featureSummary)
 
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
-            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 25),
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 7),
-            feature.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            feature.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 27),
-            toggle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-            toggle.centerYAnchor.constraint(equalTo: feature.centerYAnchor),
-            statusLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
-            statusLabel.topAnchor.constraint(equalTo: feature.bottomAnchor, constant: 12),
-            versionLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            versionLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 7),
-            note.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            note.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            note.topAnchor.constraint(equalTo: versionLabel.bottomAnchor, constant: 18),
-            rows.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            rows.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            rows.topAnchor.constraint(equalTo: note.bottomAnchor, constant: 20),
-            featureSummary.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            featureSummary.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            featureSummary.topAnchor.constraint(equalTo: rows.bottomAnchor, constant: 18),
-            featureSummary.bottomAnchor.constraint(lessThanOrEqualTo: actionSeparator.topAnchor, constant: -12),
-            updateButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            // 操作按钮放在窗口底部、靠近通用按钮，形成一致的操作区。
-            updateButton.bottomAnchor.constraint(equalTo: openButton.topAnchor, constant: -16),
-            actionSeparator.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            actionSeparator.trailingAnchor.constraint(equalTo: statusLabel.trailingAnchor),
-            actionSeparator.bottomAnchor.constraint(equalTo: updateButton.topAnchor, constant: -14),
-            prepareButton.leadingAnchor.constraint(equalTo: updateButton.trailingAnchor, constant: 12),
-            prepareButton.centerYAnchor.constraint(equalTo: updateButton.centerYAnchor),
-            openButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            openButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -22),
-            refreshButton.leadingAnchor.constraint(equalTo: openButton.trailingAnchor, constant: 12),
-            refreshButton.centerYAnchor.constraint(equalTo: openButton.centerYAnchor),
-            permissionButton.leadingAnchor.constraint(equalTo: refreshButton.trailingAnchor, constant: 12),
-            permissionButton.centerYAnchor.constraint(equalTo: openButton.centerYAnchor),
-            progress.trailingAnchor.constraint(equalTo: toggle.trailingAnchor),
-            progress.centerYAnchor.constraint(equalTo: openButton.centerYAnchor)
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        resizeToFit(animated: false)
         execute("status-all", backend: "all")
+    }
+
+    /// 窗口高度跟着内容走；内容显隐后调用，顶部保持不动，过渡平滑。
+    func resizeToFit(animated: Bool = true) {
+        guard window.isVisible, let content = window.contentView else { return }
+        content.layoutSubtreeIfNeeded()
+        let height = ceil(contentStack.fittingSize.height)
+        guard height > 100 else { return }
+        let current = window.frame.height
+        guard abs(height - current) > 0.5 else { return }
+        var frame = window.frame
+        frame.origin.y += current - height
+        frame.size.height = height
+        window.setFrame(frame, display: true, animate: animated)
+    }
+
+    /// 圆角卡片：窗口背景上做一层浅底，和系统设置的分组观感一致。
+    func makeCard(_ inner: NSView) -> NSBox {
+        let box = NSBox()
+        box.boxType = .custom
+        box.titlePosition = .noTitle
+        box.cornerRadius = 10
+        box.borderWidth = 1
+        box.borderColor = .separatorColor
+        box.fillColor = .controlBackgroundColor
+        box.contentViewMargins = .zero
+        box.contentView = inner
+        return box
+    }
+
+    /// 内容变化时统一走这里：淡入淡出加轻微位移，避免界面“跳一下”。
+    func animate(_ duration: TimeInterval = 0.18, _ changes: () -> Void) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.allowsImplicitAnimation = true
+            changes()
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -595,6 +663,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         trayPrepare = trayMenu.addItem(withTitle: "为官方更新做准备", action: #selector(prepareUpdate), keyEquivalent: "")
         trayPrepare.target = self
         trayMenu.addItem(withTitle: "使用说明", action: #selector(openFeatureReport), keyEquivalent: "").target = self
+        trayMenu.addItem(withTitle: "系统授权说明", action: #selector(showPermissionGuide), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "关于", action: #selector(showAbout), keyEquivalent: "").target = self
         trayMenu.addItem(.separator())
         trayQuit = trayMenu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -756,11 +825,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openButton.isEnabled = false
         refreshButton.isEnabled = false
         updateButton.isEnabled = false
-        prepareButton.isEnabled = false
         for control in featureSwitches { control.isEnabled = false }
 
         progress.startAnimation(nil)
-        statusLabel.textColor = .labelColor
+        statusLabel.textColor = .secondaryLabelColor
         if backend == "all" {
             statusLabel.stringValue = "正在检测…"
         } else if backend == "native_features" {
@@ -901,14 +969,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 处理后端结果
 
-    func officialStatusText(_ base: String) -> String {
-        if officialRunning && officialSupported && !recoveryRequired {
-            return base + " · 修改时自动退出并重开 Claude"
+    /// 状态文案统一从这里写，顺带做一次淡入，避免文字突然跳变。
+    func setStatus(_ text: String, color: NSColor = .secondaryLabelColor) {
+        guard text != statusLabel.stringValue else {
+            statusLabel.textColor = color
+            return
         }
-        return base
+        statusLabel.stringValue = text
+        statusLabel.textColor = color
+        statusLabel.alphaValue = 0
+        animate(0.22) { self.statusLabel.animator().alphaValue = 1 }
     }
 
-    /// 所有按钮是否可用只在这里决定，避免多处状态不一致。
+    /// 更新按钮只在真的能更新时出现，出现和消失都走动画。
+    func setUpdateVisible(_ visible: Bool) {
+        guard updateButton.isHidden == visible else {
+            if !visible { updateButton.isEnabled = true }
+            return
+        }
+        if visible {
+            updateButton.isHidden = false
+            updateButton.alphaValue = 0
+            animate { self.updateButton.animator().alphaValue = 1 }
+        } else {
+            animate { self.updateButton.animator().alphaValue = 0 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if self.updateButton.alphaValue < 0.01 {
+                    self.updateButton.isHidden = true
+                    self.window.contentView?.layoutSubtreeIfNeeded()
+                }
+            }
+        }
+    }
+
+    /// 所有控件是否可用只在这里决定，避免多处状态不一致。
     func refreshButtons() {
         let interactive = !busy && !quittingClaude
         let configReady = officialSupported && !recoveryRequired && (!enabled || backupVerified)
@@ -917,9 +1011,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 打开 Claude 不依赖适配状态：官方更新后仍应能正常使用。
         openButton.isEnabled = interactive && targetExists && !recoveryRequired
         updateButton.isEnabled = interactive && updateAvailable
-        prepareButton.isEnabled = interactive && configReady
-        updateButton.title = updateAvailable && availableRevision > 0
-            ? "更新补丁到 r\(availableRevision)" : "更新解锁补丁"
+        updateButton.title = availableRevision > 0 ? "更新到 r\(availableRevision)" : "更新补丁"
+        setUpdateVisible(interactive && updateAvailable)
         for (index, control) in featureSwitches.enumerated() {
             if index == 4 {
                 control.isEnabled = interactive && codeMemorySupported
@@ -928,6 +1021,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     && (!featureEnabled[index] || featureRestorable[index])
             }
         }
+        // 按钮显隐会改变高度，等动画结束后让窗口重新贴合内容。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
     }
 
     func applyOfficial(_ result: [String: Any]) {
@@ -936,8 +1031,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             lastError = error
             officialSupported = false
             updateAvailable = false
-            statusLabel.stringValue = error
-            statusLabel.textColor = .systemOrange
+            setStatus(error, color: .systemOrange)
             refreshButtons()
             toggle.isEnabled = false
             return
@@ -959,12 +1053,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButtons()
 
         officialMessage = result["message"] as? String ?? "检测完成"
-        statusLabel.stringValue = officialStatusText(officialMessage)
-        statusLabel.textColor = supported && (!enabled || backupVerified) ? .labelColor : .systemOrange
-        let patchText = enabled && patchRevision > 0 ? " · 补丁 r\(patchRevision)" : ""
-        let updateText = updateAvailable && availableRevision > 0 ? " · 可更新到 r\(availableRevision)" : ""
-        versionLabel.stringValue = "Claude \(result["version"] as? String ?? "未知") · 原生助手 \(assistantVersion)"
-            + patchText + updateText
+        statusLabel.toolTip = officialMessage
+        if recoveryRequired {
+            setStatus("安装中断 · 关闭开关即可恢复官方备份", color: .systemOrange)
+        } else if !supported {
+            setStatus(targetExists ? "此版本尚未适配 · 不会修改 Claude" : "未找到 Claude",
+                      color: .systemOrange)
+        } else if !enabled {
+            setStatus("未开启", color: .secondaryLabelColor)
+        } else if !backupVerified {
+            setStatus("已解锁 · 官方备份异常，恢复已停用", color: .systemOrange)
+        } else if updateAvailable {
+            setStatus("已解锁 · 有新版本可更新", color: .systemBlue)
+        } else {
+            setStatus("已解锁 · 文件校验通过", color: .secondaryLabelColor)
+        }
+        let patch = enabled && patchRevision > 0 ? " · 补丁 r\(patchRevision)" : ""
+        metaLabel.stringValue = "Claude \(result["version"] as? String ?? "未知")" + patch
     }
 
     func applyCLI(_ result: [String: Any]) {
@@ -972,19 +1077,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         featureEnabled[index] = result["enabled"] as? Bool ?? false
         codeMemorySupported = result["supported"] as? Bool ?? false
         featureSwitches[index].state = featureEnabled[index] ? .on : .off
-        featureLabels[index].stringValue = result["error"] as? String
-            ?? result["message"] as? String ?? "CLI 检测失败"
+        setFeatureDetail(index, text: result["error"] as? String ?? "")
+    }
+
+    /// 每行的补充说明只在出错时出现；正常状态保持一行一个开关。
+    func setFeatureDetail(_ index: Int, text: String) {
+        let label = featureLabels[index]
+        label.stringValue = text
+        if label.isHidden == !text.isEmpty { return }
+        animate { label.animator().isHidden = text.isEmpty }
     }
 
     func applyFeatures(_ result: [String: Any]) {
         statusLoaded = true
         if let error = result["error"] as? String {
             featureConfigWritable = false
-            featureSummary.stringValue = error + " 请重新检测。"
-            if lastError == nil {
-                statusLabel.stringValue = error
-                statusLabel.textColor = .systemOrange
-            }
+            setSummary(error + " 请重新检测。")
+            if lastError == nil { setStatus(error, color: .systemOrange) }
             return
         }
 
@@ -994,39 +1103,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for (index, id) in featureIDs.enumerated() {
             guard let feature = features.first(where: { $0["id"] as? String == id }) else { continue }
             let on = feature["enabled"] as? Bool ?? false
-            let restorable = feature["canRestore"] as? Bool ?? false
             featureEnabled[index] = on
-            featureRestorable[index] = restorable
+            featureRestorable[index] = feature["canRestore"] as? Bool ?? false
             featureSwitches[index].state = on ? .on : .off
-            featureLabels[index].stringValue = on
-                ? (restorable ? "已启用 · 可关闭恢复原值" : "已有官方配置 · 保持原值")
-                : "未启用 · 开启后重启 Claude"
+            setFeatureDetail(index, text: "")
         }
 
-        if let error = lastError {
-            // 主状态检测失败时，后续配置检测不能把错误覆盖成旧状态。
-            statusLabel.stringValue = error
-            statusLabel.textColor = .systemOrange
-        } else if !recoveryRequired && officialSupported && (!enabled || backupVerified) {
-            let base = enabled
-                ? (updateAvailable ? "Computer Use 已安装 · 解锁补丁待更新" : "原生补丁与官方备份均已校验")
-                : "Computer Use 未开启"
-            statusLabel.stringValue = officialStatusText(base)
-            statusLabel.textColor = .labelColor
-        } else {
-            statusLabel.stringValue = officialStatusText(officialMessage)
-            statusLabel.textColor = officialSupported && (!enabled || backupVerified)
-                ? .labelColor : .systemOrange
-        }
-        featureSummary.stringValue =
-            "这些开关只改官方配置，不替代执行器。系统权限、逐应用授权、拒绝、中断和动作审查都保留。" +
-            "Design、Security 和账号云端功能仍需官方服务。"
-        if officialRunning {
-            featureSummary.stringValue += " 运行时也可直接切换，助手会先正常退出 Claude。"
-        }
         if !featureConfigWritable {
-            featureSummary.stringValue = result["message"] as? String ?? "配置不可修改。"
+            setSummary(result["message"] as? String ?? "配置不可修改。")
+        } else if !recoveryRequired && officialSupported && (!enabled || backupVerified) {
+            // 正常路径不再重复主状态，只在需要时提示一次权限。
+            setSummary(justEnabledHint ? "如 Computer Use 无响应，请在系统设置里给 Claude 开启辅助功能与屏幕录制。"
+                                       : "")
+        } else {
+            setSummary("")
         }
+    }
+
+    func setSummary(_ text: String) {
+        guard featureSummary.stringValue != text || featureSummary.isHidden == !text.isEmpty else { return }
+        featureSummary.stringValue = text
+        animate { self.featureSummary.animator().isHidden = text.isEmpty }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
     }
 
     func completeAll(_ result: [String: Any]) {
@@ -1059,7 +1157,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if (command == "enable" || command == "update") && enabled {
-            showPermissionGuide()
+            // 只在窗口里提示一行；完整步骤留在菜单栏的“系统授权说明”。
+            enabledHintUntil = Date().addingTimeInterval(90)
         }
         if command == "prepare-update", result["preparedForUpdate"] as? Bool == true {
             showUpdateGuide()
