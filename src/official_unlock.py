@@ -28,10 +28,12 @@ STATE = core.WORK / 'official-install'
 MAIN = '.vite/build/index.chunk-Cyt2WTko.js'
 ASAR = 'Contents/Resources/app.asar'
 
-# 新增“只改可用性条件”的功能时把这个数字加 1。
+# 改动“安装进 Claude 的东西”时把这个数字加 1：
+# 新增“只改可用性条件”的功能，或者改变签名方式这类影响安装产物的改动。
 # 升级判断只看它，不再把历史条件一层层拼在一起，
 # 这样以后新增功能不会被旧逻辑误判为“已经是最新”。
-PATCH_REVISION = 10
+# revision 11：补丁改用固定的本地签名身份（见 native_unlock 的说明）。
+PATCH_REVISION = 11
 
 # 只读诊断会读取这些固定文件；不会读取配置、密钥或会话。
 DIAGNOSTIC_SOURCE_FILES = [
@@ -162,7 +164,12 @@ def status():
             result['nativeCodeStateUI'] = revision >= 6 and detected_version in core.CODE_UI_VERSIONS
             result['nativeCodeSideSessions'] = revision >= 7 and detected_version in core.CODE_UI_VERSIONS
             result['nativeCodeFolderWorktrees'] = revision >= 8 and detected_version in core.CODE_UI_VERSIONS
-            result['updateAvailable'] = revision < PATCH_REVISION
+            # 签名身份变了（例如第一次启用固定本地身份）也要重打一次补丁，
+            # 否则旧安装会一直停在 ad-hoc 签名上，每次更新都得重新授权。
+            result['signingUpdateAvailable'] = (
+                data.get('signingIdentity') != core.local_identity())
+            result['updateAvailable'] = (revision < PATCH_REVISION
+                                         or result['signingUpdateAvailable'])
             result['rollbackAvailable'] = (
                 revision > data.get('upgradeFromRevision', PATCH_REVISION)
                 and bool(data.get('retired'))
@@ -255,10 +262,20 @@ def build(app):
     ent['com.apple.security.cs.disable-library-validation'] = True
     ent_path = STATE / 'entitlements.plist'
     ent_path.write_bytes(plistlib.dumps(ent))
-    core.run('codesign', '--force', '--sign', '-', '--options', 'runtime', '--entitlements', str(ent_path), str(app))
-    core.run('codesign', '--verify', '--deep', '--strict', str(app))
+    # 优先用固定的本地身份，这样更新后系统权限不用重新授权；没有就退回 ad-hoc。
+    core.sign_app(app, ent_path)
 
     return {path: core.sha((app / path).read_bytes()) for path in [ASAR, *adapter['sourceFiles']]}
+
+
+def prepare_identity():
+    """第一次打补丁时建立固定的本地签名身份；建不出来就退回 ad-hoc。
+
+    只影响“更新后要不要重新授权系统权限”，不影响补丁能否使用，
+    所以这里失败不报错，交给签名环节自动降级。
+    """
+    if core.local_identity() is None:
+        core.create_local_identity()
 
 
 def clone(source, destination):
@@ -294,11 +311,13 @@ def enable():
     if current.get('recoveryRequired'):
         raise ValueError('请先关闭开关恢复官方备份，再重新开启。')
     if current['enabled']:
-        if current.get('patchRevision', 1) >= PATCH_REVISION:
+        if (current.get('patchRevision', 1) >= PATCH_REVISION
+                and not current.get('signingUpdateAvailable')):
             return current
         return update()
 
     check_idle()
+    prepare_identity()
     if platform.machine() != 'arm64' or platform.mac_ver()[0] != '27.0.1':
         raise ValueError('当前适配仅验证 arm64 / macOS 27.0.1；停止修改。')
     core.verify_source(TARGET)
@@ -320,6 +339,7 @@ def enable():
         'backgroundExperimental': True,
         'phase': 'prepared',
         'stage': str(stage),
+        'signingIdentity': core.app_signing_identity(stage),
     }
     # 先把恢复信息写盘，之后才做第一次改名。
     previous = manifest()
@@ -348,10 +368,12 @@ def update():
     if not current['enabled'] or not current['supported'] or current.get('recoveryRequired'):
         raise ValueError('仅能更新已校验的完整旧补丁；异常安装请先恢复。')
 
-    # 已经是最新 revision 时直接返回，不要求用户先退出 Claude。
-    if current.get('patchRevision', 1) >= PATCH_REVISION:
+    # 已经是最新 revision、签名身份也没变时直接返回，不要求用户先退出 Claude。
+    if (current.get('patchRevision', 1) >= PATCH_REVISION
+            and not current.get('signingUpdateAvailable')):
         return current
     check_idle()
+    prepare_identity()
     previous = manifest()
     if previous is None:
         raise ValueError('缺少安装记录；请先恢复官方原版并重新安装。')
@@ -373,6 +395,7 @@ def update():
         previous,
         installedFiles=installed,
         patchRevision=PATCH_REVISION,
+        signingIdentity=core.app_signing_identity(stage),
         phase='upgrade-prepared',
         stage=str(stage),
         retired=str(retired),

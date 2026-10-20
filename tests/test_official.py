@@ -61,7 +61,8 @@ class OfficialSafety(unittest.TestCase):
                          official.core.main_availability(old))
         self.assertEqual(official.core.web_availability(new),
                          official.core.web_availability(old))
-        self.assertEqual(official.PATCH_REVISION, 10)
+        # revision 11 只改签名身份，没有新增或改写任何可用性条件。
+        self.assertEqual(official.PATCH_REVISION, 11)
 
     def test_42304_2_anchors_are_distinct_and_hashes_well_formed(self):
         adapter = official.core.ADAPTER_42304_2
@@ -455,6 +456,81 @@ class OfficialSafety(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '不是已校验的官方版本'):
                     official.prepare_update()
             save.assert_not_called()
+
+    def test_signing_identity_update_is_offered_when_identity_changes(self):
+        """装了固定身份后，旧安装（ad-hoc 或无身份记录）要能被重打一次。"""
+        current = {'enabled': True, 'supported': True, 'patchRevision': official.PATCH_REVISION,
+                   'signingUpdateAvailable': True}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'update', return_value={'updated': True}) as update:
+            self.assertEqual(official.enable(), {'updated': True})
+            update.assert_called_once()
+
+    def test_update_runs_when_only_the_signing_identity_changed(self):
+        current = {'enabled': True, 'supported': True, 'patchRevision': official.PATCH_REVISION,
+                   'signingUpdateAvailable': True}
+        with patch.object(official, 'status', return_value=current), \
+             patch.object(official, 'check_idle'), \
+             patch.object(official, 'prepare_identity'), \
+             patch.object(official, 'manifest', return_value=None), \
+             patch.object(official, 'clone') as clone:
+            with self.assertRaisesRegex(ValueError, '缺少安装记录'):
+                official.update()
+            clone.assert_not_called()
+
+    def test_status_reports_signing_update_for_ad_hoc_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory).resolve()
+            backup = state / 'official-backup-1.app'
+            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': official.core.ADAPTER_42304_2['version']}))
+            target = state / 'Claude.app'
+            (target / 'Contents/Resources').mkdir(parents=True)
+            (target / official.ASAR).write_bytes(b'patched')
+            (target / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': official.core.ADAPTER_42304_2['version']}))
+            record = {'version': official.core.ADAPTER_42304_2['version'],
+                      'patchRevision': official.PATCH_REVISION, 'phase': 'enabled',
+                      'backup': str(backup),
+                      'installedFiles': {official.ASAR: official.core.sha(b'patched')}}
+            with patch.object(official, 'STATE', state), patch.object(official, 'TARGET', target), \
+                 patch.object(official, 'manifest', return_value=record), \
+                 patch.object(official, 'running', return_value=False), \
+                 patch.object(official, 'verify_patched'), \
+                 patch.object(official, 'verify_backup'), \
+                 patch.object(official.core, 'local_identity', return_value='abc123'):
+                result = official.status()
+            self.assertTrue(result['enabled'])
+            self.assertTrue(result['signingUpdateAvailable'])
+            self.assertTrue(result['updateAvailable'])
+
+    def test_signing_identity_parses_codesign_output_from_either_stream(self):
+        import native_unlock as core
+        for stream, text in [('stdout', b'designated => identifier "x" and certificate root = H"AB12"\n'),
+                             ('stderr', b'designated => identifier "x" and certificate root = H"AB12"\n')]:
+            done = type('R', (), {'stdout': text if stream == 'stdout' else b'',
+                                  'stderr': text if stream == 'stderr' else b''})()
+            with patch.object(core, 'run', return_value=done):
+                self.assertEqual(core.app_signing_identity(pathlib.Path('X.app')), 'ab12')
+        with patch.object(core, 'run', return_value=type('R', (), {
+                'stdout': b'designated => cdhash H"dead"\n', 'stderr': b''})()):
+            self.assertIsNone(core.app_signing_identity(pathlib.Path('X.app')))
+
+    def test_local_identity_needs_both_keychain_and_marker(self):
+        import native_unlock as core
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            with patch.object(core, 'WORK', root):
+                self.assertIsNone(core.local_identity())
+                _, keychain, _, marker = core.signing_paths()
+                keychain.parent.mkdir(parents=True, exist_ok=True)
+                keychain.write_text('x')
+                self.assertIsNone(core.local_identity())
+                marker.write_text('aabb\n')
+                self.assertEqual(core.local_identity(), 'aabb')
+                marker.write_text('\n')
+                self.assertIsNone(core.local_identity())
 
     def test_launch_opens_unsupported_official_build(self):
         with tempfile.TemporaryDirectory() as directory:

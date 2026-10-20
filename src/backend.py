@@ -6,12 +6,78 @@ Swift 界面只调用这里，再分发到三个后端模块。所有运行数�
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 
+ROOT_NAME = 'Claude 原生助手'
+LEGACY_ROOT_NAME = 'Claude Native Unlock'
+
+
+def rewrite_legacy_paths(root, old, new):
+    """把记录文件里写死的旧目录路径改成新路径（备份路径是绝对路径）。"""
+    before, after = str(old), str(new)
+    for path in root.rglob('*.json'):
+        if path.is_symlink() or not path.is_file():
+            continue
+        text = path.read_text()
+        if before in text:
+            path.write_text(text.replace(before, after))
+
+
+def state_entries(root):
+    """目录里已有的真实状态条目（安装记录、备份都在 work/ 下面）。"""
+    work = root / 'work'
+    if not work.is_dir() or work.is_symlink():
+        return []
+    return list(work.iterdir())
+
+
+def disposable_shell(root):
+    """判断目录是不是“界面启动时建出来的空壳”。
+
+    界面为了写 last-operation.json 会先建好目录；此时 work/ 里还没有任何
+    安装记录或备份。只有这种情况才允许清掉重建，避免误删真实状态。
+    """
+    if not root.is_dir() or root.is_symlink():
+        return False
+    if state_entries(root):
+        return False
+    for entry in root.iterdir():
+        if entry.name == 'work' or entry.name.startswith('last-'):
+            continue
+        return False
+    return True
+
+
 def storage_root():
-    """恢复记录和备份的固定位置。"""
-    return Path.home() / 'Library/Application Support/Claude Native Unlock'
+    """恢复记录和备份的固定位置。
+
+    0.3.16 起目录名随产品改名。旧目录还在、新目录还没拿到真实状态时整体
+    改名一次，并把记录里的绝对路径一起改掉；任何一步失败都退回旧目录，
+    绝不丢官方备份。符号链接一律不动，避免被重定向到别处。
+    """
+    support = Path.home() / 'Library/Application Support'
+    current, legacy = support / ROOT_NAME, support / LEGACY_ROOT_NAME
+    if current.is_symlink() or legacy.is_symlink() or not legacy.is_dir():
+        return current
+    if state_entries(current):
+        return current
+    if current.exists() and not disposable_shell(current):
+        return current
+    try:
+        if current.exists():
+            shutil.rmtree(current)
+        legacy.rename(current)
+        rewrite_legacy_paths(current, legacy, current)
+    except Exception:
+        try:
+            if current.exists() and not legacy.exists():
+                current.rename(legacy)
+        except OSError:
+            pass
+        return legacy
+    return current
 
 
 def configure(root=None):

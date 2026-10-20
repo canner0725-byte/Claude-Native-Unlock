@@ -91,6 +91,6 @@ def migrate(source_root, destination):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source_root', type=Path)
-    parser.add_argument('--destination', type=Path, default=Path.home()/'Library/Application Support/Claude Native Unlock')
+    parser.add_argument('--destination', type=Path, default=Path.home()/'Library/Application Support/Claude 原生助手')
     args = parser.parse_args()
     print(json.dumps(migrate(args.source_root, args.destination)))

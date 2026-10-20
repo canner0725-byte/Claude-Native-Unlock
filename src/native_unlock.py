@@ -9,13 +9,13 @@
 不在这里实现任何 Computer Use、浏览器或模型功能，也不修改 Claude 的
 逐应用授权、系统权限、截图过滤、拒绝、中断或动作审查。
 """
-import hashlib, json, pathlib, plistlib, struct, subprocess
+import hashlib, json, os, pathlib, plistlib, secrets, shutil, struct, subprocess, tempfile
 
 # 源码仓库根目录。打包成独立助手后，backend.py 会把 WORK 指到用户数据目录，
 # 避免把备份写进只读或会被替换的应用包。
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORK = ROOT / 'work'
-APP = WORK / 'Claude Native Unlock Test.app'
+APP = WORK / 'Claude 原生助手 Test.app'
 BASELINE = WORK / 'baseline' / 'Claude.app'
 PROFILE = WORK / 'profile'
 
@@ -267,3 +267,147 @@ def replace_once(s, old, new):
     if s.count(old) != 1:
         raise ValueError('Patch match count != 1: '+old[:90])
     return s.replace(old,new,1)
+
+
+# --------------------------------------------------------------------------
+# 固定的本地代码签名身份
+#
+# 改过 app.asar 就必须重新签名，而没有官方私钥时只能用临时（ad-hoc）签名。
+# ad-hoc 签名的“指定要求”是二进制的 cdhash，每次重签都会变，macOS 因此
+# 每次都把之前授予的辅助功能、屏幕录制作废。改用一把**固定的本地身份**
+# 后，指定要求变成 `identifier … and certificate root = H"…"`，只跟证书
+# 有关；同一个证书重签多少次，要求都不变，系统权限就能留住。
+#
+# 证书在本机生成一次，私钥只留在本机的钥匙串里，不随发布包分发——
+# 分发的私钥等于没有私钥，任何人都能拿它冒充本工具。
+# --------------------------------------------------------------------------
+
+IDENTITY_COMMON_NAME = 'Claude Native Unlock Local Signing'
+
+
+def remove_path(path):
+    """删除文件或目录；shutil.rmtree 对文件会静默失败，必须分开处理。"""
+    path = pathlib.Path(path)
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def signing_paths():
+    """本地签名身份的存放位置；随 WORK 一起落在用户数据目录。"""
+    root = WORK / 'signing'
+    return root, root / 'identity.keychain', root / 'password', root / 'identity.txt'
+
+
+def local_identity():
+    """返回本机已建立的签名身份；没有就返回 None（此时退回 ad-hoc 签名）。
+
+    只读一个小标记文件，不访问钥匙串，所以可以在每次状态检测里调用。
+    """
+    _, keychain, _, marker = signing_paths()
+    if not keychain.exists() or not marker.exists() or marker.is_symlink():
+        return None
+    value = marker.read_text().strip()
+    return value or None
+
+
+def create_local_identity():
+    """一次性建立本地代码签名身份；失败时返回 None，由调用方退回 ad-hoc。
+
+    证书和私钥只在本机生成并留在本机钥匙串里，不进发布包：分发的私钥
+    等于没有私钥，任何人都能拿它冒充本工具。
+    """
+    existing = local_identity()
+    if existing:
+        return existing
+    root, keychain, password_file, marker = signing_paths()
+    if not pathlib.Path('/usr/bin/openssl').exists():
+        return None
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # 标记文件丢失但钥匙串还在（上次中断）时先清干净，否则 create-keychain 会失败。
+    if keychain.exists():
+        remove_path(keychain)
+    password = secrets.token_urlsafe(24)
+    work = pathlib.Path(tempfile.mkdtemp(prefix='identity-'))
+    try:
+        combined = work / 'identity.pem'
+        run('/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+            '-keyout', str(work / 'key.pem'), '-out', str(work / 'cert.pem'),
+            '-days', '3650', '-nodes',
+            '-subj', '/CN=' + IDENTITY_COMMON_NAME + '/O=Claude Native Unlock',
+            '-addext', 'keyUsage=critical,digitalSignature',
+            '-addext', 'extendedKeyUsage=critical,codeSigning',
+            '-addext', 'basicConstraints=critical,CA:false')
+        # 直接导入 PEM，省掉 PKCS#12 的加密格式兼容问题。
+        combined.write_bytes((work / 'key.pem').read_bytes()
+                             + (work / 'cert.pem').read_bytes())
+        run('/usr/bin/security', 'create-keychain', '-p', password, str(keychain))
+        run('/usr/bin/security', 'set-keychain-settings', '-l', '-u', str(keychain))
+        run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain))
+        run('/usr/bin/security', 'import', str(combined), '-k', str(keychain),
+            '-f', 'pemseq', '-T', '/usr/bin/codesign')
+        # 允许 codesign 无提示使用私钥；否则每次签名都会弹权限对话框。
+        run('/usr/bin/security', 'set-key-partition-list',
+            '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain))
+        listing = run('/usr/bin/security', 'find-identity', '-p', 'codesigning',
+                      str(keychain)).stdout.decode()
+        digest = next((line.split()[1] for line in listing.splitlines()
+                       if IDENTITY_COMMON_NAME in line), None)
+        if not digest:
+            raise ValueError('identity not found after import')
+        # security 输出大写、codesign 的指定要求用小写；统一成小写，
+        # 否则“身份是否变化”会永远判成变了，界面就会一直提示更新。
+        digest = digest.lower()
+        password_file.write_text(password + '\n')
+        os.chmod(password_file, 0o600)
+        marker.write_text(digest + '\n')
+        os.chmod(marker, 0o600)
+        return digest
+    except Exception:
+        # 建不出来就退回 ad-hoc：功能不受影响，只是更新后要重新授权。
+        for path in (keychain, pathlib.Path(str(keychain) + '-db')):
+            remove_path(path)
+        password_file.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+        return None
+    finally:
+        remove_path(work)
+
+
+def app_signing_identity(app):
+    """读取应用**实际**的签名身份：固定身份返回证书哈希，ad-hoc 返回 None。
+
+    记录实际结果而不是“打算用什么”，这样安装记录始终能反映真实签名，
+    本地身份被删掉时也能自愈（下次打补丁会重新建立）。
+    """
+    import re
+    try:
+        # codesign 把指定要求写在 stdout、把 Executable 行写在 stderr，两处都收。
+        done = run('/usr/bin/codesign', '-d', '-r-', str(app))
+        text = (done.stdout + done.stderr).decode()
+    except Exception:
+        # 读不出来（例如合成测试目录）时按“没有固定身份”处理，不影响流程。
+        return None
+    match = re.search(r'certificate (?:root|leaf) = H"([0-9a-fA-F]+)"', text)
+    return match.group(1).lower() if match else None
+
+
+def sign_app(app, entitlements_path):
+    """用固定的本地身份签名；没有身份时退回 ad-hoc，并返回实际用到的身份。"""
+    identity = local_identity()
+    if identity:
+        try:
+            _, keychain, password_file, _ = signing_paths()
+            run('/usr/bin/security', 'unlock-keychain', '-p',
+                password_file.read_text().strip(), str(keychain))
+            run('/usr/bin/codesign', '--force', '--sign', identity,
+                '--keychain', str(keychain), '--options', 'runtime',
+                '--entitlements', str(entitlements_path), str(app))
+        except Exception:
+            identity = None
+    if not identity:
+        run('/usr/bin/codesign', '--force', '--sign', '-', '--options', 'runtime',
+            '--entitlements', str(entitlements_path), str(app))
+    run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(app))
+    return identity

@@ -11,8 +11,9 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.15'
-BUILD_NUMBER = '28'
+VERSION = '0.3.16'
+BUILD_NUMBER = '29'
+APP_NAME = 'Claude 原生助手'
 
 
 def run(*args):
@@ -20,12 +21,19 @@ def run(*args):
 
 
 def prune_artifacts():
-    """发布后只保留当前版本的安装包，构建中间产物全部清理。"""
+    """发布后只保留当前版本的安装包和应用，构建中间产物全部清理。
+
+    安装包按“文件名里没有当前版本号”判断，应用按“不是刚构建的那个”判断，
+    这样换产品名、换版本号都不会把旧文件留在发布目录里。
+    """
     dist = ROOT / 'dist'
+    keep = dist / f'{APP_NAME}.app'
     for path in dist.iterdir():
-        if (path.is_file() and path.name.startswith('Claude-Native-Unlock-')
-                and path.suffix in ('.dmg', '.zip') and f'-{VERSION}-' not in path.name):
+        if (path.is_file() and path.suffix in ('.dmg', '.zip')
+                and f'-{VERSION}-' not in path.name):
             path.unlink()
+        elif path.is_dir() and path.suffix == '.app' and path != keep:
+            shutil.rmtree(path)
     build_dir = ROOT / 'build'
     for path in build_dir.iterdir():
         if path.is_dir():
@@ -42,7 +50,7 @@ def build():
     work.mkdir(parents=True)
     dist = ROOT / 'dist'
     dist.mkdir(exist_ok=True)
-    app = dist / 'Claude Native Unlock.app'
+    app = dist / f'{APP_NAME}.app'
     if app.exists():
         app.rename(work / 'previous.app')
     run(sys.executable, '-m', 'PyInstaller', '--onedir', '--name', 'NativeUnlockBackend',
@@ -79,7 +87,7 @@ def build():
     shutil.copy2(python_license, licenses/'Python-LICENSE.txt')
     (contents/'Info.plist').write_bytes(plistlib.dumps({
         'CFBundleIdentifier': 'local.claude.native-unlock',
-        'CFBundleName': 'Claude Native Unlock',
+        'CFBundleName': APP_NAME,
         'CFBundleDisplayName': 'Claude 原生助手',
         'CFBundleExecutable': 'ClaudeNativeUnlock',
         'CFBundlePackageType': 'APPL', 'CFBundleVersion': BUILD_NUMBER,
@@ -90,7 +98,7 @@ def build():
     # Nested Python binaries are already ad-hoc signed by PyInstaller.
     run('/usr/bin/codesign', '--force', '--sign', '-', app)
     run('/usr/bin/codesign', '--verify', '--deep', '--strict', app)
-    archive = dist/f'Claude-Native-Unlock-{VERSION}-arm64.zip'
+    archive = dist/f'Claude-原生助手-{VERSION}-arm64.zip'
     if archive.exists():
         archive.rename(work/archive.name)
     run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
@@ -98,7 +106,7 @@ def build():
     image_root.mkdir()
     run('/bin/cp', '-cR', app, image_root/app.name)
     (image_root/'Applications').symlink_to('/Applications')
-    image = dist/f'Claude-Native-Unlock-{VERSION}-arm64.dmg'
+    image = dist/f'Claude-原生助手-{VERSION}-arm64.dmg'
     if image.exists():
         image.rename(work/image.name)
     run('/usr/bin/hdiutil', 'create', '-volname', 'Claude 原生助手', '-srcfolder', image_root,

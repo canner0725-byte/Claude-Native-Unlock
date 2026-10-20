@@ -1,4 +1,4 @@
-# Claude 原生助手 · Claude Native Unlock
+# Claude 原生助手
 
 [下载安装包](https://github.com/canner0725-byte/Claude-Native-Unlock/releases/latest) · [源码仓库](https://github.com/canner0725-byte/Claude-Native-Unlock)
 
@@ -20,9 +20,9 @@
 
 ## 下载与安装
 
-在 GitHub Releases 下载 Apple Silicon 的 `.dmg`，打开后将 Claude Native Unlock 拖入 Applications，也可使用 `.zip`。双击应用即可使用。首次发布使用临时签名，**没有 Apple Developer ID 签名或公证**；macOS 可能阻止首次打开。请自行核对源码和校验和，通过系统正常界面决定是否允许，不需要关闭 Gatekeeper 或 SIP。
+在 GitHub Releases 下载 Apple Silicon 的 `.dmg`，打开后将 Claude 原生助手拖入 Applications，也可使用 `.zip`。双击应用即可使用。首次发布使用临时签名，**没有 Apple Developer ID 签名或公证**；macOS 可能阻止首次打开。请自行核对源码和校验和，通过系统正常界面决定是否允许，不需要关闭 Gatekeeper 或 SIP。
 
-状态及备份位于 `~/Library/Application Support/Claude Native Unlock/`。移动应用、删除源码目录、更新本工具均不应删除此目录；恢复 Claude 原版需要其中的当前官方备份。工具只保留最新补丁和当前官方备份，更新成功后会清理旧补丁、旧备份和旧报告。更新本助手本身只需替换 Applications 里的应用，不会重新签名或修改 Claude；只有安装/更新 Claude 补丁时才会重签 Claude。
+状态及备份位于 `~/Library/Application Support/Claude 原生助手/`。移动应用、删除源码目录、更新本工具均不应删除此目录；恢复 Claude 原版需要其中的当前官方备份。工具只保留最新补丁和当前官方备份，更新成功后会清理旧补丁、旧备份和旧报告。更新本助手本身只需替换 Applications 里的应用，不会重新签名或修改 Claude；只有安装/更新 Claude 补丁时才会重签 Claude。
 
 ### 版本保留策略
 
@@ -52,6 +52,8 @@
 ### 提示建议：按 Tab 采纳
 
 Claude 回复结束后，输入框里可能先出现一段浅色的“建议下一句”。它不是已经填好的文字：点击它或直接按回车都不会发送。先按 **Tab** 采纳，文字进入输入框后，再按回车发送。0.3.6 补丁会让官方 “Prompt suggestions” 设置项在第三方 API 模式下可见，可以按需关闭。
+
+0.3.16 把产品名统一为“Claude 原生助手”，并解决“每次更新都要重新授予系统权限”的老问题：第一次打补丁时在本机生成一把固定的代码签名证书（私钥只留在本机钥匙串，不进发布包），之后一直用它签名。ad-hoc 签名的指定要求是 cdhash、重签即失效，固定身份的指定要求只跟证书有关——实测同一身份给两份内容不同的构建签名，要求完全一致。建不出身份时自动退回 ad-hoc，补丁照常可用。补丁 revision 10 → 11（只改签名方式，没有新增可用性条件）。状态目录改为 `~/Library/Application Support/Claude 原生助手/`，旧目录启动时整体迁移一次，失败自动退回，绝不丢官方备份。89 项公开测试通过。
 
 0.3.15 适配官方 Claude Desktop 2.42304.2（更新器 arm64 构建）：可用性条件与 revision 10 完全一致，只换适配版本和文件指纹，补丁 revision 仍为 10。2.42304.2 把本地功能表改名为 `W8t`（强制项）/ `G8t`（下发渲染进程项），补丁仍按原方式把目标开关追加进表内。2.42304.2 内置的 Claude Code CLI 仍是 2.1.299，因此 CLI 只新增桌面版本白名单。原生配置把 2.42304.2 加入可读版本，官方升级后旧恢复记录继续有效。77 项公开合成测试通过；在真实应用的隔离副本上构建补丁并用本机 Node 运行应用自己的功能表解析代码，确认目标开关强制可用、官方未打补丁时不可用；0.3.15（build 28）构建、签名、ZIP/DMG/SHA256、DMG 校验、ZIP 解压和安装启动检查通过。正式安装已复核：安装后的 ASAR 与隔离验证结果字节一致，九项可用性条目各出现一次，补丁版 Claude 正常启动，旧备份按“只保留最新版”清理。运行时也已证实：Claude 自己的日志显示功能表条数 31（官方原版）→ 36（补丁版），Computer Use 主开关解析为 `raw={"enabled":true,"appScopedEnabled":true} → enabled=true`。重新签名后 Claude 为 ad-hoc 签名，**系统权限需要重新绑定**：请在系统设置中重新勾选 Claude 的辅助功能与屏幕录制并重启 Claude，否则 Computer Use 无法真正截图/点击。尚未验证：真实 Computer Use 动作、运行时回归、2.42304.2 上的官方更新全流程。
 

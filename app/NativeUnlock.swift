@@ -61,7 +61,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var trayQuit: NSMenuItem!
 
     let storageURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Claude Native Unlock")
+        .appendingPathComponent("Library/Application Support/Claude 原生助手")
 
     let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve", "code-auto-dream"]
     let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务", "Cowork 自动审批选项", "Code 原生自动整理可用性"]
