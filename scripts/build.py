@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = '0.3.16'
 BUILD_NUMBER = '29'
 APP_NAME = 'Claude 原生助手'
+# 文件名保持 ASCII：非 ASCII 的发布文件名会被 GitHub 换成“.”，下载链接很难看。
+ARCHIVE_NAME = 'Claude-Native-Assistant'
 
 
 def run(*args):
@@ -30,7 +32,8 @@ def prune_artifacts():
     keep = dist / f'{APP_NAME}.app'
     for path in dist.iterdir():
         if (path.is_file() and path.suffix in ('.dmg', '.zip')
-                and f'-{VERSION}-' not in path.name):
+                and (f'-{VERSION}-' not in path.name
+                     or not path.name.startswith(ARCHIVE_NAME))):
             path.unlink()
         elif path.is_dir() and path.suffix == '.app' and path != keep:
             shutil.rmtree(path)
@@ -98,7 +101,7 @@ def build():
     # Nested Python binaries are already ad-hoc signed by PyInstaller.
     run('/usr/bin/codesign', '--force', '--sign', '-', app)
     run('/usr/bin/codesign', '--verify', '--deep', '--strict', app)
-    archive = dist/f'Claude-原生助手-{VERSION}-arm64.zip'
+    archive = dist/f'{ARCHIVE_NAME}-{VERSION}-arm64.zip'
     if archive.exists():
         archive.rename(work/archive.name)
     run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', app, archive)
@@ -106,7 +109,7 @@ def build():
     image_root.mkdir()
     run('/bin/cp', '-cR', app, image_root/app.name)
     (image_root/'Applications').symlink_to('/Applications')
-    image = dist/f'Claude-原生助手-{VERSION}-arm64.dmg'
+    image = dist/f'{ARCHIVE_NAME}-{VERSION}-arm64.dmg'
     if image.exists():
         image.rename(work/image.name)
     run('/usr/bin/hdiutil', 'create', '-volname', 'Claude 原生助手', '-srcfolder', image_root,
