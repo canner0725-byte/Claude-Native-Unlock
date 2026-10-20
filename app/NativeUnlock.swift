@@ -10,6 +10,8 @@ import AppKit
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var contentStack: NSStackView!
+    /// Stack 底边与内容视图的约束；量高度时要临时断开，否则它把高度钉在窗口上。
+    var contentBottomPin: NSLayoutConstraint!
 
     // 主开关：安装 / 恢复正式版可用性补丁。
     let toggle = NSSwitch()
@@ -96,6 +98,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Dock 图标直接从包内读取：系统图标缓存有时仍显示旧图标。
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        }
 
         // 应用菜单。
         let menu = NSMenu()
@@ -213,7 +220,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             control.action = #selector(featureChanged(_:))
             control.setAccessibilityLabel(name + " 配置开关")
             control.isEnabled = false
-            control.controlSize = .small
             featureSwitches.append(control)
             featureLabels.append(detail)
 
@@ -241,7 +247,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let section = NSTextField(labelWithString: "原生配置")
         section.font = .systemFont(ofSize: 11, weight: .semibold)
-        section.textColor = .tertiaryLabelColor
+        section.textColor = .secondaryLabelColor
 
         featureSummary.font = .systemFont(ofSize: 11)
         featureSummary.textColor = .systemOrange
@@ -292,9 +298,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+            stack.topAnchor.constraint(equalTo: content.topAnchor)
         ])
+        contentBottomPin = stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        contentBottomPin.isActive = true
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -306,7 +313,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func resizeToFit(animated: Bool = true) {
         guard window.isVisible, let content = window.contentView else { return }
         content.layoutSubtreeIfNeeded()
+        // 底边约束会把 Stack 高度钉死在窗口上，量出来的永远是当前高度。
+        // 先断开再量，才能拿到内容真正需要的高度。
+        contentBottomPin.isActive = false
         let height = ceil(contentStack.fittingSize.height)
+        contentBottomPin.isActive = true
         guard height > 100 else { return }
         let current = window.frame.height
         guard abs(height - current) > 0.5 else { return }
@@ -317,17 +328,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 圆角卡片：窗口背景上做一层浅底，和系统设置的分组观感一致。
-    func makeCard(_ inner: NSView) -> NSBox {
-        let box = NSBox()
-        box.boxType = .custom
-        box.titlePosition = .noTitle
-        box.cornerRadius = 10
-        box.borderWidth = 1
-        box.borderColor = .separatorColor
-        box.fillColor = .controlBackgroundColor
-        box.contentViewMargins = .zero
-        box.contentView = inner
-        return box
+    ///
+    /// 不用 NSBox：它的 contentView 不参与 Auto Layout，卡片量出来的高度是 0，
+    /// 内容会从卡片里溢出来压到上面的标题上。自己画一层，尺寸由内容决定。
+    func makeCard(_ inner: NSView) -> CardView {
+        let card = CardView()
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
+        ])
+        return card
     }
 
     /// 内容变化时统一走这里：淡入淡出加轻微位移，避免界面“跳一下”。
@@ -642,9 +656,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func installStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        let image = NSImage(systemSymbolName: "lock.open", accessibilityDescription: "Claude 原生助手菜单")
-        image?.isTemplate = true
-        statusItem.button?.image = image
+        statusItem.button?.image = menuBarIcon(.unlocked)
         statusItem.button?.toolTip = "Claude 原生助手 · 正在检测"
         trayMenu.autoenablesItems = false
 
@@ -681,19 +693,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 : "原生补丁未开启")
             : (targetExists ? "版本待适配" : "未找到 Claude")
 
-        let symbol: String
+        let state: MenuBarIconState
         if blocked {
-            symbol = "hourglass"
+            state = .busy
         } else if !statusLoaded {
-            symbol = "lock.open"
+            state = .unlocked
         } else if recoveryRequired || (enabled && !backupVerified) || !officialSupported {
-            symbol = "exclamationmark.triangle"
+            state = .alert
         } else {
-            symbol = enabled ? "lock.open" : "lock"
+            state = enabled ? .unlocked : .locked
         }
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Claude 原生助手菜单")
-        image?.isTemplate = true
-        statusItem.button?.image = image
+        statusItem.button?.image = menuBarIcon(state)
         statusItem.button?.toolTip = "Claude 原生助手 · " + text
         trayStatus.title = text
         trayRefresh.isEnabled = !blocked
@@ -1166,6 +1176,148 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshAllStatus()
     }
 
+}
+
+// MARK: - 菜单栏图标
+
+/// 放射星芒：rays 条从中心向外张开的圆头花瓣。和 App 图标共用同一套形状。
+func starburstPath(center: NSPoint, radius: CGFloat, rays: Int,
+                   innerRatio: CGFloat = 0.20,
+                   innerWidth: CGFloat = 0.075,
+                   outerWidth: CGFloat = 0.21) -> NSBezierPath {
+    let path = NSBezierPath()
+    let r0 = radius * innerRatio
+    let w0 = radius * innerWidth / 2
+    let w1 = radius * outerWidth / 2
+    let tipY = radius - w1
+    for index in 0..<rays {
+        let petal = NSBezierPath()
+        petal.move(to: NSPoint(x: -w0, y: r0))
+        petal.curve(to: NSPoint(x: -w1, y: tipY),
+                    controlPoint1: NSPoint(x: -w0 * 1.25, y: r0 + (radius - r0) * 0.45),
+                    controlPoint2: NSPoint(x: -w1, y: tipY - (radius - r0) * 0.30))
+        petal.appendArc(withCenter: NSPoint(x: 0, y: tipY), radius: w1,
+                        startAngle: 180, endAngle: 0, clockwise: true)
+        petal.curve(to: NSPoint(x: w0, y: r0),
+                    controlPoint1: NSPoint(x: w1, y: tipY - (radius - r0) * 0.30),
+                    controlPoint2: NSPoint(x: w0 * 1.25, y: r0 + (radius - r0) * 0.45))
+        petal.close()
+        var transform = AffineTransform()
+        transform.translate(x: center.x, y: center.y)
+        transform.rotate(byDegrees: CGFloat(index) * 360 / CGFloat(rays))
+        petal.transform(using: transform)
+        path.append(petal)
+    }
+    return path
+}
+
+/// 挂锁：锁体填充 + 锁梁描边；open = true 时锁梁右侧抬起。
+func drawPadlock(rect: NSRect, open: Bool) {
+    let width = rect.width
+    let stroke = width * 0.15
+    let shackleRadius = width * 0.30
+    let bodyHeight = max(rect.height - shackleRadius - stroke, width * 0.40)
+    let body = NSRect(x: rect.minX, y: rect.minY, width: width, height: bodyHeight)
+    NSBezierPath(roundedRect: body, xRadius: width * 0.22, yRadius: width * 0.22).fill()
+
+    let shackle = NSBezierPath()
+    shackle.appendArc(withCenter: NSPoint(x: rect.midX, y: body.maxY),
+                      radius: shackleRadius, startAngle: 180,
+                      endAngle: open ? 45 : 0, clockwise: true)
+    shackle.lineWidth = stroke
+    shackle.lineCapStyle = .round
+    shackle.stroke()
+}
+
+enum MenuBarIconState { case unlocked, locked, alert, busy }
+
+/// 星芒 + 状态徽章，画进 18×18 的点坐标系。
+func drawMenuBarIcon(_ state: MenuBarIconState) {
+    let size: CGFloat = 18
+    NSColor.black.setFill()
+    NSColor.black.setStroke()
+    if state == .busy {
+        NSColor(white: 0, alpha: 0.45).setFill()
+        starburstPath(center: NSPoint(x: size * 0.5, y: size * 0.5),
+                      radius: size * 0.42, rays: 8).fill()
+        return
+    }
+    starburstPath(center: NSPoint(x: size * 0.35, y: size * 0.65),
+                  radius: size * 0.36, rays: 12,
+                  innerWidth: 0.06, outerWidth: 0.19).fill()
+    switch state {
+    case .alert:
+        let bar = NSRect(x: size * 0.72, y: size * 0.30, width: size * 0.12, height: size * 0.32)
+        NSBezierPath(roundedRect: bar, xRadius: bar.width / 2, yRadius: bar.width / 2).fill()
+        let dot = NSRect(x: size * 0.72, y: size * 0.14, width: size * 0.12, height: size * 0.12)
+        NSBezierPath(ovalIn: dot).fill()
+    default:
+        let box = NSRect(x: size * 0.47, y: size * 0.02, width: size * 0.50, height: size * 0.57)
+        // 先挖一圈空隙，锁和星芒才不会糊在一起。
+        if let context = NSGraphicsContext.current?.cgContext {
+            context.setBlendMode(.clear)
+            NSBezierPath(ovalIn: box.insetBy(dx: -size * 0.045, dy: -size * 0.045)).fill()
+            context.setBlendMode(.normal)
+        }
+        NSColor.black.setFill()
+        NSColor.black.setStroke()
+        drawPadlock(rect: box, open: state == .unlocked)
+    }
+}
+
+/// 模板图：1x / 2x 两份表示，系统按菜单栏明暗自动着色。
+var menuBarIconCache: [String: NSImage] = [:]
+
+func menuBarIcon(_ state: MenuBarIconState) -> NSImage {
+    let key = String(describing: state)
+    if let cached = menuBarIconCache[key] { return cached }
+    let points: CGFloat = 18
+    let image = NSImage(size: NSSize(width: points, height: points))
+    for scale in [1, 2] {
+        let pixels = Int(points) * scale
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        // 位图上下文以像素为单位；先按像素放大绘制，再标点尺寸。
+        // 顺序反了会让 18pt 的设计在 18pt 的画布里被放大 2 倍后裁掉。
+        NSGraphicsContext.current?.cgContext.scaleBy(x: CGFloat(scale), y: CGFloat(scale))
+        drawMenuBarIcon(state)
+        NSGraphicsContext.restoreGraphicsState()
+        rep.size = NSSize(width: points, height: points)
+        image.addRepresentation(rep)
+    }
+    image.isTemplate = true
+    menuBarIconCache[key] = image
+    return image
+}
+
+/// 圆角卡片：浅底 + 细描边，高度跟着内容走。
+final class CardView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        applyColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyColors() {
+        // 动态颜色要在当前外观下解析，否则切到深色模式还是浅色底。
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
 }
 
 let app = NSApplication.shared
