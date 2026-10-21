@@ -33,7 +33,8 @@ ASAR = 'Contents/Resources/app.asar'
 # 升级判断只看它，不再把历史条件一层层拼在一起，
 # 这样以后新增功能不会被旧逻辑误判为“已经是最新”。
 # revision 11：补丁改用固定的本地签名身份（见 native_unlock 的说明）。
-PATCH_REVISION = 11
+# revision 12：适配 Desktop 3.1623.0，并按表内实际内容决定追加哪些开关。
+PATCH_REVISION = 12
 
 # 只读诊断会读取这些固定文件；不会读取配置、密钥或会话。
 DIAGNOSTIC_SOURCE_FILES = [
@@ -184,8 +185,13 @@ def status():
                 result['message'] = '补丁文件校验通过 · 官方备份异常，已停用恢复和补丁更新；请检查备份目录。'
                 result['updateAvailable'] = False
         else:
-            core.verify_source(TARGET)
+            adapter = core.source_adapter(TARGET)
+            core.verify_source(TARGET, adapter)
             result.update(supported=True, message='未开启 · 官方原版校验通过')
+            if adapter.get('discovered'):
+                # 未登记的新版本：官方身份和功能表结构都对得上，可以解锁。
+                result['structuralAdaptation'] = True
+                result['message'] = '未登记版本 · 结构匹配，可以解锁'
     except Exception:
         if detected_version is not None and not result['enabled']:
             result['message'] = (
@@ -210,26 +216,26 @@ def build(app):
     只改主进程功能表里目标功能的部署条件；官方提示、截图、
     授权和执行器保持原样。
     """
-    original, header, base = core.verify_source(app)
     adapter = core.source_adapter(app)
+    original, header, base = core.verify_source(app, adapter)
     data = bytearray(original[base:])
 
     # Computer Use 基础开关、后台模式、macOS 上限，以及各版本自己的可用性条件。
-    feature = (
+    # 逐条插入：官方已经强制成同样形状的跳过，形状不同则停下，不覆盖官方语义。
+    entries = core.split_entries(
         '1291166712:{rule:"forced",value:{enabled:!0,appScopedEnabled:!0}},'
         '1346958739:{rule:"forced",value:{major:27,minor:0}},'
+        + core.main_availability(adapter)
     )
     for path in [adapter['main']]:
         old = core.content(original, header, base, path).decode()
-        changed = core.replace_once(
-            old,
-            adapter['featureAnchor'],
-            adapter['featureAnchor'] + feature + core.main_availability(adapter),
-        )
+        changed = core.insert_entries(old, adapter['featureAnchor'], entries)
         web_availability = core.web_availability(adapter)
         if web_availability:
-            changed = core.replace_once(changed, adapter['webFeatureAnchor'],
-                                       adapter['webFeatureAnchor'] + web_availability)
+            changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
+                                          core.split_entries(web_availability))
+        # 改完先过一遍语法检查，避免把 Claude 写成打不开的应用。
+        core.check_js(changed)
         new = changed.encode()
         node = core.node(header, path)
         node['offset'], node['size'] = str(len(data)), len(new)
@@ -292,8 +298,12 @@ def prune_old_state(keep_backup=None):
     永远保留；符号链接一律跳过，避免误删状态目录之外的文件。
     """
     keep = pathlib.Path(keep_backup).name if keep_backup else None
+    # prepared / upgrade-prepared / restore-prepared / rollback-prepared 都是
+    # 操作中途的临时副本：成功时已被改名成最终目录，留下的就是中断残留。
     prefixes = ('retired-patched-', 'rollback-retired-',
-                'adaptation-report-', 'previous-version-manifest-')
+                'adaptation-report-', 'previous-version-manifest-',
+                'prepared-', 'upgrade-prepared-', 'restore-prepared-',
+                'rollback-prepared-')
     for entry in STATE.iterdir():
         if entry.is_symlink():
             continue

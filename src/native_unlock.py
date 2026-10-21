@@ -9,7 +9,7 @@
 不在这里实现任何 Computer Use、浏览器或模型功能，也不修改 Claude 的
 逐应用授权、系统权限、截图过滤、拒绝、中断或动作审查。
 """
-import hashlib, json, os, pathlib, plistlib, secrets, shutil, struct, subprocess, tempfile
+import hashlib, json, os, pathlib, plistlib, re, secrets, shutil, struct, subprocess, tempfile
 
 # 源码仓库根目录。打包成独立助手后，backend.py 会把 WORK 指到用户数据目录，
 # 避免把备份写进只读或会被替换的应用包。
@@ -174,9 +174,36 @@ ADAPTER_42304_2 = {
  }
 }
 
+# 3.1623.0：大版本跃迁后重新核对的构建。功能表仍是两张：
+# `var ken={…}`（强制项）与紧随其后的 `Aen={…}`（下发渲染进程项）。
+# 与 2.42304.2 的差异都在表里，所以适配器只追加真正还缺的开关：
+# - 2371478310 / 857846362 官方已自行强制，不再追加（重复键会被后出现的官方值覆盖）；
+# - 3264789062 改成 rule:"follows"，是官方有意跟随“会话是否跑在本机”，不覆盖；
+# - 1235690166 / 3335190042 / 3858164079 已从整个包里消失，不再追加；
+# - 2120747855（提示建议设置项）仍然缺失，继续强制。
+ADAPTER_31623 = {
+ 'version': '3.1623.0',
+ 'asarHash': '760e7cbb6f861f0bc0e71e71fd9c6b721ba735f0f638b6ea623645daff4261a7',
+ 'main': '.vite/build/index.chunk-BLvpT1n4.js',
+ 'featureAnchor': 'var ken={',
+ 'mainAvailability': '2120747855:{rule:"forced",value:!0},',
+ 'webFeatureAnchor': 'Aen={',
+ 'webAvailability': '',
+ 'files': {
+  '.vite/build/index.pre.js': '3061f02edf85b68dc862372a93d68986f83ee0a39e60859eb44f8a7f12ada8a2',
+  '.vite/build/index.chunk-BLvpT1n4.js': 'b842b02003a350a14dd76bf6d56a8fda75255fb76576a2a7ac7407ad3c057315',
+  '.vite/build/index.chunk-Dln4TQLP.js': '5b1d9361afc8deab52a7659f026dfbc74b9d944d9077663778195547917bcd4b',
+ },
+ 'sourceFiles': {
+  'Contents/Info.plist': '6744736f8ce9888c17966d223a1a277409f6c987a4847d4a92c5fa7bf34948bd',
+  'Contents/MacOS/Claude': '9cda504cf0bf64709e2da71f4cecd7dbd5b523273603abd231dcbe83d9cccb22',
+  'Contents/Resources/app.asar.unpacked/node_modules/@ant/claude-swift/build/Release/computer_use.node': 'eda174bfbbbbcb6747a756a397466ebb06f381cf9649c18baad7564571cbdf2a',
+ }
+}
+
 # 这些版本才有“新版 Code 工作台”相关界面；补丁 revision 5 起按版本判断。
 CODE_UI_VERSIONS = (ADAPTER_37337['version'], ADAPTER_42304['version'],
-                    ADAPTER_42304_2['version'])
+                    ADAPTER_42304_2['version'], ADAPTER_31623['version'])
 
 
 def adapters_for_version(version):
@@ -193,6 +220,8 @@ def adapters_for_version(version):
         return [ADAPTER_42304_ARM64, ADAPTER_42304]
     if version == ADAPTER_42304_2['version']:
         return [ADAPTER_42304_2]
+    if version == ADAPTER_31623['version']:
+        return [ADAPTER_31623]
     return []
 
 
@@ -214,6 +243,125 @@ def installed_build(record):
     return matches[0] if len(matches) == 1 else None
 
 
+PACKED_LIMIT = 20_000_000
+
+
+def packed_js(header):
+    """遍历 ASAR 里所有已打包的 .js 文件。"""
+    def walk(nodes, prefix=''):
+        for name, child in nodes.get('files', {}).items():
+            path = prefix + '/' + name if prefix else name
+            if 'files' in child:
+                yield from walk(child, path)
+            elif not child.get('unpacked') and 'offset' in child and path.endswith('.js'):
+                yield path, child
+
+    yield from walk(header)
+
+
+def feature_tables(text):
+    """找出强制项表和下发渲染进程项表的锚点。
+
+    锚点是对象字面量的开头（`var X={` 或 `X={`），只认紧跟着
+    `rule:"forced"` / `rule:"always"` 的那一个；找不到或找到多个都拒绝。
+    这样新版本改了变量名也不用改代码。
+    """
+    forced, always = [], []
+    for match in re.finditer(r'(?:var\s+)?([A-Za-z0-9$_]{1,16})=\{', text):
+        window = text[match.end():match.end() + 400]
+        if 'rule:"forced"' in window:
+            forced.append(match.group(0))
+        elif 'rule:"always"' in window:
+            always.append(match.group(0))
+    forced, always = list(dict.fromkeys(forced)), list(dict.fromkeys(always))
+    if len(forced) != 1 or len(always) != 1:
+        raise ValueError('Feature tables are not uniquely locatable')
+    return forced[0], always[0]
+
+
+def table_bounds(text, anchor):
+    """返回锚点所在对象字面量的 (起点, 终点)，用来把查找限制在表内。"""
+    start = text.find(anchor)
+    if start < 0:
+        raise ValueError('Feature table anchor missing: ' + anchor)
+    brace = text.index('{', start)
+    depth = 0
+    for index in range(brace, len(text)):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return brace, index + 1
+    raise ValueError('Unterminated feature table')
+
+
+def split_entries(text):
+    """把 `k:{…},k2:{…},` 拆成 [(k, '{…}' 内部内容), …]。"""
+    entries, index = [], 0
+    while index < len(text):
+        if text[index] in ', ':
+            index += 1
+            continue
+        match = re.match(r'(\d+):\{', text[index:])
+        if not match:
+            raise ValueError('Malformed availability entry')
+        brace = index + len(match.group(0)) - 1
+        depth = 0
+        for end in range(brace, len(text)):
+            if text[end] == '{':
+                depth += 1
+            elif text[end] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+        else:
+            raise ValueError('Unterminated availability entry')
+        entries.append((match.group(1), text[brace + 1:end]))
+        index = end + 1
+    return entries
+
+
+def table_definition(text, anchor, key):
+    """取表里 key 的现有定义体；没有就返回 None。只在表内查找。"""
+    start, end = table_bounds(text, anchor)
+    match = re.search(r'(?<![0-9])' + re.escape(key) + r':\{', text[start:end])
+    if not match:
+        return None
+    brace = start + match.end() - 1
+    depth = 0
+    for index in range(brace, end):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[brace + 1:index]
+    raise ValueError('Unterminated gate definition: ' + key)
+
+
+def insert_entries(text, anchor, entries):
+    """把可用性条目插到表头，已存在且相同的跳过，形状冲突则拒绝。
+
+    新版本里官方可能已经自己把某个开关设成 forced。此时再追加一次会产生
+    重复键，而对象字面量里后出现的定义获胜——我们的值会被悄悄覆盖。所以
+    这里先查表：相同就跳过；形状不同就停下来，不猜测官方语义。
+    """
+    additions = []
+    for key, body in entries:
+        current = table_definition(text, anchor, key)
+        if current is None:
+            additions.append((key, body))
+        elif current.replace(' ', '') == body.replace(' ', ''):
+            continue
+        else:
+            raise ValueError('Gate ' + key + ' already defined differently: ' + current[:80])
+    if not additions:
+        return text
+    inserted = ''.join(key + ':{' + body + '},' for key, body in additions)
+    return replace_once(text, anchor, anchor + inserted)
+
+
 def main_availability(adapter):
     """主进程功能表要追加的可用性条件。"""
     return adapter.get('mainAvailability', '')
@@ -224,13 +372,71 @@ def web_availability(adapter):
     return adapter.get('webAvailability', '')
 
 
+DISCOVERY_CACHE = {}
+
+
+def discover_adapter(app):
+    """未登记版本：按官方身份和功能表结构现场生成适配器。
+
+    这是给“官方又升级了”准备的兜底：只读结构，不猜语义。调用方仍然要先
+    通过官方签名校验；表找不到、表不唯一、或目标开关的现有形状和我们要写
+    的不一致，都会抛异常，不会修改应用。
+    """
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier') != 'com.anthropic.claudefordesktop':
+        raise ValueError('Not the expected application')
+    b, header, base = read_asar(app / 'Contents/Resources/app.asar')
+    digest = sha(b)
+    cached = DISCOVERY_CACHE.get(digest)
+    if cached:
+        return cached
+    found = []
+    for path, child in packed_js(header):
+        if int(child.get('size', 0)) > PACKED_LIMIT:
+            continue
+        if b'rule:"forced"' in content(b, header, base, path):
+            found.append(path)
+    if len(found) != 1:
+        raise ValueError('Feature table not uniquely located')
+    text = content(b, header, base, found[0]).decode('utf-8', 'replace')
+    forced_anchor, always_anchor = feature_tables(text)
+    adapter = {
+        'version': info.get('CFBundleShortVersionString'),
+        'asarHash': digest,
+        'main': found[0],
+        'featureAnchor': forced_anchor,
+        'webFeatureAnchor': always_anchor,
+        # 用和登记版本同一组条件；insert_entries 会跳过官方已强制成同样
+        # 形状的项，遇到形状不同则拒绝，不覆盖官方语义。
+        'mainAvailability': ('2371478310:{rule:"forced",value:!0},'
+                             '857846362:{rule:"forced",value:!0},'
+                             '2120747855:{rule:"forced",value:!0},'),
+        'webAvailability': '',
+        # 未登记构建没有固定文件指纹；安全性来自官方签名和结构校验。
+        'files': {},
+        'sourceFiles': {},
+        'discovered': True,
+    }
+    DISCOVERY_CACHE[digest] = adapter
+    return adapter
+
+
 def source_adapter(app):
-    """按版本和 ASAR 指纹选择适配器；未知版本直接拒绝。"""
+    """按版本和 ASAR 指纹选择适配器。
+
+    已登记版本走固定指纹；未登记的新版本按官方身份和功能表结构现场识别，
+    这样官方再升级也不用等人改代码。识别不出来一律拒绝。
+    """
     info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
     version=info['CFBundleShortVersionString']
     adapters=adapters_for_version(version)
     if not adapters:
-        raise ValueError('Unknown version; no patch applied')
+        try:
+            return discover_adapter(app)
+        except ValueError as error:
+            if 'Not the expected application' in str(error):
+                raise ValueError('Unknown version; no patch applied')
+            raise
     if len(adapters) == 1:
         return adapters[0]
     # 同一个版本号可能对应两种官方构建：官网 universal DMG 和更新器 arm64。
@@ -243,9 +449,9 @@ def source_adapter(app):
     raise ValueError('ASAR fingerprint mismatch; no patch applied')
 
 
-def verify_source(app):
+def verify_source(app, adapter=None):
     """确认应用是已适配的官方原版：版本、ASAR、关键文件和签名全部匹配。"""
-    adapter=source_adapter(app)
+    adapter = adapter or source_adapter(app)
     b,h,base=read_asar(app/'Contents/Resources/app.asar')
     if sha(b) != adapter['asarHash']:
         raise ValueError('ASAR fingerprint mismatch; no patch applied')
@@ -260,6 +466,28 @@ def verify_source(app):
     if 'TeamIdentifier=Q6L2SF6YDW' not in signature:
         raise ValueError('Source is not signed by the expected official team')
     return b,h,base
+
+
+def check_js(text):
+    """本机有 node 时对改过的 JS 做一次语法检查，没有就跳过。
+
+    这是给“未登记版本自动适配”加的一道保险：语法不成立就绝不安裝。
+    """
+    node = shutil.which('node')
+    if not node:
+        for candidate in ('/opt/homebrew/bin/node', '/usr/local/bin/node'):
+            if pathlib.Path(candidate).exists():
+                node = candidate
+                break
+    if not node:
+        return
+    handle = tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8')
+    try:
+        handle.write(text)
+        handle.close()
+        run(node, '--check', handle.name)
+    finally:
+        pathlib.Path(handle.name).unlink(missing_ok=True)
 
 
 def replace_once(s, old, new):
@@ -381,7 +609,6 @@ def app_signing_identity(app):
     记录实际结果而不是“打算用什么”，这样安装记录始终能反映真实签名，
     本地身份被删掉时也能自愈（下次打补丁会重新建立）。
     """
-    import re
     try:
         # codesign 把指定要求写在 stdout、把 Executable 行写在 stderr，两处都收。
         done = run('/usr/bin/codesign', '-d', '-r-', str(app))

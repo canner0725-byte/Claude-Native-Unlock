@@ -61,8 +61,9 @@ class OfficialSafety(unittest.TestCase):
                          official.core.main_availability(old))
         self.assertEqual(official.core.web_availability(new),
                          official.core.web_availability(old))
-        # revision 11 只改签名身份，没有新增或改写任何可用性条件。
-        self.assertEqual(official.PATCH_REVISION, 11)
+        # 2.42304.2 的可用性条件与 revision 10 一致；后续 revision 只增加
+        # 签名方式和适配逻辑，没有新增或改写可用性条件。
+        self.assertGreaterEqual(official.PATCH_REVISION, 10)
 
     def test_42304_2_anchors_are_distinct_and_hashes_well_formed(self):
         adapter = official.core.ADAPTER_42304_2
@@ -555,3 +556,78 @@ class OfficialSafety(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FeatureTableEditing(unittest.TestCase):
+    """表内插入必须能识别“官方已经自己强制了”的情况。"""
+
+    TABLE = ('var ken={123929380:{rule:"forced",value:!0},'
+             '857846362:{rule:"forced",value:!0}},Aen={101380594:{rule:"always",value:!0}};')
+
+    def test_inserts_only_missing_gates(self):
+        import native_unlock as core
+        out = core.insert_entries(
+            self.TABLE, 'var ken={',
+            core.split_entries('1291166712:{rule:"forced",value:!0},'
+                               '857846362:{rule:"forced",value:!0},'))
+        self.assertEqual(out.count('1291166712:{'), 1)
+        self.assertEqual(out.count('857846362:{'), 1)   # 官方已有同样定义，不重复
+        self.assertTrue(out.startswith('var ken={1291166712:'))
+
+    def test_identical_existing_entry_is_left_alone(self):
+        import native_unlock as core
+        out = core.insert_entries(self.TABLE, 'var ken={',
+                                  core.split_entries('857846362:{rule:"forced",value:!0},'))
+        self.assertEqual(out, self.TABLE)
+
+    def test_conflicting_definition_is_refused(self):
+        import native_unlock as core
+        with self.assertRaisesRegex(ValueError, 'already defined differently'):
+            core.insert_entries(self.TABLE, 'var ken={',
+                                core.split_entries('857846362:{rule:"remote"},'))
+
+    def test_lookup_is_scoped_to_the_table(self):
+        """同名键出现在另一张表里，不算本表已有。"""
+        import native_unlock as core
+        table = ('var ken={1:{rule:"forced",value:!0}},'
+                 'Aen={2120747855:{rule:"always",value:!0}};')
+        out = core.insert_entries(table, 'var ken={',
+                                  core.split_entries('2120747855:{rule:"forced",value:!0},'))
+        self.assertIn('var ken={2120747855:{rule:"forced",value:!0},', out)
+        self.assertEqual(out.count('2120747855:{'), 2)
+
+    def test_table_anchors_are_discovered(self):
+        import native_unlock as core
+        forced, always = core.feature_tables(self.TABLE)
+        self.assertEqual(forced, 'var ken={')
+        self.assertEqual(always, 'Aen={')
+
+    def test_ambiguous_tables_are_refused(self):
+        import native_unlock as core
+        with self.assertRaisesRegex(ValueError, 'not uniquely locatable'):
+            core.feature_tables('var a={x:{rule:"forced"}},b={y:{rule:"forced"}},'
+                                'c={z:{rule:"always"}}')
+
+    def test_discovery_refuses_a_non_official_app(self):
+        import native_unlock as core
+        with tempfile.TemporaryDirectory() as directory:
+            app = pathlib.Path(directory).resolve() / 'Claude.app'
+            (app / 'Contents').mkdir(parents=True)
+            (app / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleIdentifier': 'com.example.other',
+                                'CFBundleShortVersionString': '9.9.9'}))
+            with self.assertRaisesRegex(ValueError, 'Not the expected application'):
+                core.discover_adapter(app)
+
+    def test_prune_removes_interrupted_staging_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = pathlib.Path(directory).resolve()
+            keep = state / 'official-backup-1.app'
+            for name in ['official-backup-1.app', 'official-backup-old.app',
+                         'restore-prepared-1.app', 'upgrade-prepared-2.app',
+                         'prepared-3.app', 'retired-patched-4.app']:
+                (state / name).mkdir()
+            with patch.object(official, 'STATE', state):
+                official.prune_old_state(keep)
+            self.assertEqual(sorted(p.name for p in state.iterdir()),
+                             ['official-backup-1.app'])

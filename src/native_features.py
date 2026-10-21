@@ -31,6 +31,7 @@ SUPPORTED_VERSIONS = {
     official.core.ADAPTER_37337['version'],
     official.core.ADAPTER_42304['version'],
     official.core.ADAPTER_42304_2['version'],
+    official.core.ADAPTER_31623['version'],
 }
 
 FEATURES = {

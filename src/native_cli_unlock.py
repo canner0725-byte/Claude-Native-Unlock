@@ -8,7 +8,8 @@ Claude Code 的 Bun 单文件里有一个“功能是否可用”的判断函数
 
 已适配：
 - 2.1.295：Desktop 2.37337.1
-- 2.1.299：Desktop 2.42304.0 / 2.42304.2（2.42304.2 仍内置 2.1.299 的清单）
+- 2.1.299：Desktop 2.42304.0 / 2.42304.2
+- 2.1.304：Desktop 3.1623.0
 
 选择桌面端已安装的最新 CLI；如果最新版尚未适配就拒绝操作，
 不会退回旧版本制造“已启用”的假象。
@@ -59,12 +60,28 @@ ADAPTER_21299 = {
     'newPredicate': b'function vjt(){return!0}',
 }
 
-ADAPTERS = {adapter['version']: adapter for adapter in (ADAPTER_21295, ADAPTER_21299)}
+ADAPTER_21304 = {
+    'version': '2.1.304',
+    'subdir': '6bbba6adc37f',
+    'sourceHash': '21d484aa3737c3f2e665dbd849797caafb36675f8e26e11cb47e19220bdf6c15',
+    'sectionOffset': 92520448,
+    'graphLength': 177840174,
+    'metadataOffsets': (177840126, 177675733, 141908, 7, 177840125, 0, 8191),
+    'modulePath': b'/$bunfs/root/chunk-kr8ndcyv.js',
+    'moduleIndex': 679,
+    'moduleFields': (177553915, 30, 140025442, 14652, 0, 0, 67718392, 23376, 67741768, 0, 177553946, 30, 1, 1, 1, 0),
+    'oldPredicate': b'function $Kt(){let e=J();return e?.enabled===!0||e?.available===!0}',
+    'newPredicate': b'function $Kt(){return!0}',
+}
+
+ADAPTERS = {adapter['version']: adapter
+            for adapter in (ADAPTER_21295, ADAPTER_21299, ADAPTER_21304)}
 SUPPORTED_DESKTOP_VERSIONS = {
     core.VERSION,
     core.ADAPTER_37337['version'],
     core.ADAPTER_42304['version'],
     core.ADAPTER_42304_2['version'],
+    core.ADAPTER_31623['version'],
 }
 
 
