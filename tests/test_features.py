@@ -3,6 +3,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -243,6 +244,32 @@ class NativeConfigurationSafety(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 features.main()
         self.assertNotIn('SYNTHETIC-SECRET', output.getvalue())
+
+
+class InterfaceParity(unittest.TestCase):
+    """界面里的开关列表必须和后端的 FEATURES 对得上，避免一边加了一边没加。"""
+
+    def setUp(self):
+        self.source = (pathlib.Path(__file__).resolve().parents[1]/'app/NativeUnlock.swift').read_text()
+        match = re.search(r'let featureIDs = \[(.*?)\]', self.source, re.S)
+        self.ids = re.findall(r'"([a-z-]+)"', match.group(1))
+
+    def test_ui_ids_match_backend_feature_keys(self):
+        # 界面最后一个开关是 Code 自动整理，它走 CLI 后端，不在 FEATURES 里。
+        self.assertEqual(self.ids[:-1], list(features.FEATURES))
+        self.assertEqual(self.ids[-1], 'code-auto-dream')
+
+    def test_ui_rows_have_titles_and_descriptions(self):
+        titles = re.search(r'let featureTitles = \[(.*?)\]', self.source, re.S).group(1)
+        self.assertEqual(len(re.findall(r'"', titles)) // 2, len(self.ids))
+        descriptions = re.search(r'let featureDescriptions = \[(.*?)\]\n', self.source, re.S).group(1)
+        self.assertEqual(len(re.findall(r'^\s*"', descriptions, re.M)), len(self.ids))
+
+    def test_ui_state_arrays_cover_every_row(self):
+        for name in ['featureEnabled', 'featureRestorable']:
+            match = re.search(rf'var {name}: \[Bool\] = Array\(repeating: false, count: (\d+)\)', self.source)
+            self.assertIsNotNone(match, name)
+            self.assertEqual(int(match.group(1)), len(self.ids), name)
 
 
 if __name__ == '__main__':
