@@ -93,6 +93,34 @@ def effective_record(app, data):
     return data
 
 
+CONFIG_KEY_CACHE = {}
+
+
+def config_keys():
+    """只读取已安装 Claude 的 3P 配置 schema，返回它认识的 flatKey 集合。
+
+    配置键是随版本变化的：官方可能在新版里删掉某个设置。这里只读主
+    chunk 里的 `flatKey:"…"` 声明，用来判断某个开关在当前版本是否真的
+    存在；键不存在时界面会显示“此版本没有这个设置”，而不是给一个点了
+    也没用的开关。读取失败返回 None，调用方按“未知”处理，不阻止操作。
+    """
+    info = plistlib.loads((TARGET / 'Contents/Info.plist').read_bytes())
+    version = info.get('CFBundleShortVersionString', 'unknown')
+    b, header, base = core.read_asar(TARGET / ASAR)
+    digest = core.sha(b)
+    if digest in CONFIG_KEY_CACHE:
+        return CONFIG_KEY_CACHE[digest]
+    adapters = core.adapters_for_version(version)
+    if adapters:
+        main = adapters[0]['main']
+    else:
+        main = core.discover_adapter(TARGET)['main']
+    text = core.content(b, header, base, main).decode('utf-8', 'replace')
+    keys = set(re.findall(r'flatKey:"([A-Za-z0-9_]+)"', text))
+    CONFIG_KEY_CACHE[digest] = keys
+    return keys
+
+
 def verify_backup(data, version=None):
     """备份必须在本工具目录内、版本和构建一致、通过官方签名与指纹校验。"""
     backup = pathlib.Path(data['backup'])

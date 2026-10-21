@@ -171,12 +171,20 @@ def report(application=None):
         path, config, _, _ = active_config()
         check_local(config)
         result['configWritable'] = os.access(path.parent, os.W_OK)
+        # 官方可能在新版里删掉某个设置；只读核对键是否还在。
+        try:
+            keys = official.config_keys()
+        except Exception:
+            keys = None
         for identifier, spec in FEATURES.items():
             record = load_record(path, identifier)
             owned = bool(record and record['phase'] != 'restored')
+            available = keys is None or spec['key'] in keys
+            enabled = effective(identifier, config) and available
             result['features'].append({'id': identifier, 'title': spec['title'],
-                'enabled': effective(identifier, config), 'canRestore': owned,
-                'message': '已启用' if effective(identifier, config) else '未启用',
+                'enabled': enabled, 'canRestore': owned, 'available': available,
+                'message': ('此版本没有这个设置' if not available
+                            else '已启用' if enabled else '未启用'),
                 'managedByUnlocker': owned})
         result['message'] = '官方配置可用；开关只改配置，实际功能以 Claude 为准。'
         if not application['supported'] or application.get('recoveryRequired'):
@@ -211,6 +219,13 @@ def change(feature, restore=False):
     check_local(config)
     spec = FEATURES[feature]
     key, value = spec['key'], spec['value']
+    if not restore:
+        try:
+            keys = official.config_keys()
+        except Exception:
+            keys = None
+        if keys is not None and key not in keys:
+            raise ValueError('当前 Claude 版本没有这个设置；停止修改。')
     record = load_record(path, feature)
     if restore:
         if not record or record['phase'] == 'restored':

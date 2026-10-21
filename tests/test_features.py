@@ -3,7 +3,9 @@ import io
 import json
 import os
 import pathlib
+import plistlib
 import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -225,6 +227,12 @@ class NativeConfigurationSafety(unittest.TestCase):
             features.change('tool-search')
         self.assertEqual(self.read()['toolSearchEnabled'], 'yes')
 
+    def test_change_refuses_a_key_this_version_does_not_have(self):
+        with patch.object(features.official, 'config_keys', return_value=set()):
+            with self.assertRaisesRegex(ValueError, '没有这个设置'):
+                features.change('tool-search')
+        self.assertNotIn('toolSearchEnabled', self.read())
+
     def test_status_never_contains_credentials(self):
         self.assertNotIn('SYNTHETIC-SECRET', json.dumps(features.report()))
 
@@ -244,6 +252,49 @@ class NativeConfigurationSafety(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 features.main()
         self.assertNotIn('SYNTHETIC-SECRET', output.getvalue())
+
+
+class ConfigKeyAvailability(unittest.TestCase):
+    """官方可能在新版里删掉某个设置键；删了就禁用开关，不能装作能点。"""
+
+    def fake_app(self, root):
+        app = root / 'Claude.app'
+        (app / 'Contents/Resources').mkdir(parents=True)
+        script = (b'var ken={1:{rule:"forced",value:!0}};'
+                  b'var x={flatKey:"toolSearchEnabled"};')
+        header = {'files': {'.vite': {'files': {'build': {'files': {'index.js': {
+            'offset': '0', 'size': len(script)}}}}}}}
+        raw = json.dumps(header, separators=(',', ':')).encode()
+        payload = ((len(raw) + 7) // 4) * 4
+        asar = (struct.pack('<IIII', 4, payload + 4, payload, len(raw))
+                + raw + b'\0' * (payload - 4 - len(raw)) + script)
+        (app / features.official.ASAR).write_bytes(asar)
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(
+            {'CFBundleShortVersionString': features.official.core.ADAPTER_31623['version']}))
+        return app
+
+    def test_reads_flat_keys_from_the_installed_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.fake_app(pathlib.Path(directory).resolve())
+            adapter = {'version': '3.1623.0', 'main': '.vite/build/index.js'}
+            with patch.object(features.official, 'TARGET', app), \
+                 patch.object(features.official, 'CONFIG_KEY_CACHE', {}), \
+                 patch.object(features.official.core, 'adapters_for_version',
+                              return_value=[adapter]):
+                keys = features.official.config_keys()
+            self.assertIn('toolSearchEnabled', keys)
+            self.assertNotIn('skipWebFetchPreflight', keys)
+
+    def test_missing_key_is_reported_unavailable(self):
+        application = {'version': '3.1623.0', 'supported': True, 'running': False}
+        with patch.object(features.official, 'status', return_value=application), \
+             patch.object(features.official, 'config_keys',
+                          return_value={'builtinBrowserEnabled'}):
+            result = features.report()
+        item = next(f for f in result['features'] if f['id'] == 'tool-search')
+        self.assertFalse(item['available'])
+        self.assertFalse(item['enabled'])
+        self.assertEqual(item['message'], '此版本没有这个设置')
 
 
 class InterfaceParity(unittest.TestCase):

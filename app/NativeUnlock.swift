@@ -96,6 +96,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var featureLabels: [NSTextField] = []
     var featureRows: [NSView] = []
     var featureEnabled: [Bool] = Array(repeating: false, count: 8)
+    /// 当前 Claude 版本是否还有这个配置键；没有就禁用而不是装作能点。
+    var featureAvailable: [Bool] = Array(repeating: true, count: 8)
     // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
     let featureSummary = NSTextField(wrappingLabelWithString: "")
 
@@ -1081,6 +1083,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 control.isEnabled = interactive && codeMemorySupported
             } else {
                 control.isEnabled = interactive && featureConfigWritable && configReady
+                    && featureAvailable[index]
                     && (!featureEnabled[index] || featureRestorable[index])
             }
         }
@@ -1168,10 +1171,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for (index, id) in featureIDs.enumerated() {
             guard let feature = features.first(where: { $0["id"] as? String == id }) else { continue }
             let on = feature["enabled"] as? Bool ?? false
+            let available = feature["available"] as? Bool ?? true
             featureEnabled[index] = on
+            featureAvailable[index] = available
             featureRestorable[index] = feature["canRestore"] as? Bool ?? false
             featureSwitches[index].state = on ? .on : .off
-            setFeatureDetail(index, text: "")
+            setFeatureDetail(index, text: available ? ""
+                             : (feature["message"] as? String ?? "此版本没有这个设置"))
         }
 
         if !featureConfigWritable {
