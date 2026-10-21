@@ -214,6 +214,19 @@ def check_idle():
         raise ValueError('请先正常退出 Claude，再操作开关。不会强制结束正在运行的会话。')
 
 
+def verify_gates(text, anchor, entries):
+    """补丁写完后，按表内实际生效的定义核对每个目标开关。
+
+    对象字面量里后定义获胜，`table_definition` 取的就是最后一份，也就是
+    Claude 真正会读到的值。这里逐条比对；任何一条不一致就拒绝安装，
+    避免把“表里写了、运行时没生效”的补丁装到正式应用上。
+    """
+    for key, body in entries:
+        actual = core.table_definition(text, anchor, key)
+        if actual is None or actual.replace(' ', '') != body.replace(' ', ''):
+            raise ValueError('补丁写入后开关未生效；停止安装：' + key)
+
+
 def build(app):
     """在应用副本上写入可用性条件，重算 ASAR 完整性并临时签名。
 
@@ -237,11 +250,17 @@ def build(app):
         old = core.content(original, header, base, path).decode()
         changed = core.insert_entries(old, adapter['featureAnchor'], entries, gates)
         web_availability = core.web_availability(adapter)
-        if web_availability:
+        web_entries = core.split_entries(web_availability)
+        if web_entries:
             changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
-                                          core.split_entries(web_availability), gates)
+                                          web_entries, gates)
+            verify_gates(changed, adapter['webFeatureAnchor'], web_entries)
         # 改完先过一遍语法检查，避免把 Claude 写成打不开的应用。
         core.check_js(changed)
+        # 语法通过还不够：再读回表里**实际生效**的那一份定义，确认每个目标
+        # 开关真的解析成我们写的值。官方改了形状或换了取值时，这里会先失败，
+        # 而不是装完才发现“入口在、开关没开”。
+        verify_gates(changed, adapter['featureAnchor'], entries)
         new = changed.encode()
         node = core.node(header, path)
         node['offset'], node['size'] = str(len(data)), len(new)

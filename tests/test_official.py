@@ -683,6 +683,24 @@ class FutureBuildCompatibility(unittest.TestCase):
         self.assertEqual(core.table_definition(table, 'var ken={', '5'),
                          'rule:"forced",value:!0')
 
+    def test_effective_gate_is_checked_after_writing(self):
+        """写完必须按“最后一份定义”核对，不能只看文本里出现过。"""
+        import native_unlock as core
+        entries = core.split_entries('1291166712:{rule:"forced",value:{enabled:!0}},')
+        out = core.insert_entries(self.TABLE, 'var ken={', entries)
+        official.verify_gates(out, 'var ken={', entries)
+        # 官方在我们之后又定义了一份关闭值：补丁实际不生效，必须拒绝
+        _, end = core.table_bounds(out, 'var ken={')
+        overridden = out[:end - 1] + ',1291166712:{rule:"forced",value:{enabled:!1}}' + out[end - 1:]
+        with self.assertRaisesRegex(ValueError, '未生效'):
+            official.verify_gates(overridden, 'var ken={', entries)
+
+    def test_missing_gate_after_writing_is_refused(self):
+        import native_unlock as core
+        entries = core.split_entries('1291166712:{rule:"forced",value:{enabled:!0}},')
+        with self.assertRaisesRegex(ValueError, '未生效'):
+            official.verify_gates(self.TABLE, 'var ken={', entries)
+
     def test_changed_build_with_same_version_falls_back_to_discovery(self):
         """版本号没变但构建变了：不能套用旧锚点。"""
         import native_unlock as core

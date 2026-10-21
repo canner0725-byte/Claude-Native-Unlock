@@ -199,6 +199,31 @@ class NativeConfigurationSafety(unittest.TestCase):
         features.record_path(self.config, 'browser').write_text(json.dumps(record))
         self.assertEqual(features.load_record(self.config, 'browser')['version'], version)
 
+    def test_desktop_extensions_and_tool_search_are_off_until_set(self):
+        """这两项官方默认关闭：没写就是没启用，不能显示成已开启。"""
+        self.assertFalse(features.effective('desktop-extensions', self.original))
+        self.assertFalse(features.effective('tool-search', self.original))
+
+    def test_desktop_extensions_roundtrip(self):
+        features.change('desktop-extensions')
+        self.assertEqual(self.read(), {**self.original, 'isDesktopExtensionEnabled': True})
+        self.assertTrue(features.effective('desktop-extensions', self.read()))
+        features.change('desktop-extensions', restore=True)
+        self.assertEqual(self.read(), self.original)
+        self.assertNotIn('isDesktopExtensionEnabled', self.read())
+
+    def test_tool_search_roundtrip_keeps_other_keys(self):
+        features.change('tool-search')
+        self.assertEqual(self.read(), {**self.original, 'toolSearchEnabled': True})
+        features.change('tool-search', restore=True)
+        self.assertEqual(self.read(), self.original)
+
+    def test_new_switches_refuse_a_non_boolean_existing_value(self):
+        self.config.write_text(json.dumps({**self.original, 'toolSearchEnabled': 'yes'}))
+        with self.assertRaisesRegex(ValueError, '值异常'):
+            features.change('tool-search')
+        self.assertEqual(self.read()['toolSearchEnabled'], 'yes')
+
     def test_status_never_contains_credentials(self):
         self.assertNotIn('SYNTHETIC-SECRET', json.dumps(features.report()))
 

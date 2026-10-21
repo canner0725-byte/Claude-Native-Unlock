@@ -46,7 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastError: String?
     var pendingClaudeRefresh = false
     var featureConfigWritable = false
-    var featureRestorable: [Bool] = [false, false, false, false, false]
+    var featureRestorable: [Bool] = Array(repeating: false, count: 8)
 
     // 一键退出 Claude 并应用修改。
     var quittingClaude = false
@@ -73,21 +73,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let storageURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Claude 原生助手")
 
-    let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve", "code-auto-dream"]
+    let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve",
+                      "desktop-extensions", "tool-search", "webfetch-preflight",
+                      "code-auto-dream"]
     let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务",
-                         "Cowork 自动审批选项", "Code 自动整理"]
+                         "Cowork 自动审批选项", "插件里的桌面扩展", "MCP 工具按需加载",
+                         "WebFetch 免域名预检", "Code 自动整理"]
     // 说明只在悬停提示里出现，窗口里保持一行一个开关。
     let featureDescriptions = [
         "Chat 使用标准工作台，启用官方高级文件分析。",
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
         "允许官方定时任务；是否执行仍由 Claude 决定。",
         "显示 Cowork 官方自动审批选项；动作审查保留。",
+        "允许插件里打包的桌面扩展（.mcpb）加载；签名检查仍按官方策略。",
+        "MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。",
+        "跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。",
         "只解除 Code 自动整理的可用性限制；用户开关保持。"
     ]
+    /// Code 自动整理在列表里的位置；它走 CLI 后端，不是 3P 配置项。
+    var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
     var featureSwitches: [NSSwitch] = []
     var featureLabels: [NSTextField] = []
     var featureRows: [NSView] = []
-    var featureEnabled: [Bool] = [false, false, false, false, false]
+    var featureEnabled: [Bool] = Array(repeating: false, count: 8)
     // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
     let featureSummary = NSTextField(wrappingLabelWithString: "")
 
@@ -1069,7 +1077,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateButton.title = availableRevision > 0 ? "更新到 r\(availableRevision)" : "更新补丁"
         setUpdateVisible(interactive && updateAvailable)
         for (index, control) in featureSwitches.enumerated() {
-            if index == 4 {
+            if featureIDs[index] == "code-auto-dream" {
                 control.isEnabled = interactive && codeMemorySupported
             } else {
                 control.isEnabled = interactive && featureConfigWritable && configReady
@@ -1130,7 +1138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applyCLI(_ result: [String: Any]) {
-        let index = 4
+        let index = codeAutoDreamIndex
         featureEnabled[index] = result["enabled"] as? Bool ?? false
         codeMemorySupported = result["supported"] as? Bool ?? false
         featureSwitches[index].state = featureEnabled[index] ? .on : .off

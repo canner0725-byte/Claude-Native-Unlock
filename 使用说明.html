@@ -44,6 +44,9 @@
   <li><strong>官方内置浏览器</strong>：启用 Claude 官方内置浏览器，不是 Dia 或 Chrome。</li>
   <li><strong>官方定时任务</strong>：允许官方定时任务；是否执行仍由 Claude 决定。</li>
   <li><strong>Cowork 自动审批选项</strong>：显示官方自动审批选项；动作审查和权限流程保留。</li>
+  <li><strong>插件里的桌面扩展</strong>：允许插件打包的桌面扩展（.mcpb）加载；官方签名检查仍然生效。</li>
+  <li><strong>MCP 工具按需加载</strong>：MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。</li>
+  <li><strong>WebFetch 免域名预检</strong>：跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。</li>
   <li><strong>Code 原生自动整理可用性</strong>：只解除 Code 自动整理的可用性限制；当前 CLI 版本由后端检测，用户开关保持。</li>
 </ul>
 <p>这些开关只改 Claude 已有的官方配置，不提供替代执行器、云服务或账号系统。</p>

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """官方第三方 API（3P）配置的可用性开关。
 
-只改 Claude 已有配置里的四个非秘密字段，不新增执行器、服务或账号：
+只改 Claude 已有配置里的几个非秘密字段，不新增执行器、服务或账号：
 - desktopHome
 - builtinBrowserEnabled
 - scheduledTasksEnabled
 - autoModeEnabled
+- isDesktopExtensionEnabled
+- toolSearchEnabled
+- skipWebFetchPreflight
 
 所有修改都先留恢复记录，支持原值回滚；管理员策略、配置服务器、
 符号链接和并发修改都会被拒绝。
@@ -39,6 +42,17 @@ FEATURES = {
     'browser': {'title': '官方内置浏览器', 'key': 'builtinBrowserEnabled', 'value': True},
     'scheduled-tasks': {'title': '官方定时任务', 'key': 'scheduledTasksEnabled', 'value': True},
     'auto-approve': {'title': 'Cowork 自动审批选项', 'key': 'autoModeEnabled', 'value': True},
+    # 官方文档：桌面扩展（.mcpb）默认不加载，把这一项设成 true 才允许插件里
+    # 打包的扩展运行；扩展本身仍由官方加载器和签名策略检查。
+    'desktop-extensions': {'title': '插件里的桌面扩展', 'key': 'isDesktopExtensionEnabled', 'value': True},
+    # 官方文档：MCP 工具定义默认全部塞进上下文；打开后改为按需加载。
+    # 第三方网关若支持，桌面端会额外注入 ENABLE_TOOL_SEARCH；不支持时
+    # 走官方旧路径，不会伪造工具或替换检索服务。
+    'tool-search': {'title': 'MCP 工具按需加载', 'key': 'toolSearchEnabled', 'value': True},
+    # 官方文档：Code 会话里的 WebFetch 默认先向 api.anthropic.com 做域名
+    # 预检；第三方部署连不上那个域名，WebFetch 就一直失败。打开这一项
+    # 让官方跳过预检，抓取仍走官方 WebFetch 与既有 egress 规则。
+    'webfetch-preflight': {'title': 'WebFetch 免域名预检', 'key': 'skipWebFetchPreflight', 'value': True},
 }
 
 
@@ -128,10 +142,6 @@ def valid_value(feature, value):
     return value in ['standard', 'simple', 'no-vm', 'off'] if feature == 'file-analysis' else type(value) is bool
 
 
-def matches(config, key, present, value):
-    return (key in config) == present and (not present or type(config[key]) is type(value) and config[key] == value)
-
-
 def effective(feature, config):
     if feature == 'file-analysis':
         home = config.get('desktopHome')
@@ -141,6 +151,10 @@ def effective(feature, config):
     if feature == 'scheduled-tasks':
         return config.get('scheduledTasksEnabled', True) is True
     return config.get(FEATURES[feature]['key']) is True
+
+
+def matches(config, key, present, value):
+    return (key in config) == present and (not present or type(config[key]) is type(value) and config[key] == value)
 
 
 def report(application=None):
