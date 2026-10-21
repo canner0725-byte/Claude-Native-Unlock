@@ -26,6 +26,7 @@ class BackupSafety(unittest.TestCase):
                                     (official, 'running', lambda: False),
                                     (official, 'manifest', lambda: self.record),
                                     (official, 'verify_patched', lambda *args: None),
+                                    (official, 'prepare_identity', lambda: None),
                                     (official.core, 'verify_source', lambda *args: None)]:
             self.stack.enter_context(patch.object(module, name, value))
 
@@ -84,7 +85,8 @@ class BackupSafety(unittest.TestCase):
         verify.assert_called_once_with(self.backup)
 
     def test_same_version_restore_keeps_backup_and_restores_original(self):
-        with patch.object(official, 'clone', side_effect=shutil.copytree):
+        with patch.object(official, 'clone', side_effect=shutil.copytree), \
+             patch.object(official, 'status', return_value={'enabled': False, 'supported': True}):
             result = official.disable()
         self.assertEqual((self.target / official.ASAR).read_bytes(), b'original')
         self.assertEqual((self.backup / official.ASAR).read_bytes(), b'original')
@@ -121,7 +123,7 @@ class BackupSafety(unittest.TestCase):
                 return official.core.ADAPTER_42304
             return official.core.ADAPTER_42304_ARM64
 
-        with patch.object(official.core, 'source_adapter', side_effect=adapter), \
+        with patch.object(official.core, 'registered_adapter', side_effect=adapter), \
              patch.object(official.core, 'verify_source', lambda *args: None):
             with self.assertRaisesRegex(ValueError, '官方构建'):
                 official.verify_backup(self.record, version)
@@ -135,7 +137,7 @@ class BackupSafety(unittest.TestCase):
         (self.backup / 'Contents/Info.plist').write_bytes(
             plistlib.dumps({'CFBundleShortVersionString': version}))
 
-        with patch.object(official.core, 'source_adapter',
+        with patch.object(official.core, 'registered_adapter',
                           return_value=official.core.ADAPTER_42304_ARM64), \
              patch.object(official.core, 'verify_source', lambda *args: None):
             self.assertEqual(official.verify_backup(self.record, version), self.backup)

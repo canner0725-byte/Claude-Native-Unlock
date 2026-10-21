@@ -24,6 +24,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 只在可更新时出现。
     let updateButton = NSButton(title: "更新补丁", target: nil, action: nil)
+    // 打完补丁后出现：一键跳到系统设置的隐私页面。
+    let permissionButton = NSButton(title: "去授权", target: nil, action: nil)
 
     let progress = NSProgressIndicator()
 
@@ -56,6 +58,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 刚开启/更新补丁后，短时间内在窗口里提示一次系统权限；过期自动消失。
     var enabledHintUntil = Date.distantPast
     var justEnabledHint: Bool { Date() < enabledHintUntil }
+    var permissionReGrantLikely = false
 
     // 菜单栏。
     var statusItem: NSStatusItem!
@@ -253,7 +256,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         featureSummary.textColor = .systemOrange
         featureSummary.isHidden = true
 
-        for button in [openButton, refreshButton, updateButton] {
+        for button in [openButton, refreshButton, updateButton, permissionButton] {
             button.bezelStyle = .rounded
             button.target = self
         }
@@ -261,6 +264,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.action = #selector(refresh)
         updateButton.action = #selector(confirmUpdate)
         updateButton.toolTip = "把补丁更新到最新 revision；只保留最新版和当前官方备份。"
+        permissionButton.action = #selector(openPrivacySettings)
+        permissionButton.toolTip = "打开系统设置的隐私页面，给 Claude 勾选辅助功能与屏幕录制。"
+        permissionButton.bezelStyle = .rounded
+        permissionButton.isHidden = true
         updateButton.isEnabled = false
         // 可更新时再淡入，平时不占视觉位置。
         updateButton.alphaValue = 0
@@ -273,7 +280,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let footerSpacer = NSView()
         footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let footer = NSStackView(views: [openButton, refreshButton, footerSpacer,
-                                         updateButton, progress])
+                                         permissionButton, updateButton, progress])
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 10
@@ -675,6 +682,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         trayPrepare = trayMenu.addItem(withTitle: "为官方更新做准备", action: #selector(prepareUpdate), keyEquivalent: "")
         trayPrepare.target = self
         trayMenu.addItem(withTitle: "使用说明", action: #selector(openFeatureReport), keyEquivalent: "").target = self
+        trayMenu.addItem(withTitle: "去系统设置授权", action: #selector(openPrivacySettings), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "系统授权说明", action: #selector(showPermissionGuide), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "关于", action: #selector(showAbout), keyEquivalent: "").target = self
         trayMenu.addItem(.separator())
@@ -739,6 +747,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .version: assistantBuild,
             .credits: NSAttributedString(string: "独立开源项目，与 Anthropic 无隶属关系。\n仅解除已适配版本的原生功能可用性条件。")
         ])
+    }
+
+    /// 一键跳到系统设置的隐私页面。macOS 只允许系统设置写授权，
+    /// 所以这里只能把用户送到对应页面，不能代替勾选。
+    @objc func openPrivacySettings() {
+        let urls = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+            "x-apple.systempreferences:com.apple.preference.security",
+        ]
+        for candidate in urls {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) {
+                recordOperation("open-privacy-settings", backend: "ui",
+                                result: ["message": candidate])
+                return
+            }
+        }
+        showPermissionGuide()
+    }
+
+    /// 权限是否需要重新授权：打完补丁后签名身份变了，系统就不再认旧授权。
+    func updatePermissionButton() {
+        let needed = enabled && !busy && !quittingClaude && permissionReGrantLikely
+        guard permissionButton.isHidden == !needed else { return }
+        if needed {
+            permissionButton.isHidden = false
+            permissionButton.alphaValue = 0
+            animate { self.permissionButton.animator().alphaValue = 1 }
+        } else {
+            animate { self.permissionButton.animator().alphaValue = 0 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if self.permissionButton.alphaValue < 0.01 {
+                    self.permissionButton.isHidden = true
+                }
+            }
+        }
     }
 
     @objc func showPermissionGuide() {
@@ -1031,6 +1076,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     && (!featureEnabled[index] || featureRestorable[index])
             }
         }
+        updatePermissionButton()
         // 按钮显隐会改变高度，等动画结束后让窗口重新贴合内容。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
     }
@@ -1059,6 +1105,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         targetExists = result["targetExists"] as? Bool ?? false
         updateAvailable = enabled && supported && backupVerified && !recoveryRequired
             && (result["updateAvailable"] as? Bool ?? false)
+        permissionReGrantLikely = result["permissionReGrantLikely"] as? Bool ?? false
         toggle.state = enabled ? .on : .off
         refreshButtons()
 
@@ -1169,6 +1216,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if (command == "enable" || command == "update") && enabled {
             // 只在窗口里提示一行；完整步骤留在菜单栏的“系统授权说明”。
             enabledHintUntil = Date().addingTimeInterval(90)
+            if permissionReGrantLikely { openPrivacySettings() }
         }
         if command == "prepare-update", result["preparedForUpdate"] as? Bool == true {
             showUpdateGuide()

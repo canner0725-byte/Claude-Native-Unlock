@@ -100,7 +100,7 @@ def verify_backup(data, version=None):
             or backup.resolve() != backup.absolute()):
         raise ValueError('备份路径异常；停止操作。')
     core.verify_source(backup)
-    adapter = core.source_adapter(backup)
+    adapter = core.registered_adapter(backup)
     expected = data.get('version', core.VERSION)
     if adapter['version'] != expected or (version is not None and adapter['version'] != version):
         raise ValueError('备份版本与安装记录或当前 Claude 不一致；停止操作。')
@@ -169,6 +169,10 @@ def status():
             # 否则旧安装会一直停在 ad-hoc 签名上，每次更新都得重新授权。
             result['signingUpdateAvailable'] = (
                 data.get('signingIdentity') != core.local_identity())
+            # 补丁签名和本地身份一致时，重打补丁不会改变系统授权；
+            # 否则（官方升级后重签）这次需要重新授权一次。
+            result['permissionReGrantLikely'] = bool(
+                result['signingUpdateAvailable'])
             result['updateAvailable'] = (revision < PATCH_REVISION
                                          or result['signingUpdateAvailable'])
             result['rollbackAvailable'] = (
@@ -221,19 +225,21 @@ def build(app):
     data = bytearray(original[base:])
 
     # Computer Use 基础开关、后台模式、macOS 上限，以及各版本自己的可用性条件。
-    # 逐条插入：官方已经强制成同样形状的跳过，形状不同则停下，不覆盖官方语义。
+    # 官方已强制成同样形状的跳过；形状不同就追加到表尾覆盖（后定义获胜），
+    # 这样官方改了自己的取值时，我们的解锁依然生效。
     entries = core.split_entries(
         '1291166712:{rule:"forced",value:{enabled:!0,appScopedEnabled:!0}},'
         '1346958739:{rule:"forced",value:{major:27,minor:0}},'
         + core.main_availability(adapter)
     )
+    gates = {}
     for path in [adapter['main']]:
         old = core.content(original, header, base, path).decode()
-        changed = core.insert_entries(old, adapter['featureAnchor'], entries)
+        changed = core.insert_entries(old, adapter['featureAnchor'], entries, gates)
         web_availability = core.web_availability(adapter)
         if web_availability:
             changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
-                                          core.split_entries(web_availability))
+                                          core.split_entries(web_availability), gates)
         # 改完先过一遍语法检查，避免把 Claude 写成打不开的应用。
         core.check_js(changed)
         new = changed.encode()
@@ -271,7 +277,8 @@ def build(app):
     # 优先用固定的本地身份，这样更新后系统权限不用重新授权；没有就退回 ad-hoc。
     core.sign_app(app, ent_path)
 
-    return {path: core.sha((app / path).read_bytes()) for path in [ASAR, *adapter['sourceFiles']]}
+    return ({path: core.sha((app / path).read_bytes()) for path in [ASAR, *adapter['sourceFiles']]},
+            gates)
 
 
 def prepare_identity():
@@ -340,7 +347,7 @@ def enable():
     stage = STATE / ('prepared-' + stamp + '.app')
     backup = STATE / ('official-backup-' + stamp + '.app')
     clone(TARGET, stage)
-    installed = build(stage)
+    installed, gates = build(stage)
     record = {
         'version': core.source_adapter(TARGET)['version'],
         'patchRevision': PATCH_REVISION,
@@ -350,6 +357,7 @@ def enable():
         'phase': 'prepared',
         'stage': str(stage),
         'signingIdentity': core.app_signing_identity(stage),
+        'gates': gates,
     }
     # 先把恢复信息写盘，之后才做第一次改名。
     previous = manifest()
@@ -399,13 +407,14 @@ def update():
     stage = STATE / ('upgrade-prepared-' + stamp + '.app')
     retired = STATE / ('retired-patched-' + stamp + '.app')
     clone(backup, stage)
-    installed = build(stage)
+    installed, gates = build(stage)
     old = effective_record(TARGET, previous)
     record = dict(
         previous,
         installedFiles=installed,
         patchRevision=PATCH_REVISION,
         signingIdentity=core.app_signing_identity(stage),
+        gates=gates,
         phase='upgrade-prepared',
         stage=str(stage),
         retired=str(retired),
@@ -505,9 +514,8 @@ def disable():
         if target_version != record.get('version', core.VERSION):
             raise ValueError('Claude 已升级；不会用旧版本备份覆盖新版。请重新检测并生成适配报告。')
         # 用“已验证的官方备份”的 ASAR 指纹判断目标是否已经是官方原版。
-        # 不能对补丁版目标调用 source_adapter：2.42304 起要靠 ASAR 指纹
-        # 区分 arm64 / universal 构建，补丁版的 ASAR 已改变，会直接报错。
-        official_asar_hash = core.source_adapter(backup)['asarHash']
+        # 备份必须是已登记的官方构建，所以这里用不做结构识别的取法。
+        official_asar_hash = core.registered_adapter(backup)['asarHash']
         if core.sha((TARGET / ASAR).read_bytes()) == official_asar_hash:
             core.verify_source(TARGET)
             # 恢复在改名后中断时，目标已经是官方原版；补记完成状态。

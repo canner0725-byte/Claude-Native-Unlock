@@ -323,12 +323,16 @@ def split_entries(text):
 
 
 def table_definition(text, anchor, key):
-    """取表里 key 的现有定义体；没有就返回 None。只在表内查找。"""
+    """取表里 key 的**最后一次**定义体；没有就返回 None。只在表内查找。
+
+    对象字面量里后定义获胜，所以表尾那份才是实际生效的值——插入覆盖项之后
+    再读，读到的必须是我们的定义。
+    """
     start, end = table_bounds(text, anchor)
-    match = re.search(r'(?<![0-9])' + re.escape(key) + r':\{', text[start:end])
-    if not match:
+    matches = list(re.finditer(r'(?<![0-9])' + re.escape(key) + r':\{', text[start:end]))
+    if not matches:
         return None
-    brace = start + match.end() - 1
+    brace = start + matches[-1].end() - 1
     depth = 0
     for index in range(brace, end):
         if text[index] == '{':
@@ -340,26 +344,47 @@ def table_definition(text, anchor, key):
     raise ValueError('Unterminated gate definition: ' + key)
 
 
-def insert_entries(text, anchor, entries):
-    """把可用性条目插到表头，已存在且相同的跳过，形状冲突则拒绝。
+def insert_entries(text, anchor, entries, report=None):
+    """把可用性条目写进功能表，返回 (新文本, 实际结果)。
 
-    新版本里官方可能已经自己把某个开关设成 forced。此时再追加一次会产生
-    重复键，而对象字面量里后出现的定义获胜——我们的值会被悄悄覆盖。所以
-    这里先查表：相同就跳过；形状不同就停下来，不猜测官方语义。
+    三种情况分开处理：
+
+    - 表里没有这个键：插到表头。
+    - 表里已有完全相同的定义：跳过，什么都不做。
+    - 表里已有不同定义：追加到**表尾**。对象字面量里后出现的定义获胜，
+      所以追加在末尾能覆盖官方值；如果放在表头反而会被官方值覆盖。
+
+    结果写进 report（若提供），用于安装记录和界面提示：
+    `inserted` / `skipped` / `overridden`。
     """
-    additions = []
+    result = {'inserted': [], 'skipped': [], 'overridden': []}
+    head, tail = [], []
     for key, body in entries:
         current = table_definition(text, anchor, key)
         if current is None:
-            additions.append((key, body))
+            head.append((key, body))
+            result['inserted'].append(key)
         elif current.replace(' ', '') == body.replace(' ', ''):
-            continue
+            result['skipped'].append(key)
         else:
-            raise ValueError('Gate ' + key + ' already defined differently: ' + current[:80])
-    if not additions:
-        return text
-    inserted = ''.join(key + ':{' + body + '},' for key, body in additions)
-    return replace_once(text, anchor, anchor + inserted)
+            tail.append((key, body))
+            result['overridden'].append(key)
+    if head:
+        text = replace_once(text, anchor, anchor
+                            + ''.join(key + ':{' + body + '},' for key, body in head))
+    if tail:
+        # 表尾：定位这张表自己的结束花括号。注意表末条目可能没有尾逗号，
+        # 直接拼 `k:{…},` 会变成 `…},k:{…}` 之外还多出逗号，必须补分隔符。
+        _, end = table_bounds(text, anchor)
+        close = end - 1
+        prefix = text[:close].rstrip()
+        if not prefix.endswith(','):
+            prefix += ','
+        inserted = ''.join(key + ':{' + body + '},' for key, body in tail)
+        text = prefix + inserted + text[close:]
+    if report is not None:
+        report.update(result)
+    return text
 
 
 def main_availability(adapter):
@@ -421,6 +446,29 @@ def discover_adapter(app):
     return adapter
 
 
+def registered_adapter(app):
+    """只按已登记版本和指纹取适配器，不做结构识别。
+
+    备份校验用这个：备份必须是官方原始构建，不能是“看起来结构像”的东西。
+    """
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    version = info['CFBundleShortVersionString']
+    adapters = adapters_for_version(version)
+    if not adapters:
+        raise ValueError('Unknown version; no patch applied')
+    if len(adapters) == 1:
+        return adapters[0]
+    try:
+        b, _, _ = read_asar(app / 'Contents/Resources/app.asar')
+    except Exception:
+        raise ValueError('ASAR fingerprint mismatch; no patch applied')
+    digest = sha(b)
+    for adapter in adapters:
+        if digest == adapter['asarHash']:
+            return adapter
+    raise ValueError('ASAR fingerprint mismatch; no patch applied')
+
+
 def source_adapter(app):
     """按版本和 ASAR 指纹选择适配器。
 
@@ -438,15 +486,34 @@ def source_adapter(app):
                 raise ValueError('Unknown version; no patch applied')
             raise
     if len(adapters) == 1:
-        return adapters[0]
+        # 只有一种已登记构建：仍要核对整包指纹。官方可能不升版本号就换构建，
+        # 此时按结构重新识别，而不是套用旧锚点。ASAR 读不出来就直接拒绝。
+        try:
+            b,_,_=read_asar(app/'Contents/Resources/app.asar')
+        except Exception:
+            raise ValueError('ASAR fingerprint mismatch; no patch applied')
+        if sha(b) == adapters[0]['asarHash']:
+            return adapters[0]
+        return _rediscover_or_refuse(app, 'ASAR fingerprint mismatch; no patch applied')
     # 同一个版本号可能对应两种官方构建：官网 universal DMG 和更新器 arm64。
     # 版本号相同，只能靠 ASAR 指纹区分，绝不能混用整包指纹。
-    b,_,_=read_asar(app/'Contents/Resources/app.asar')
+    try:
+        b,_,_=read_asar(app/'Contents/Resources/app.asar')
+    except Exception:
+        raise ValueError('ASAR fingerprint mismatch; no patch applied')
     digest=sha(b)
     for adapter in adapters:
         if digest == adapter['asarHash']:
             return adapter
-    raise ValueError('ASAR fingerprint mismatch; no patch applied')
+    return _rediscover_or_refuse(app, 'ASAR fingerprint mismatch; no patch applied')
+
+
+def _rediscover_or_refuse(app, message):
+    """指纹对不上时尝试按结构重新识别；任何失败都回落到原来的拒绝。"""
+    try:
+        return discover_adapter(app)
+    except Exception:
+        raise ValueError(message)
 
 
 def verify_source(app, adapter=None):

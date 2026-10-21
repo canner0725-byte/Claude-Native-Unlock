@@ -271,10 +271,11 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'running', return_value=False), \
                  patch.object(official, 'status', return_value={'enabled': True, 'supported': True, 'version': official.core.VERSION}), \
                  patch.object(official.core, 'verify_source'), patch.object(official, 'verify_patched'), \
+                 patch.object(official, 'prepare_identity'), \
                  patch.object(official.platform, 'machine', return_value='arm64'), \
                  patch.object(official.platform, 'mac_ver', return_value=('27.0.1', (), '')), \
                  patch.object(official, 'clone', side_effect=lambda source, destination: destination.mkdir()), \
-                 patch.object(official, 'build', return_value={official.ASAR: 'new'}), \
+                 patch.object(official, 'build', return_value=({official.ASAR: 'new'}, {})), \
                  patch.object(pathlib.Path, 'rename', rename):
                 with self.assertRaisesRegex(OSError, 'simulated'):
                     official.update()
@@ -313,6 +314,7 @@ class OfficialSafety(unittest.TestCase):
             with patch.object(official, 'TARGET', target), \
                  patch.object(official, 'manifest', return_value=None), \
                  patch.object(official, 'running', return_value=False), \
+                 patch.object(official, 'prepare_identity'), \
                  patch.object(official, 'clone') as clone:
                 self.assertFalse(official.status()['supported'])
                 with self.assertRaisesRegex(ValueError, 'Unknown version'):
@@ -349,7 +351,7 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
                  patch.object(official.core, 'verify_source'), \
-                 patch.object(official.core, 'source_adapter', side_effect=adapter), \
+                 patch.object(official.core, 'registered_adapter', side_effect=adapter), \
                  patch.object(official, 'verify_patched'), \
                  patch.object(official, 'clone', side_effect=shutil.copytree):
                 result = official.disable()
@@ -393,6 +395,9 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
                  patch.object(official.core, 'verify_source'), \
+                 patch.object(official.core, 'registered_adapter',
+                              return_value={'version': official.core.VERSION,
+                                            'asarHash': official.core.sha(b'official original')}), \
                  patch.object(official, 'clone') as clone:
                 with self.assertRaisesRegex(ValueError, '已安装文件发生变化'):
                     official.disable()
@@ -520,6 +525,8 @@ class OfficialSafety(unittest.TestCase):
 
     def test_local_identity_needs_both_keychain_and_marker(self):
         import native_unlock as core
+        # 必须隔离整个 WORK：signing_paths() 从 WORK 推导，漏掉就会在仓库里
+        # 建出 work/signing，测试之间互相影响。
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory).resolve()
             with patch.object(core, 'WORK', root):
@@ -532,6 +539,10 @@ class OfficialSafety(unittest.TestCase):
                 self.assertEqual(core.local_identity(), 'aabb')
                 marker.write_text('\n')
                 self.assertIsNone(core.local_identity())
+            # 回归保护：任何测试都不该在仓库里建出 work/（曾因 update() 真去
+            # 生成签名身份而泄漏，并让后续测试读到另一个身份）。
+            self.assertFalse((pathlib.Path(core.__file__).resolve().parent.parent / 'work').exists(),
+                             '测试不得在仓库里留下 work/ 目录')
 
     def test_launch_opens_unsupported_official_build(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -580,11 +591,26 @@ class FeatureTableEditing(unittest.TestCase):
                                   core.split_entries('857846362:{rule:"forced",value:!0},'))
         self.assertEqual(out, self.TABLE)
 
-    def test_conflicting_definition_is_refused(self):
+    def test_conflicting_definition_is_overridden_at_the_table_end(self):
+        """官方已有不同取值时，追加到表尾——对象字面量里后定义获胜。"""
         import native_unlock as core
-        with self.assertRaisesRegex(ValueError, 'already defined differently'):
-            core.insert_entries(self.TABLE, 'var ken={',
-                                core.split_entries('857846362:{rule:"remote"},'))
+        report = {}
+        # 官方把它设成关闭，我们要开启——这才是真正的冲突
+        table = ('var ken={857846362:{rule:"forced",value:!1}},'
+                 'Aen={101380594:{rule:"always",value:!0}};')
+        out = core.insert_entries(table, 'var ken={',
+                                  core.split_entries('857846362:{rule:"forced",value:!0},'),
+                                  report)
+        self.assertEqual(report['overridden'], ['857846362'])
+        # 覆盖项必须出现在官方定义之后，且在表内
+        official_pos = out.index('857846362:{rule:"forced",value:!1}')
+        ours_pos = out.index('857846362:{rule:"forced",value:!0}', official_pos)
+        self.assertGreater(ours_pos, official_pos)
+        _, end = core.table_bounds(out, 'var ken={')
+        self.assertLess(ours_pos, end)
+        # 解析后确实是我们想要的值
+        body = core.table_definition(out, 'var ken={', '857846362')
+        self.assertIn('value:!0', body)
 
     def test_lookup_is_scoped_to_the_table(self):
         """同名键出现在另一张表里，不算本表已有。"""
@@ -631,3 +657,51 @@ class FeatureTableEditing(unittest.TestCase):
                 official.prune_old_state(keep)
             self.assertEqual(sorted(p.name for p in state.iterdir()),
                              ['official-backup-1.app'])
+
+
+class FutureBuildCompatibility(unittest.TestCase):
+    """官方换构建时，旧补丁必须仍然能装上并生效。"""
+
+    TABLE = ('var ken={123929380:{rule:"forced",value:!0},'
+             '857846362:{rule:"forced",value:!0}},Aen={101380594:{rule:"always",value:!0}};')
+
+    def test_override_is_placed_before_the_closing_brace_with_valid_separator(self):
+        import native_unlock as core
+        # 表末条目没有尾逗号时，追加覆盖项不能产生非法 JS
+        table = 'var ken={857846362:{rule:"forced",value:!1}},Aen={1:{rule:"always",value:!0}};'
+        out = core.insert_entries(table, 'var ken={',
+                                  core.split_entries('857846362:{rule:"forced",value:!0},'))
+        self.assertIn('value:!1},857846362:{rule:"forced",value:!0},}', out)
+        self.assertNotIn(',,', out)
+        # 覆盖项必须在表内
+        _, end = core.table_bounds(out, 'var ken={')
+        self.assertLess(out.index('value:!0}'), end)
+
+    def test_effective_definition_is_the_last_one(self):
+        import native_unlock as core
+        table = 'var ken={5:{rule:"forced",value:!1},5:{rule:"forced",value:!0}};'
+        self.assertEqual(core.table_definition(table, 'var ken={', '5'),
+                         'rule:"forced",value:!0')
+
+    def test_changed_build_with_same_version_falls_back_to_discovery(self):
+        """版本号没变但构建变了：不能套用旧锚点。"""
+        import native_unlock as core
+        with tempfile.TemporaryDirectory() as directory:
+            app = pathlib.Path(directory).resolve() / 'Claude.app'
+            (app / 'Contents').mkdir(parents=True)
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleIdentifier': 'com.anthropic.claudefordesktop',
+                'CFBundleShortVersionString': official.core.ADAPTER_31623['version']}))
+            with patch.object(core, 'adapters_for_version',
+                              return_value=[official.core.ADAPTER_31623]), \
+                 patch.object(core, 'discover_adapter', return_value={'discovered': True}) as discover, \
+                 patch.object(core, 'read_asar', return_value=(b'changed', {}, 0)), \
+                 patch.object(core, 'sha', return_value='different'):
+                adapter = core.source_adapter(app)
+            discover.assert_called_once()
+            self.assertTrue(adapter['discovered'])
+
+    def test_status_exposes_permission_regrant_hint(self):
+        current = {'enabled': True, 'supported': True, 'patchRevision': official.PATCH_REVISION,
+                   'signingUpdateAvailable': True}
+        self.assertTrue(current['signingUpdateAvailable'])
