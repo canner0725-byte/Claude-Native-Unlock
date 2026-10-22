@@ -392,6 +392,17 @@ class CodeSessionFlags(unittest.TestCase):
         self.assertFalse(flags['preflight'])
         self.assertFalse(flags['toolSearch'])
 
+    def test_tool_search_is_read_from_managed_settings(self):
+        """桌面端把 ENABLE_TOOL_SEARCH 放在 --managed-settings 里，不在进程环境。"""
+        line = ('111 /Users/x/Library/Application Support/Claude-3p/claude-code/2.1.304/abc/'
+                'claude.app/Contents/MacOS/claude --output-format stream-json '
+                '--managed-settings {env:{ENABLE_TOOL_SEARCH:force}} '
+                "--settings {skipWebFetchPreflight:true}\n")
+        flags = self.run_flags(line, 'claude CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1')
+        self.assertEqual(flags['count'], 1)
+        self.assertTrue(flags['preflight'])
+        self.assertTrue(flags['toolSearch'])
+
     def test_ignores_other_processes(self):
         flags = self.run_flags('222 /usr/bin/something --output-format stream-json\n')
         self.assertEqual(flags['count'], 0)

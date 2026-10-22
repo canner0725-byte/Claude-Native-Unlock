@@ -11,8 +11,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.26'
-BUILD_NUMBER = '39'
+VERSION = '0.3.27'
+BUILD_NUMBER = '40'
 APP_NAME = 'Claude 原生助手'
 # 文件名保持 ASCII：非 ASCII 的发布文件名会被 GitHub 换成“.”，下载链接很难看。
 ARCHIVE_NAME = 'Claude-Native-Assistant'

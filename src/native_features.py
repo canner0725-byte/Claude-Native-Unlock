@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import stat
 import sys
 import time
@@ -159,16 +160,25 @@ def matches(config, key, present, value):
 
 LOG_TAIL_BYTES = 262144
 CLI_MARKER = 'claude-code/'
-SETTINGS_RE = re.compile(r'--settings(?:=|\s+)(\S+)')
+
+
+def _argument(args, name):
+    """取 `--name value` 或 `--name=value` 的值；没有就返回空串。"""
+    for index, item in enumerate(args):
+        if item == name and index + 1 < len(args):
+            return args[index + 1]
+        if item.startswith(name + '='):
+            return item[len(name) + 1:]
+    return ''
 
 
 def code_session_flags():
     """只读正在运行的 Code CLI 进程，确认桌面把设置传给了会话。
 
-    Code 会话由桌面端启动：设置以 `--settings` 参数传入，工具搜索以
-    `ENABLE_TOOL_SEARCH` 环境变量传入。这里只读 argv/env，用来判断
-    “开关打开后，新会话是否真的带上了”；不创建会话，也不向会话发送内容。
-    读不到进程列表时返回 None，不猜测。
+    桌面端实际用两个参数下发：`--settings` 带 skipWebFetchPreflight，
+    `--managed-settings` 带 `{env:{ENABLE_TOOL_SEARCH:…}}`（旧路径也可能
+    直接放进进程环境）。这里只读 argv/env，用来判断“开关打开后，新会话
+    是否真的带上了”；不创建会话，也不向会话发送内容。读不到返回 None。
     """
     try:
         listing = official.core.run('ps', '-axo', 'pid=,command=').stdout.decode()
@@ -184,15 +194,21 @@ def code_session_flags():
             continue
         if '--output-format' not in command:
             continue
-        match = SETTINGS_RE.search(command)
-        settings = match.group(1) if match else ''
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            args = command.split()
+        settings = _argument(args, '--settings')
+        managed = _argument(args, '--managed-settings')
         try:
             env = official.core.run('ps', 'eww', '-p', pid).stdout.decode()
         except Exception:
             env = ''
         sessions.append({'pid': pid,
-                         'preflight': 'skipWebFetchPreflight' in settings,
-                         'toolSearch': 'ENABLE_TOOL_SEARCH=' in env})
+                         'preflight': ('skipWebFetchPreflight' in settings
+                                       or 'skipWebFetchPreflight' in managed),
+                         'toolSearch': ('ENABLE_TOOL_SEARCH' in managed
+                                        or 'ENABLE_TOOL_SEARCH=' in env)})
     return {'count': len(sessions),
             'preflight': any(item['preflight'] for item in sessions),
             'toolSearch': any(item['toolSearch'] for item in sessions)}
