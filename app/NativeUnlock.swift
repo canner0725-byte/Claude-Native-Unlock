@@ -4,28 +4,39 @@ import AppKit
 // 所有真正的补丁操作都在内置 Python 后端里完成；这里只负责显示状态、
 // 收集用户意图，并把后端返回的 JSON 转成中文提示。
 //
-// 界面只保留“现在能不能用”和“点哪里”：主开关一张卡片、原生配置一列、
-// 底部两个常用按钮。更新补丁只在真的可更新时淡入；准备官方更新、系统
-// 授权说明、使用说明等低频动作用菜单栏菜单承载，窗口里不再堆文字。
-class AppDelegate: NSObject, NSApplicationDelegate {
+// 窗口按 Claude 设置页的布局重做：左侧搜索/分区导航，右侧分组设置行。
+// 配色、开关、按钮和间距对齐 Claude 桌面端（深色近黑、蓝色开关、灰色按钮）。
+class AppDelegate: NSObject, NSApplicationDelegate, NSSearchFieldDelegate {
     var window: NSWindow!
-    var contentStack: NSStackView!
-    /// Stack 底边与内容视图的约束；量高度时要临时断开，否则它把高度钉在窗口上。
-    var contentBottomPin: NSLayoutConstraint!
+    var scrollView: NSScrollView!
+    var contentTitleLabel: NSTextField!
+    var sectionViews: [String: NSView] = [:]
+    var sidebarRows: [String: SidebarRowView] = [:]
+    var sidebarHeaders: [(view: NSView, ids: [String])] = []
+    var selectedSection = "general"
+    var searchField: NSSearchField!
 
     // 主开关：安装 / 恢复正式版可用性补丁。
-    let toggle = NSSwitch()
+    let toggle = ClaudeSwitch()
     let statusLabel = NSTextField(wrappingLabelWithString: "正在检测…")
-    let metaLabel = NSTextField(labelWithString: "正在检测…")
+    let metaLabel = NSTextField(wrappingLabelWithString: "正在检测…")
+    let statusPill = StatusPillView()
 
-    // 底部操作。
-    let openButton = NSButton(title: "打开 Claude", target: nil, action: nil)
-    let refreshButton = NSButton(title: "重新检测", target: nil, action: nil)
+    // 右侧设置行里的动态状态。
+    let patchStateLabel = NSTextField(wrappingLabelWithString: "正在检测…")
+    let patchMetaLabel = NSTextField(wrappingLabelWithString: "正在检测…")
+    let backupStateLabel = NSTextField(wrappingLabelWithString: "正在检测…")
 
-    // 只在可更新时出现。
-    let updateButton = NSButton(title: "更新补丁", target: nil, action: nil)
-    // 打完补丁后出现：一键跳到系统设置的隐私页面。
-    let permissionButton = NSButton(title: "去授权", target: nil, action: nil)
+    // 操作按钮。
+    let openButton = ClaudeButton(title: "打开", style: .secondary)
+    let refreshButton = ClaudeButton(title: "重新检测", style: .secondary)
+    let updateButton = ClaudeButton(title: "更新补丁", style: .secondary)
+    let prepareButton = ClaudeButton(title: "准备更新", style: .secondary)
+    let permissionButton = ClaudeButton(title: "去系统设置", style: .secondary)
+    let guideButton = ClaudeButton(title: "打开说明", style: .secondary)
+    let githubButton = ClaudeButton(title: "打开 GitHub", style: .secondary)
+    var refreshIconButton: ClaudeIconButton!
+    var closeButton: ClaudeIconButton!
 
     let progress = NSProgressIndicator()
 
@@ -82,7 +93,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务",
                          "Cowork 自动审批选项", "插件里的桌面扩展", "MCP 工具按需加载",
                          "WebFetch 免域名预检", "Code 自动整理"]
-    // 说明只在悬停提示里出现，窗口里保持一行一个开关。
     let featureDescriptions = [
         "Chat 使用标准工作台，启用官方高级文件分析。",
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
@@ -95,7 +105,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     ]
     /// Code 自动整理在列表里的位置；它走 CLI 后端，不是 3P 配置项。
     var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
-    var featureSwitches: [NSSwitch] = []
+    var featureSwitches: [ClaudeSwitch] = []
     var featureLabels: [NSTextField] = []
     var featureHints: [NSTextField] = []
     var featureRows: [NSView] = []
@@ -152,248 +162,605 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         workspaceCenter.addObserver(self, selector: #selector(systemDidWake(_:)),
                                     name: NSWorkspace.didWakeNotification, object: nil)
 
-        // 主窗口。
-        // 780 高度给补丁操作行和最多四行状态留出空间，避免底部按钮重叠。
-        // 内容自己决定高度，所以先给一个够用的初始尺寸，随后按内容收敛。
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
-                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        // 主窗口：透明标题栏、全尺寸内容，左侧栏直接延伸到交通灯下面。
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 640),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                          backing: .buffered, defer: false)
         window.title = "Claude 原生助手"
         window.isReleasedWhenClosed = false
-        // 记住上次位置；窗口在已断开的显示器上时回到主屏居中。
-        window.setFrameAutosaveName("ClaudeNativeUnlockMainWindow")
-        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) {
-            window.center()
-        }
-        let content = NSView()
-        window.contentView = content
-
-        // 标题栏透明、标题在内容里，接近 macOS 自带设置窗口的观感。
+        window.minSize = NSSize(width: 808, height: 520)
+        window.backgroundColor = ClaudeTheme.pane
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
         window.styleMask.insert(.fullSizeContentView)
+        let savedFrameAtLaunch = UserDefaults.standard.string(
+            forKey: "NSWindow Frame ClaudeNativeUnlockSettingsWindow")
+        window.setFrameAutosaveName("ClaudeNativeUnlockSettingsWindow")
+        // 早期版本可能留下过被 Auto Layout 压窄的窗口尺寸；小于最小宽度就重置。
+        let savedKey = "NSWindow Frame ClaudeNativeUnlockSettingsWindow"
+        if let saved = UserDefaults.standard.string(forKey: savedKey) {
+            let parts = saved.split(separator: " ")
+            if parts.count >= 4, let width = Double(parts[2]), width < 808 {
+                UserDefaults.standard.removeObject(forKey: savedKey)
+                window.setContentSize(NSSize(width: 880, height: 640))
+                window.center()
+            }
+        } else {
+            window.setContentSize(NSSize(width: 880, height: 640))
+            window.center()
+        }
 
-        // 全部内容放在一个纵向 Stack 里：改文案、隐藏元素都能平滑过渡，
-        // 窗口高度自己跟着内容走，不再靠一堆固定约束硬撑。
+        let root = NSView()
+        window.contentView = root
+        let sidebar = buildSidebar()
+        let pane = buildContentPane()
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        pane.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(sidebar)
+        root.addSubview(pane)
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 248),
+            pane.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            pane.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            pane.topAnchor.constraint(equalTo: root.topAnchor),
+            pane.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: 560)
+        ])
+        window.contentMinSize = NSSize(width: 808, height: 520)
+
+        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) {
+            window.center()
+        }
+        selectSection("general")
+        updateStatusPill()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeFirstResponder(nil)
+        if savedFrameAtLaunch == nil {
+            // Auto Layout 会把窗口压到最小宽度；首次启动时在布局完成后恢复到目标尺寸。
+            DispatchQueue.main.async {
+                self.window.setContentSize(NSSize(width: 880, height: 640))
+                self.window.center()
+            }
+        }
+        execute("status-all", backend: "all")
+    }
+
+    // MARK: - 左侧栏
+
+    func buildSidebar() -> NSView {
+        let sidebar = SidebarBackgroundView()
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
+        stack.distribution = .fill
         stack.spacing = 0
-        stack.edgeInsets = NSEdgeInsets(top: 34, left: 22, bottom: 20, right: 22)
-        contentStack = stack
+        stack.edgeInsets = NSEdgeInsets(top: 46, left: 12, bottom: 14, right: 12)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor)
+        ])
 
-        let title = NSTextField(labelWithString: "Claude 原生助手")
-        title.font = .systemFont(ofSize: 20, weight: .semibold)
-        metaLabel.font = .systemFont(ofSize: 11)
-        metaLabel.textColor = .tertiaryLabelColor
+        // 与 Claude 设置页一致：搜索框直接放在交通灯下面，不在侧栏顶部加品牌行。
+        searchField = NSSearchField()
+        searchField.placeholderString = "搜索设置"
+        searchField.font = .systemFont(ofSize: 13)
+        searchField.controlSize = .small
+        searchField.delegate = self
+        searchField.sendsSearchStringImmediately = true
+        searchField.focusRingType = .none
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(searchField)
+        searchField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+        searchField.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        stack.setCustomSpacing(18, after: searchField)
 
-        let header = NSStackView(views: [title, metaLabel])
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = 3
+        addSidebarHeader("设置", ids: ["general", "features", "patch"], to: stack)
+        addSidebarRow("general", title: "概览", symbol: "slider.horizontal.3", to: stack)
+        addSidebarRow("features", title: "原生配置", symbol: "switch.2", to: stack)
+        addSidebarRow("patch", title: "补丁与更新", symbol: "arrow.triangle.2.circlepath", to: stack)
 
-        // 主开关卡片：一行标题 + 一行状态。
-        let mainTitle = NSTextField(labelWithString: "Computer Use")
-        mainTitle.font = .systemFont(ofSize: 15, weight: .medium)
-        mainTitle.toolTip = "安装或恢复 Computer Use、Code 工作台等原生可用性补丁。"
-        statusLabel.font = .systemFont(ofSize: 12)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.maximumNumberOfLines = 2
-        statusLabel.lineBreakMode = .byWordWrapping
+        addSidebarHeader("本机", ids: ["system", "about"], to: stack)
+        addSidebarRow("system", title: "系统授权", symbol: "lock.shield", to: stack)
+        addSidebarRow("about", title: "关于", symbol: "info.circle", to: stack)
 
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .vertical)
+        stack.addArrangedSubview(spacer)
+
+        statusPill.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(statusPill)
+        stack.setCustomSpacing(8, after: statusPill)
+
+        let version = NSTextField(labelWithString: "0.0.0 · 菜单栏常驻")
+        version.font = .systemFont(ofSize: 10.5)
+        version.textColor = ClaudeTheme.textMuted
+        version.stringValue = assistantVersion + " · 菜单栏常驻"
+        stack.addArrangedSubview(version)
+
+        return sidebar
+    }
+
+    func addSidebarHeader(_ title: String, ids: [String], to stack: NSStackView) {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = ClaudeTheme.textMuted
+        let wrap = NSView()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 10),
+            label.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 14),
+            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -4)
+        ])
+        stack.addArrangedSubview(wrap)
+        wrap.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+        sidebarHeaders.append((wrap, ids))
+    }
+
+    func addSidebarRow(_ id: String, title: String, symbol: String, to stack: NSStackView) {
+        let row = SidebarRowView(id: id, title: title, symbol: symbol) { [weak self] selected in
+            self?.selectSection(selected)
+        }
+        row.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        sidebarRows[id] = row
+    }
+
+    func selectSection(_ id: String) {
+        guard sectionViews[id] != nil else { return }
+        selectedSection = id
+        for (rowID, row) in sidebarRows {
+            row.isSelected = rowID == id
+        }
+        for (sectionID, view) in sectionViews {
+            view.isHidden = sectionID != id
+        }
+        contentTitleLabel?.stringValue = [
+            "general": "概览",
+            "features": "原生配置",
+            "patch": "补丁与更新",
+            "system": "系统授权",
+            "about": "关于"
+        ][id] ?? ""
+        scrollView?.contentView.scroll(to: .zero)
+        if let scrollView = scrollView {
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    // MARK: - 右侧内容
+
+    func buildContentPane() -> NSView {
+        let pane = ContentBackgroundView()
+        let topBar = NSView()
+        topBar.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(topBar)
+
+        contentTitleLabel = NSTextField(labelWithString: "概览")
+        contentTitleLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+        contentTitleLabel.textColor = ClaudeTheme.textPrimary
+        contentTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(contentTitleLabel)
+
+        progress.style = .spinning
+        progress.controlSize = .small
+        progress.isDisplayedWhenStopped = false
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(progress)
+
+        refreshIconButton = ClaudeIconButton(symbol: "arrow.clockwise",
+                                             accessibility: "重新检测") { [weak self] in
+            self?.refresh()
+        }
+        closeButton = ClaudeIconButton(symbol: "xmark", accessibility: "关闭窗口") { [weak self] in
+            self?.window.performClose(nil)
+        }
+        refreshIconButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        topBar.addSubview(refreshIconButton)
+        topBar.addSubview(closeButton)
+
+        scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        pane.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            topBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            topBar.topAnchor.constraint(equalTo: pane.topAnchor),
+            topBar.heightAnchor.constraint(equalToConstant: 58),
+            contentTitleLabel.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 32),
+            contentTitleLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
+            progress.trailingAnchor.constraint(equalTo: refreshIconButton.leadingAnchor, constant: -12),
+            progress.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
+            closeButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -18),
+            closeButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
+            closeButton.widthAnchor.constraint(equalToConstant: 28),
+            closeButton.heightAnchor.constraint(equalToConstant: 28),
+            refreshIconButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
+            refreshIconButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
+            refreshIconButton.widthAnchor.constraint(equalToConstant: 28),
+            refreshIconButton.heightAnchor.constraint(equalToConstant: 28),
+            scrollView.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: pane.bottomAnchor)
+        ])
+
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = doc
+        let sections = NSStackView()
+        sections.orientation = .vertical
+        sections.alignment = .leading
+        sections.distribution = .fill
+        sections.spacing = 0
+        sections.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(sections)
+        NSLayoutConstraint.activate([
+            doc.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            doc.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            doc.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            doc.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
+            sections.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 32),
+            sections.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -32),
+            sections.topAnchor.constraint(equalTo: doc.topAnchor, constant: 4),
+            sections.bottomAnchor.constraint(lessThanOrEqualTo: doc.bottomAnchor, constant: -36),
+            doc.heightAnchor.constraint(greaterThanOrEqualTo: sections.heightAnchor, constant: 40)
+        ])
+
+        let builders: [(String, NSView)] = [
+            ("general", buildGeneralSection()),
+            ("features", buildFeaturesSection()),
+            ("patch", buildPatchSection()),
+            ("system", buildSystemSection()),
+            ("about", buildAboutSection())
+        ]
+        for (id, view) in builders {
+            sections.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: sections.widthAnchor).isActive = true
+            sectionViews[id] = view
+        }
+        return pane
+    }
+
+    func buildGeneralSection() -> NSView {
+        configureDynamicLabel(statusLabel)
+        configureDynamicLabel(metaLabel)
+
+        let computerUse = settingsRow(
+            title: "Computer Use",
+            descriptionView: statusLabel,
+            control: toggle)
         toggle.target = self
         toggle.action = #selector(switchChanged)
         toggle.setAccessibilityLabel("Computer Use 解锁开关")
         toggle.isEnabled = false
 
-        let mainText = NSStackView(views: [mainTitle, statusLabel])
-        mainText.orientation = .vertical
-        mainText.alignment = .leading
-        mainText.spacing = 4
-        mainText.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let mainRow = NSStackView(views: [mainText, toggle])
-        mainRow.orientation = .horizontal
-        mainRow.alignment = .centerY
-        mainRow.spacing = 16
-        mainRow.distribution = .fill
+        let versionRow = settingsRow(
+            title: "Claude",
+            descriptionView: metaLabel)
 
-        // 原生配置卡片：一行一个开关，说明放在悬停提示里。
-        let rows = NSStackView()
-        rows.orientation = .vertical
-        rows.alignment = .leading
-        rows.spacing = 0
-        for (index, name) in featureTitles.enumerated() {
-            let label = NSTextField(labelWithString: name)
-            label.font = .systemFont(ofSize: 14)
-            label.toolTip = featureDescriptions[index]
-            let detail = NSTextField(labelWithString: "")
-            detail.font = .systemFont(ofSize: 11)
-            detail.textColor = .systemOrange
-            detail.lineBreakMode = .byTruncatingTail
-            detail.isHidden = true
-
-            // 只用于“装没装插件、有没有 .mcpb”这类可核对的事实，不是错误。
-            let hint = NSTextField(labelWithString: "")
-            hint.font = .systemFont(ofSize: 11)
-            hint.textColor = .secondaryLabelColor
-            hint.lineBreakMode = .byTruncatingTail
-            hint.isHidden = true
-            // 说明文字不能把整行撑宽，否则右对齐的开关会被挤到中间。
-            detail.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-            hint.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-
-            let control = NSSwitch()
-            control.tag = index
-            control.target = self
-            control.action = #selector(featureChanged(_:))
-            control.setAccessibilityLabel(name + " 配置开关")
-            control.isEnabled = false
-            // 开关始终贴右；说明文字变长时只压缩文字，不移动开关。
-            control.setContentHuggingPriority(.required, for: .horizontal)
-            control.setContentCompressionResistancePriority(.required, for: .horizontal)
-            featureSwitches.append(control)
-            featureLabels.append(detail)
-            featureHints.append(hint)
-
-            let text = NSStackView(views: [label, detail, hint])
-            text.orientation = .vertical
-            text.alignment = .leading
-            text.spacing = 2
-            text.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            text.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-
-            // 弹簧视图吃掉多余宽度，保证开关始终贴右，不被说明文字推走。
-            let spacer = NSView()
-            spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-            spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-
-            let row = NSStackView(views: [text, spacer, control])
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 16
-            row.edgeInsets = NSEdgeInsets(top: 9, left: 14, bottom: 9, right: 14)
-            if index > 0 {
-                let hairline = NSBox()
-                hairline.boxType = .separator
-                rows.addArrangedSubview(hairline)
-                hairline.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-            }
-            rows.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-            featureRows.append(row)
-        }
-
-        let section = NSTextField(labelWithString: "原生配置")
-        section.font = .systemFont(ofSize: 11, weight: .semibold)
-        section.textColor = .secondaryLabelColor
-
-        featureSummary.font = .systemFont(ofSize: 11)
-        featureSummary.textColor = .systemOrange
-        featureSummary.isHidden = true
-
-        for button in [openButton, refreshButton, updateButton, permissionButton] {
-            button.bezelStyle = .rounded
-            button.target = self
-        }
+        let openRow = settingsRow(
+            title: "打开 Claude",
+            description: "启动已安装的 Claude 应用。",
+            control: openButton)
+        openButton.target = self
         openButton.action = #selector(openClaude)
+
+        let refreshRow = settingsRow(
+            title: "重新检测",
+            description: "重新核对补丁、官方备份与配置状态。",
+            control: refreshButton)
+        refreshButton.target = self
         refreshButton.action = #selector(refresh)
+
+        return section([
+            settingsGroup("解锁", rows: [computerUse, versionRow], first: true),
+            settingsGroup("操作", rows: [openRow, refreshRow])
+        ], intro: "一个开关管理官方 Computer Use 与 Code 工作台的可用性补丁。动作授权、拒绝与中断仍由 Claude 处理。")
+    }
+
+    func buildFeaturesSection() -> NSView {
+        var rows: [NSView] = []
+        for index in featureTitles.indices {
+            rows.append(featureRow(index))
+        }
+        featureSummary.font = .systemFont(ofSize: 12)
+        featureSummary.textColor = ClaudeTheme.warning
+        featureSummary.isHidden = true
+        featureSummary.maximumNumberOfLines = 3
+        featureSummary.lineBreakMode = .byWordWrapping
+
+        return section([
+            featureSummary,
+            settingsGroup("配置", rows: rows, first: false)
+        ], intro: "这些开关只修改 Claude 已有的官方配置，不新增执行器或服务。说明文字会随版本核对，官方删掉的设置会自动禁用。")
+    }
+
+    func featureRow(_ index: Int) -> NSView {
+        let title = NSTextField(labelWithString: featureTitles[index])
+        title.font = .systemFont(ofSize: 14, weight: .medium)
+        title.textColor = ClaudeTheme.textPrimary
+        title.toolTip = featureDescriptions[index]
+
+        let desc = NSTextField(wrappingLabelWithString: featureDescriptions[index])
+        desc.font = .systemFont(ofSize: 13)
+        desc.textColor = ClaudeTheme.textSecondary
+        desc.maximumNumberOfLines = 0
+        desc.lineBreakMode = .byWordWrapping
+        desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let detail = NSTextField(wrappingLabelWithString: "")
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = ClaudeTheme.warning
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        detail.isHidden = true
+
+        let hint = NSTextField(wrappingLabelWithString: "")
+        hint.font = .systemFont(ofSize: 12)
+        hint.textColor = ClaudeTheme.textMuted
+        hint.maximumNumberOfLines = 2
+        hint.lineBreakMode = .byWordWrapping
+        hint.isHidden = true
+
+        let control = ClaudeSwitch()
+        control.tag = index
+        control.target = self
+        control.action = #selector(featureChanged(_:))
+        control.setAccessibilityLabel(featureTitles[index] + " 配置开关")
+        control.isEnabled = false
+        control.setContentHuggingPriority(.required, for: .horizontal)
+        control.setContentCompressionResistancePriority(.required, for: .horizontal)
+        featureSwitches.append(control)
+        featureLabels.append(detail)
+        featureHints.append(hint)
+
+        let row = settingsRow(titleView: title, descriptionView: desc,
+                              extraViews: [detail, hint], control: control)
+        featureRows.append(row)
+        return row
+    }
+
+    func buildPatchSection() -> NSView {
+        configureDynamicLabel(patchStateLabel)
+        configureDynamicLabel(patchMetaLabel)
+        configureDynamicLabel(backupStateLabel)
+
+        let stateRow = settingsRow(title: "补丁状态", descriptionView: patchStateLabel)
+        let versionRow = settingsRow(title: "Claude 版本", descriptionView: patchMetaLabel)
+        let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel)
+
+        updateButton.target = self
         updateButton.action = #selector(confirmUpdate)
         updateButton.toolTip = "把补丁更新到最新 revision；只保留最新版和当前官方备份。"
+        let updateRow = settingsRow(
+            title: "更新补丁",
+            description: "安装最新适配 revision。旧补丁会清理，只保留当前官方备份。",
+            control: updateButton)
+
+        prepareButton.target = self
+        prepareButton.action = #selector(prepareUpdate)
+        let prepareRow = settingsRow(
+            title: "为官方更新做准备",
+            description: "恢复完整官方签名和官方文件，供 Claude 官方更新器校验。备份、配置和会话都会保留。",
+            control: prepareButton)
+
+        return section([
+            settingsGroup("状态", rows: [stateRow, versionRow, backupRow], first: true),
+            settingsGroup("维护", rows: [updateRow, prepareRow])
+        ], intro: "补丁只在已适配的 Claude 版本上安装；更新或恢复都会先校验当前文件和官方备份。")
+    }
+
+    func buildSystemSection() -> NSView {
+        permissionButton.target = self
         permissionButton.action = #selector(openPrivacySettings)
         permissionButton.toolTip = "打开系统设置的隐私页面，给 Claude 勾选辅助功能与屏幕录制。"
-        permissionButton.bezelStyle = .rounded
-        permissionButton.isHidden = true
-        updateButton.isEnabled = false
-        // 可更新时再淡入，平时不占视觉位置。
-        updateButton.alphaValue = 0
-        updateButton.isHidden = true
 
-        progress.style = .spinning
-        progress.controlSize = .small
-        progress.isDisplayedWhenStopped = false
+        let permissionRow = settingsRow(
+            title: "辅助功能与屏幕录制",
+            description: "在系统设置里给 Claude 勾选这两项，然后在 Claude 设置 → This computer → System 确认显示 Granted。",
+            control: permissionButton)
 
-        let footerSpacer = NSView()
-        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let footer = NSStackView(views: [openButton, refreshButton, footerSpacer,
-                                         permissionButton, updateButton, progress])
-        footer.orientation = .horizontal
-        footer.alignment = .centerY
-        footer.spacing = 10
+        let reviewRow = settingsRow(
+            title: "逐应用授权",
+            description: "Computer Use 的逐应用授权、应用拦截、安全输入保护和用户拒绝都由 Claude 保留；本工具不绕过这些检查。")
 
-        let mainCard = makeCard(mainRow)
-        let rowsCard = makeCard(rows)
+        let browserRow = settingsRow(
+            title: "外部浏览器",
+            description: "Dia、Chrome 等外部浏览器受官方只读授权限制，Computer Use 不能点击或输入。网页操作请用 Claude 官方内置浏览器或 Claude in Chrome。")
 
-        for view in [header, mainCard, section, rowsCard, featureSummary, footer] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            stack.addArrangedSubview(view)
-            view.widthAnchor.constraint(equalTo: stack.widthAnchor,
-                                        constant: -44).isActive = true
+        return section([
+            settingsGroup("权限", rows: [permissionRow], first: true),
+            settingsGroup("边界", rows: [reviewRow, browserRow])
+        ], intro: "系统授权由 macOS 管理，只有你本人在系统设置里才能勾选；本工具只能把你带到对应页面。")
+    }
+
+    func buildAboutSection() -> NSView {
+        guideButton.target = self
+        guideButton.action = #selector(openFeatureReport)
+        githubButton.target = self
+        githubButton.action = #selector(openGitHub)
+
+        let versionRow = settingsRow(
+            title: "版本",
+            description: "Claude 原生助手 " + assistantVersion + " (" + assistantBuild + ")。")
+        let guideRow = settingsRow(
+            title: "使用说明",
+            description: "打开随包的中文说明，包含开关含义、官方更新顺序和恢复步骤。",
+            control: guideButton)
+        let githubRow = settingsRow(
+            title: "源码与发布",
+            description: "独立开源项目，与 Anthropic 无隶属关系；只分发自有的工具代码，不含 Claude 程序或用户数据。",
+            control: githubButton)
+        let dataRow = settingsRow(
+            title: "数据位置",
+            description: "备份与恢复记录保存在 ~/Library/Application Support/Claude 原生助手/，请勿手动删除。")
+
+        return section([
+            settingsGroup("应用", rows: [versionRow, guideRow, githubRow], first: true),
+            settingsGroup("数据", rows: [dataRow])
+        ], intro: "只解除已适配版本的原生功能可用性条件，不修改官方功能行为。")
+    }
+
+    // MARK: - 设置行与分组
+
+    func section(_ groups: [NSView], intro: String) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .fill
+        stack.spacing = 0
+
+        let introLabel = NSTextField(wrappingLabelWithString: intro)
+        introLabel.font = .systemFont(ofSize: 13)
+        introLabel.textColor = ClaudeTheme.textSecondary
+        introLabel.maximumNumberOfLines = 0
+        introLabel.lineBreakMode = .byWordWrapping
+        introLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        introLabel.translatesAutoresizingMaskIntoConstraints = false
+        introLabel.setContentHuggingPriority(.required, for: .vertical)
+        stack.addArrangedSubview(introLabel)
+        introLabel.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        stack.setCustomSpacing(24, after: introLabel)
+
+        for group in groups {
+            stack.addArrangedSubview(group)
+            group.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
-        stack.setCustomSpacing(18, after: header)
-        stack.setCustomSpacing(22, after: mainCard)
-        stack.setCustomSpacing(8, after: section)
-        stack.setCustomSpacing(10, after: rowsCard)
-        stack.setCustomSpacing(16, after: featureSummary)
+        return stack
+    }
 
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+    func settingsGroup(_ title: String, rows: [NSView], first: Bool = false) -> NSView {
+        let group = NSStackView()
+        group.orientation = .vertical
+        group.alignment = .leading
+        group.distribution = .fill
+        group.spacing = 0
+        if !first {
+            let line = HairlineView()
+            line.translatesAutoresizingMaskIntoConstraints = false
+            group.addArrangedSubview(line)
+            line.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            group.setCustomSpacing(20, after: line)
+        }
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 15, weight: .semibold)
+        heading.textColor = ClaudeTheme.textPrimary
+        heading.setContentHuggingPriority(.required, for: .vertical)
+        group.addArrangedSubview(heading)
+        group.setCustomSpacing(6, after: heading)
+        for (index, row) in rows.enumerated() {
+            row.setContentHuggingPriority(.required, for: .vertical)
+            group.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            if index < rows.count - 1 {
+                group.setCustomSpacing(4, after: row)
+            }
+        }
+        return group
+    }
+
+    func settingsRow(title: String, description: String, control: NSView? = nil) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        titleLabel.textColor = ClaudeTheme.textPrimary
+        let desc = NSTextField(wrappingLabelWithString: description)
+        desc.font = .systemFont(ofSize: 13)
+        desc.textColor = ClaudeTheme.textSecondary
+        desc.maximumNumberOfLines = 0
+        desc.lineBreakMode = .byWordWrapping
+        desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return settingsRow(titleView: titleLabel, descriptionView: desc,
+                           extraViews: [], control: control)
+    }
+
+    func settingsRow(title: String, descriptionView: NSView, control: NSView? = nil) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        titleLabel.textColor = ClaudeTheme.textPrimary
+        return settingsRow(titleView: titleLabel, descriptionView: descriptionView,
+                           extraViews: [], control: control)
+    }
+
+    func settingsRow(titleView: NSTextField, descriptionView: NSView,
+                     extraViews: [NSView], control: NSView?) -> NSView {
+        let row = NSView()
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.translatesAutoresizingMaskIntoConstraints = false
+        text.addArrangedSubview(titleView)
+        text.addArrangedSubview(descriptionView)
+        for view in extraViews { text.addArrangedSubview(view) }
+        row.addSubview(text)
+
+        if let control = control {
+            control.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(control)
+            NSLayoutConstraint.activate([
+                control.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                text.trailingAnchor.constraint(equalTo: control.leadingAnchor, constant: -24)
+            ])
+        } else {
+            text.trailingAnchor.constraint(equalTo: row.trailingAnchor).isActive = true
+        }
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: content.topAnchor)
+            text.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            text.topAnchor.constraint(equalTo: row.topAnchor, constant: 16),
+            text.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -16)
         ])
-        contentBottomPin = stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)
-        contentBottomPin.isActive = true
-
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        resizeToFit(animated: false)
-        execute("status-all", backend: "all")
+        return row
     }
 
-    /// 窗口高度跟着内容走；内容显隐后调用，顶部保持不动，过渡平滑。
-    func resizeToFit(animated: Bool = true) {
-        guard window.isVisible, let content = window.contentView else { return }
-        content.layoutSubtreeIfNeeded()
-        // 底边约束会把 Stack 高度钉死在窗口上，量出来的永远是当前高度。
-        // 先断开再量，才能拿到内容真正需要的高度。
-        contentBottomPin.isActive = false
-        let height = ceil(contentStack.fittingSize.height)
-        contentBottomPin.isActive = true
-        guard height > 100 else { return }
-        let current = window.frame.height
-        guard abs(height - current) > 0.5 else { return }
-        var frame = window.frame
-        frame.origin.y += current - height
-        frame.size.height = height
-        window.setFrame(frame, display: true, animate: animated)
+    func configureDynamicLabel(_ label: NSTextField) {
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = ClaudeTheme.textSecondary
+        label.maximumNumberOfLines = 0
+        label.lineBreakMode = .byWordWrapping
     }
 
-    /// 圆角卡片：窗口背景上做一层浅底，和系统设置的分组观感一致。
-    ///
-    /// 不用 NSBox：它的 contentView 不参与 Auto Layout，卡片量出来的高度是 0，
-    /// 内容会从卡片里溢出来压到上面的标题上。自己画一层，尺寸由内容决定。
-    func makeCard(_ inner: NSView) -> CardView {
-        let card = CardView()
-        inner.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(inner)
-        NSLayoutConstraint.activate([
-            inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
-            inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
-        ])
-        return card
-    }
+    // MARK: - 搜索
 
-    /// 内容变化时统一走这里：淡入淡出加轻微位移，避免界面“跳一下”。
-    func animate(_ duration: TimeInterval = 0.18, _ changes: () -> Void) {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = duration
-            context.allowsImplicitAnimation = true
-            changes()
+    func controlTextDidChange(_ obj: Notification) {
+        guard obj.object as? NSSearchField === searchField else { return }
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var firstVisible: String?
+        for (id, row) in sidebarRows {
+            let matches = query.isEmpty || row.titleText.lowercased().contains(query)
+                || (id == "features" && featureTitles.contains { $0.lowercased().contains(query) })
+            row.isHidden = !matches
+            if matches, firstVisible == nil { firstVisible = id }
+        }
+        for (view, ids) in sidebarHeaders {
+            view.isHidden = !ids.contains { sidebarRows[$0]?.isHidden == false }
+        }
+        if let current = sidebarRows[selectedSection], current.isHidden, let id = firstVisible {
+            selectSection(id)
         }
     }
+
+    // MARK: - 生命周期
 
     func applicationDidBecomeActive(_ notification: Notification) {
         // 回到助手窗口时顺手刷新；弹窗打开时或 4 秒内不重复检测。
@@ -463,7 +830,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func featureChanged(_ sender: NSSwitch) {
+    @objc func openGitHub() {
+        if let url = URL(string: "https://github.com/canner0725-byte/Claude-Native-Unlock") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func featureChanged(_ sender: ClaudeSwitch) {
         let index = sender.tag
         let enabling = sender.state == .on
         sender.state = featureEnabled[index] ? .on : .off
@@ -607,7 +980,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pendingAfterQuit = action
         relaunchAfterAction = relaunch
         statusLabel.stringValue = "正在等待 Claude 退出…"
-        statusLabel.textColor = .labelColor
+        statusLabel.textColor = ClaudeTheme.textSecondary
         progress.startAnimation(nil)
         refreshButtons()
         updateStatusItem()
@@ -758,6 +1131,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         trayPrepare.isEnabled = !blocked && officialSupported && !recoveryRequired
             && (!enabled || backupVerified)
         trayQuit.isEnabled = !busy
+        updateStatusPill()
+    }
+
+    /// 左侧栏底部的状态胶囊。
+    func updateStatusPill() {
+        guard statusPill.superview != nil else { return }
+        let blocked = busy || quittingClaude
+        let text: String
+        let tint: NSColor
+        var pulsing = false
+        if blocked {
+            text = "处理中"; tint = ClaudeTheme.accent; pulsing = true
+        } else if !statusLoaded {
+            text = "检测中"; tint = ClaudeTheme.accent; pulsing = true
+        } else if recoveryRequired {
+            text = "需要恢复"; tint = ClaudeTheme.warning
+        } else if !officialSupported {
+            text = targetExists ? "待适配" : "未找到 Claude"; tint = ClaudeTheme.warning
+        } else if enabled && !backupVerified {
+            text = "备份异常"; tint = ClaudeTheme.warning
+        } else if enabled {
+            text = "已解锁"; tint = ClaudeTheme.accent
+        } else {
+            text = "未开启"; tint = ClaudeTheme.textMuted
+        }
+        statusPill.update(text: text, tint: tint, pulsing: pulsing)
     }
 
     @objc func showStatusMenu() {
@@ -773,6 +1172,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeFirstResponder(nil)
     }
 
     @objc func showAbout() {
@@ -804,22 +1204,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         showPermissionGuide()
     }
 
-    /// 权限是否需要重新授权：打完补丁后签名身份变了，系统就不再认旧授权。
+    /// 权限按钮始终在“系统授权”页可见；能不能点由忙碌状态决定。
     func updatePermissionButton() {
-        let needed = enabled && !busy && !quittingClaude && permissionReGrantLikely
-        guard permissionButton.isHidden == !needed else { return }
-        if needed {
-            permissionButton.isHidden = false
-            permissionButton.alphaValue = 0
-            animate { self.permissionButton.animator().alphaValue = 1 }
-        } else {
-            animate { self.permissionButton.animator().alphaValue = 0 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if self.permissionButton.alphaValue < 0.01 {
-                    self.permissionButton.isHidden = true
-                }
-            }
-        }
+        permissionButton.isHidden = false
+        permissionButton.isEnabled = !busy && !quittingClaude
     }
 
     @objc func showPermissionGuide() {
@@ -916,10 +1304,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openButton.isEnabled = false
         refreshButton.isEnabled = false
         updateButton.isEnabled = false
+        prepareButton.isEnabled = false
+        refreshIconButton.isEnabled = false
         for control in featureSwitches { control.isEnabled = false }
 
         progress.startAnimation(nil)
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.textColor = ClaudeTheme.textSecondary
         if backend == "all" {
             statusLabel.stringValue = "正在检测…"
         } else if backend == "native_features" {
@@ -939,6 +1329,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             statusLabel.stringValue = "正在检测正式版…"
         }
+        mirrorPatchStatus()
         updateStatusItem()
     }
 
@@ -1028,7 +1419,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         statusLabel.stringValue = "正在检测…"
-        statusLabel.textColor = .labelColor
+        statusLabel.textColor = ClaudeTheme.textSecondary
         updateStatusItem()
         runBackend("status-all", backend: "all", feature: nil) { result in
             self.completeAll(result)
@@ -1061,7 +1452,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 处理后端结果
 
     /// 状态文案统一从这里写，顺带做一次淡入，避免文字突然跳变。
-    func setStatus(_ text: String, color: NSColor = .secondaryLabelColor) {
+    func setStatus(_ text: String, color: NSColor = ClaudeTheme.textSecondary) {
         guard text != statusLabel.stringValue else {
             statusLabel.textColor = color
             return
@@ -1072,25 +1463,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         animate(0.22) { self.statusLabel.animator().alphaValue = 1 }
     }
 
-    /// 更新按钮只在真的能更新时出现，出现和消失都走动画。
+    /// 旧界面里更新按钮会按可用性淡入；设置页里始终展示，只用启用状态表达。
     func setUpdateVisible(_ visible: Bool) {
-        guard updateButton.isHidden == visible else {
-            if !visible { updateButton.isEnabled = true }
-            return
-        }
-        if visible {
-            updateButton.isHidden = false
-            updateButton.alphaValue = 0
-            animate { self.updateButton.animator().alphaValue = 1 }
-        } else {
-            animate { self.updateButton.animator().alphaValue = 0 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if self.updateButton.alphaValue < 0.01 {
-                    self.updateButton.isHidden = true
-                    self.window.contentView?.layoutSubtreeIfNeeded()
-                }
-            }
-        }
+        updateButton.isHidden = false
+        updateButton.alphaValue = 1
     }
 
     /// 所有控件是否可用只在这里决定，避免多处状态不一致。
@@ -1101,8 +1477,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.isEnabled = interactive && officialSupported && (!enabled || backupVerified)
         // 打开 Claude 不依赖适配状态：官方更新后仍应能正常使用。
         openButton.isEnabled = interactive && targetExists && !recoveryRequired
+        refreshButton.isEnabled = interactive
+        refreshIconButton.isEnabled = interactive
         updateButton.isEnabled = interactive && updateAvailable
-        updateButton.title = availableRevision > 0 ? "更新到 r\(availableRevision)" : "更新补丁"
+        updateButton.title = updateAvailable && availableRevision > 0
+            ? "更新到 r\(availableRevision)" : "已是最新"
+        updateButton.invalidateIntrinsicContentSize()
+        prepareButton.isEnabled = interactive && officialSupported && !recoveryRequired
+            && (!enabled || backupVerified)
         setUpdateVisible(interactive && updateAvailable)
         for (index, control) in featureSwitches.enumerated() {
             if featureIDs[index] == "code-auto-dream" {
@@ -1114,8 +1496,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         updatePermissionButton()
-        // 按钮显隐会改变高度，等动画结束后让窗口重新贴合内容。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
     }
 
     func applyOfficial(_ result: [String: Any]) {
@@ -1124,9 +1504,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             lastError = error
             officialSupported = false
             updateAvailable = false
-            setStatus(error, color: .systemOrange)
+            setStatus(error, color: ClaudeTheme.warning)
             refreshButtons()
             toggle.isEnabled = false
+            mirrorPatchStatus()
+            updateStatusPill()
             return
         }
 
@@ -1149,21 +1531,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         officialMessage = result["message"] as? String ?? "检测完成"
         statusLabel.toolTip = officialMessage
         if recoveryRequired {
-            setStatus("安装中断 · 关闭开关即可恢复官方备份", color: .systemOrange)
+            setStatus("安装中断 · 关闭开关即可恢复官方备份", color: ClaudeTheme.warning)
         } else if !supported {
             setStatus(targetExists ? "此版本尚未适配 · 不会修改 Claude" : "未找到 Claude",
-                      color: .systemOrange)
+                      color: ClaudeTheme.warning)
         } else if !enabled {
-            setStatus("未开启", color: .secondaryLabelColor)
+            setStatus("未开启", color: ClaudeTheme.textSecondary)
         } else if !backupVerified {
-            setStatus("已解锁 · 官方备份异常，恢复已停用", color: .systemOrange)
+            setStatus("已解锁 · 官方备份异常，恢复已停用", color: ClaudeTheme.warning)
         } else if updateAvailable {
-            setStatus("已解锁 · 有新版本可更新", color: .systemBlue)
+            setStatus("已解锁 · 有新版本可更新", color: ClaudeTheme.accent)
         } else {
-            setStatus("已解锁 · 文件校验通过", color: .secondaryLabelColor)
+            setStatus("已解锁 · 文件校验通过", color: ClaudeTheme.textSecondary)
         }
+        metaVersion = result["version"] as? String ?? metaVersion
+        refreshMeta()
+        mirrorPatchStatus()
+        updateStatusPill()
+    }
+
+    var metaVersion = ""
+
+    func refreshMeta() {
         let patch = enabled && patchRevision > 0 ? " · 补丁 r\(patchRevision)" : ""
-        metaLabel.stringValue = "Claude \(result["version"] as? String ?? "未知")" + patch
+        let running = officialRunning ? " · 运行中" : ""
+        let text = "Claude " + (metaVersion.isEmpty ? "未知" : metaVersion) + patch + running
+        metaLabel.stringValue = text
+        patchMetaLabel.stringValue = text
+    }
+
+    /// 补丁页和概览页共享同一份状态文案。
+    func mirrorPatchStatus() {
+        patchStateLabel.stringValue = statusLabel.stringValue
+        patchStateLabel.textColor = statusLabel.textColor
+        patchMetaLabel.stringValue = metaLabel.stringValue
+        if !statusLoaded {
+            backupStateLabel.stringValue = "正在检测…"
+        } else if !enabled {
+            backupStateLabel.stringValue = "补丁未安装；安装后会自动保存完整官方备份。"
+        } else if backupVerified {
+            backupStateLabel.stringValue = "当前官方备份已校验，可用于恢复官方原版。"
+        } else {
+            backupStateLabel.stringValue = "官方备份校验异常；恢复和补丁更新已停用。"
+        }
     }
 
     func applyCLI(_ result: [String: Any]) {
@@ -1196,6 +1606,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setFeatureDetail(_ index: Int, text: String) {
         let label = featureLabels[index]
         label.stringValue = text
+        label.invalidateIntrinsicContentSize()
         // 当前可见状态已经和文字是否为空一致时不用再动。
         if label.isHidden == text.isEmpty { return }
         animate { label.animator().isHidden = text.isEmpty }
@@ -1204,6 +1615,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setFeatureHint(_ index: Int, text: String) {
         let label = featureHints[index]
         label.stringValue = text
+        label.invalidateIntrinsicContentSize()
         if label.isHidden == text.isEmpty { return }
         animate { label.animator().isHidden = text.isEmpty }
     }
@@ -1230,7 +1642,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 setFeatureHint(index, text: "")
             }
             setSummary(error + " 请重新检测。")
-            if lastError == nil { setStatus(error, color: .systemOrange) }
+            if lastError == nil { setStatus(error, color: ClaudeTheme.warning) }
             return
         }
 
@@ -1246,6 +1658,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             featureAvailable[index] = available
             featureRestorable[index] = feature["canRestore"] as? Bool ?? false
             featureSwitches[index].state = on ? .on : .off
+            // 默认开启、又没有本工具恢复记录的项不能从界面关闭；用悬停提示说清楚，
+            // 否则一个“亮着但点不动”的开关看起来像坏了。
+            featureSwitches[index].toolTip = !available
+                ? "此版本没有这个设置。"
+                : (on && !featureRestorable[index] && id != "code-auto-dream"
+                    ? "这一项由 Claude 默认开启；本工具没有它的恢复记录，因此不从这里关闭。"
+                    : featureDescriptions[index])
             var detail = available ? "" : (feature["message"] as? String ?? "此版本没有这个设置")
             if detail.isEmpty, on, justChangedFeature, let sessions = sessions {
                 detail = codeSessionDetail(id: id, sessions: sessions)
@@ -1257,9 +1676,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let hint = featureEnabled[index] && featureAvailable[index]
                 ? desktopExtensionHint(result) : ""
             setFeatureHint(index, text: hint)
-            if !hint.isEmpty {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
-            }
         }
 
         let health = result["configHealth"] as? [String: Any]
@@ -1277,13 +1693,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             setSummary("")
         }
+        refreshMeta()
     }
 
     func setSummary(_ text: String) {
         guard featureSummary.stringValue != text || featureSummary.isHidden != text.isEmpty else { return }
         featureSummary.stringValue = text
         animate { self.featureSummary.animator().isHidden = text.isEmpty }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
     }
 
     func completeAll(_ result: [String: Any]) {
@@ -1297,6 +1713,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let officialResult = result["official"] as? [String: Any]
             ?? ["error": "正式版检测未完成；请重新检测。"]
+        metaVersion = officialResult["version"] as? String ?? metaVersion
         applyOfficial(officialResult)
         applyCLI(result["cli"] as? [String: Any] ?? [:])
         applyFeatures(result["features"] as? [String: Any] ?? [:])
@@ -1307,6 +1724,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func complete(_ result: [String: Any], command: String = "status") {
         lastStatusAt = Date()
+        metaVersion = result["version"] as? String ?? metaVersion
         applyOfficial(result)
         if lastError != nil {
             finishInteraction()
@@ -1326,6 +1744,641 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshAllStatus()
     }
 
+    func animate(_ duration: TimeInterval = 0.18, _ changes: () -> Void) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+            context.allowsImplicitAnimation = true
+            changes()
+        }
+    }
+}
+
+// MARK: - Claude 设置页视觉
+
+enum ClaudeTheme {
+    static func dynamic(_ light: NSColor, _ dark: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        }
+    }
+
+    static func rgb(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat((value >> 16) & 0xFF) / 255,
+                green: CGFloat((value >> 8) & 0xFF) / 255,
+                blue: CGFloat(value & 0xFF) / 255,
+                alpha: alpha)
+    }
+
+    // Claude 设置页：近黑侧栏、稍亮的右侧面板、蓝色开关、灰色按钮。
+    static let pane = dynamic(rgb(0xFFFFFF), rgb(0x1C1C1B))
+    static let sidebar = dynamic(rgb(0xF0EFEC), rgb(0x141413))
+    static let sidebarHover = dynamic(rgb(0xE9E8E2), rgb(0x232322))
+    static let sidebarSelected = dynamic(rgb(0xE1E0D9), rgb(0x30302E))
+
+    static let textPrimary = dynamic(rgb(0x151515), rgb(0xF2F1EE))
+    static let textSecondary = dynamic(rgb(0x5F5E5A), rgb(0xA3A19C))
+    static let textMuted = dynamic(rgb(0x8A8A8A), rgb(0x77756F))
+    static let border = dynamic(rgb(0x151515, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.09))
+    static let separator = dynamic(rgb(0x151515, alpha: 0.08), rgb(0xFFFFFF, alpha: 0.08))
+
+    static let accent = dynamic(rgb(0x007AFF), rgb(0x0A84FF))
+    static let accentHover = dynamic(rgb(0x0066D6), rgb(0x3B9CFF))
+    static let switchOff = dynamic(rgb(0xD2D1C7), rgb(0x4A4A47))
+    static let switchOffHover = dynamic(rgb(0xC3C2B7), rgb(0x55554F))
+
+    static let buttonFill = dynamic(rgb(0xE7E6E1), rgb(0x383735))
+    static let buttonHover = dynamic(rgb(0xDDDCD6), rgb(0x45443F))
+    static let buttonPressed = dynamic(rgb(0xD2D1C7), rgb(0x2E2E2C))
+    static let buttonBorder = dynamic(rgb(0xD9D8D2), rgb(0x45443F))
+
+    static let warning = dynamic(rgb(0xB4531F), rgb(0xE0A075))
+    static let clay = rgb(0xD97757)
+}
+
+/// 左侧栏底色；右侧一条 1px 分隔线。
+final class SidebarBackgroundView: NSView {
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        ClaudeTheme.sidebar.setFill()
+        dirtyRect.fill()
+        ClaudeTheme.border.setStroke()
+        let line = NSBezierPath()
+        line.move(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.minY))
+        line.line(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.maxY))
+        line.lineWidth = 1
+        line.stroke()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+/// 右侧面板底色。
+final class ContentBackgroundView: NSView {
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        ClaudeTheme.pane.setFill()
+        dirtyRect.fill()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+/// 设置页左侧的一行：图标 + 标题，选中时灰底白字。
+final class SidebarRowView: NSView {
+    let id: String
+    let titleText: String
+    private let iconView = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+    private let onSelect: (String) -> Void
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+
+    var isSelected = false {
+        didSet { updateAppearance() }
+    }
+
+    init(id: String, title: String, symbol: String, onSelect: @escaping (String) -> Void) {
+        self.id = id
+        self.titleText = title
+        self.onSelect = onSelect
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            iconView.image = image
+            iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        }
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.contentTintColor = ClaudeTheme.textSecondary
+        label.stringValue = title
+        label.font = .systemFont(ofSize: 13.5)
+        label.textColor = ClaudeTheme.textSecondary
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 17),
+            iconView.heightAnchor.constraint(equalToConstant: 17),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 9),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateAppearance()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onSelect(id)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let background: NSColor
+            if isSelected {
+                background = ClaudeTheme.sidebarSelected
+            } else if hovered {
+                background = ClaudeTheme.sidebarHover
+            } else {
+                background = .clear
+            }
+            layer?.backgroundColor = background.cgColor
+        }
+        let color = isSelected ? ClaudeTheme.textPrimary : ClaudeTheme.textSecondary
+        label.textColor = color
+        iconView.contentTintColor = color
+        label.font = .systemFont(ofSize: 13.5, weight: isSelected ? .medium : .regular)
+    }
+}
+
+/// 圆形图标按钮，用于右上角的刷新和关闭。
+final class ClaudeIconButton: NSButton {
+    private let symbolView = NSImageView()
+    private let actionClosure: () -> Void
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+
+    init(symbol: String, accessibility: String, action: @escaping () -> Void) {
+        self.actionClosure = action
+        super.init(frame: .zero)
+        isBordered = false
+        bezelStyle = .regularSquare
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        title = ""
+        target = self
+        self.action = #selector(performAction)
+        setAccessibilityLabel(accessibility)
+        toolTip = accessibility
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: accessibility) {
+            symbolView.image = image
+            symbolView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        }
+        symbolView.translatesAutoresizingMaskIntoConstraints = false
+        symbolView.contentTintColor = ClaudeTheme.textSecondary
+        addSubview(symbolView)
+        NSLayoutConstraint.activate([
+            symbolView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            symbolView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            symbolView.widthAnchor.constraint(equalToConstant: 18),
+            symbolView.heightAnchor.constraint(equalToConstant: 18)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func performAction() { actionClosure() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        updateAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        updateAppearance()
+    }
+
+    override var isEnabled: Bool {
+        didSet { updateAppearance() }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let color = hovered ? ClaudeTheme.sidebarHover : NSColor.clear
+            layer?.backgroundColor = color.cgColor
+        }
+        symbolView.contentTintColor = isEnabled ? ClaudeTheme.textSecondary
+            : ClaudeTheme.textMuted.withAlphaComponent(0.5)
+    }
+}
+
+/// 分组之间的 1px 分隔线。
+final class HairlineView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        applyColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = ClaudeTheme.separator.cgColor
+        }
+    }
+}
+
+/// Claude 设置页开关：38×22 胶囊轨道 + 白色圆钮，开启为系统蓝。
+/// 直接绘制而不是用 CALayer：滚动区域里刚显示的分组也能可靠地画出来。
+final class ClaudeSwitch: NSControl {
+    var state: NSControl.StateValue = .off {
+        didSet {
+            guard state != oldValue else { return }
+            animateKnob()
+            setAccessibilityValue(state == .on)
+        }
+    }
+
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+    private var knobFraction: CGFloat = 0
+    private var knobTimer: Timer?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel("开关")
+        knobFraction = state == .on ? 1 : 0
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 38, height: 22) }
+
+    override var isEnabled: Bool {
+        didSet { needsDisplay = true }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        window?.makeFirstResponder(self)
+        state = state == .on ? .off : .on
+        if let action = action {
+            NSApp.sendAction(action, to: target, from: self)
+        }
+    }
+
+    override var acceptsFirstResponder: Bool { isEnabled }
+
+    override func keyDown(with event: NSEvent) {
+        guard event.keyCode == 49 || event.keyCode == 36 else {
+            super.keyDown(with: event)
+            return
+        }
+        guard isEnabled else { return }
+        state = state == .on ? .off : .on
+        if let action = action {
+            NSApp.sendAction(action, to: target, from: self)
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = NSRect(x: 0, y: (bounds.height - 22) / 2, width: 38, height: 22)
+        let alpha: CGFloat = isEnabled ? 1 : 0.42
+        let on = state == .on
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let trackColor = on
+                ? (hovered ? ClaudeTheme.accentHover : ClaudeTheme.accent)
+                : (hovered ? ClaudeTheme.switchOffHover : ClaudeTheme.switchOff)
+            trackColor.withAlphaComponent(alpha).setFill()
+            NSBezierPath(roundedRect: track, xRadius: 11, yRadius: 11).fill()
+
+            let knobSize: CGFloat = 18
+            let travel = track.width - knobSize - 4
+            let knobX = track.minX + 2 + travel * knobFraction
+            let knobRect = NSRect(x: knobX, y: track.minY + 2,
+                                  width: knobSize, height: knobSize)
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.22)
+            shadow.shadowBlurRadius = 1.5
+            shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+            NSGraphicsContext.saveGraphicsState()
+            shadow.set()
+            NSColor.white.withAlphaComponent(alpha).setFill()
+            NSBezierPath(ovalIn: knobRect).fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        if window?.firstResponder === self {
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: -0.5, dy: -0.5),
+                                    xRadius: 13, yRadius: 13)
+            ClaudeTheme.accent.withAlphaComponent(0.60).setStroke()
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+    }
+
+    private func animateKnob() {
+        knobTimer?.invalidate()
+        let target: CGFloat = state == .on ? 1 : 0
+        let start = knobFraction
+        guard abs(target - start) > 0.001 else {
+            knobFraction = target
+            needsDisplay = true
+            return
+        }
+        let startTime = Date()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            let t = min(1, Date().timeIntervalSince(startTime) / 0.18)
+            // ease-out cubic：起步快、收尾稳，接近 macOS 开关的手感。
+            let eased = 1 - pow(1 - t, 3)
+            self.knobFraction = start + (target - start) * eased
+            self.needsDisplay = true
+            if t >= 1 {
+                timer.invalidate()
+                self.knobTimer = nil
+                self.knobFraction = target
+                self.needsDisplay = true
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        knobTimer = timer
+    }
+}
+
+enum ClaudeButtonStyle { case primary, secondary, soft, ghost, ghostAccent }
+
+/// Claude 设置页按钮：灰色圆角填充、白色文字；悬停与按下有轻微变化。
+final class ClaudeButton: NSButton {
+    let style: ClaudeButtonStyle
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+
+    init(title: String, style: ClaudeButtonStyle) {
+        self.style = style
+        super.init(frame: .zero)
+        self.title = title
+        isBordered = false
+        bezelStyle = .regularSquare
+        wantsLayer = true
+        focusRingType = .none
+        font = .systemFont(ofSize: 13, weight: .medium)
+        setButtonType(.momentaryPushIn)
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var intrinsicContentSize: NSSize {
+        let width = (title as NSString).size(withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 13)]).width
+        return NSSize(width: ceil(width) + 26, height: 28)
+    }
+
+    override var isEnabled: Bool {
+        didSet { needsDisplay = true }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        needsDisplay = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let pressed = cell?.isHighlighted == true
+        let alpha: CGFloat = isEnabled ? 1 : 0.40
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let radius: CGFloat = 7
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        var fill: NSColor
+        var text: NSColor
+        switch style {
+        case .primary, .secondary, .soft:
+            fill = pressed ? ClaudeTheme.buttonPressed : (hovered ? ClaudeTheme.buttonHover : ClaudeTheme.buttonFill)
+            text = ClaudeTheme.textPrimary
+        case .ghost, .ghostAccent:
+            fill = hovered || pressed ? ClaudeTheme.buttonHover : .clear
+            text = style == .ghostAccent ? ClaudeTheme.accent : ClaudeTheme.textSecondary
+        }
+
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let solidFill = fill.usingColorSpace(.sRGB) ?? fill
+            solidFill.withAlphaComponent(solidFill.alphaComponent * alpha).setFill()
+            path.fill()
+            if style != .ghost && style != .ghostAccent {
+                let solidBorder = ClaudeTheme.buttonBorder.usingColorSpace(.sRGB) ?? ClaudeTheme.buttonBorder
+                solidBorder.withAlphaComponent(alpha).setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
+            let solidText = text.usingColorSpace(.sRGB) ?? text
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font ?? NSFont.systemFont(ofSize: 13, weight: .medium),
+                .foregroundColor: solidText.withAlphaComponent(alpha),
+                .paragraphStyle: {
+                    let style = NSMutableParagraphStyle()
+                    style.alignment = .center
+                    return style
+                }(),
+            ]
+            let textSize = (title as NSString).size(withAttributes: attributes)
+            let textRect = NSRect(x: 0, y: (bounds.height - textSize.height) / 2 - 0.5,
+                                  width: bounds.width, height: textSize.height)
+            (title as NSString).draw(in: textRect, withAttributes: attributes)
+        }
+        if window?.firstResponder === self {
+            ClaudeTheme.accent.withAlphaComponent(0.55).setStroke()
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+                                    xRadius: radius + 1, yRadius: radius + 1)
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+    }
+
+    override var acceptsFirstResponder: Bool { isEnabled }
+}
+
+/// 左侧栏底部的状态胶囊：小圆点 + 文字，处理中时圆点轻微呼吸。
+final class StatusPillView: NSView {
+    private let dot = NSView()
+    private let label = NSTextField(labelWithString: "")
+    private var tint: NSColor = ClaudeTheme.textMuted
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 11
+
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = ClaudeTheme.textSecondary
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dot)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 22),
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        update(text: "检测中", tint: ClaudeTheme.accent, pulsing: true)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func update(text: String, tint: NSColor, pulsing: Bool) {
+        self.tint = tint
+        label.stringValue = text
+        label.textColor = tint
+        applyColors()
+        if pulsing {
+            startBreathing()
+        } else {
+            dot.layer?.removeAnimation(forKey: "breathe")
+            dot.layer?.opacity = 1
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = tint.withAlphaComponent(0.12).cgColor
+            dot.layer?.backgroundColor = tint.cgColor
+        }
+        needsDisplay = true
+    }
+
+    private func startBreathing() {
+        guard dot.layer?.animation(forKey: "breathe") == nil else { return }
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = [1, 0.35, 1]
+        animation.keyTimes = [0, 0.5, 1]
+        animation.duration = 1.8
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        dot.layer?.add(animation, forKey: "breathe")
+    }
+}
+
+/// 侧栏顶部的 12 光线星芒，用黏土橙填充。
+final class StarburstLogoView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            ClaudeTheme.clay.setFill()
+            let radius = min(bounds.width, bounds.height) / 2 - 0.5
+            starburstPath(center: NSPoint(x: bounds.midX, y: bounds.midY),
+                          radius: radius, rays: 12,
+                          innerWidth: 0.065, outerWidth: 0.195).fill()
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
 }
 
 // MARK: - 菜单栏图标
@@ -1444,33 +2497,55 @@ func menuBarIcon(_ state: MenuBarIconState) -> NSImage {
     return image
 }
 
-/// 圆角卡片：浅底 + 细描边，高度跟着内容走。
-final class CardView: NSView {
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layer?.cornerRadius = 10
-        layer?.borderWidth = 1
-        applyColors()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyColors()
-    }
-
-    private func applyColors() {
-        // 动态颜色要在当前外观下解析，否则切到深色模式还是浅色底。
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-            layer?.borderColor = NSColor.separatorColor.cgColor
+#if PREVIEW
+extension AppDelegate {
+    /// 预览构建用：把真实窗口渲染成 PNG，不依赖屏幕录制授权。
+    func renderPreview(to path: String, dark: Bool) {
+        NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        window.appearance = NSApp.appearance
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        window.contentView?.subviews.forEach { $0.displayIfNeeded() }
+        CATransaction.flush()
+        guard let view = window.contentView,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
         }
+        // cacheDisplay 不含滚动容器里的图层；PDF 是更接近打印的完整渲染，便于核对。
+        let pdf = view.dataWithPDF(inside: view.bounds)
+        try? pdf.write(to: URL(fileURLWithPath: path + ".pdf"))
     }
 }
 
+let previewDelegate = AppDelegate()
+let previewApp = NSApplication.shared
+previewApp.delegate = previewDelegate
+let previewBase = ProcessInfo.processInfo.environment["PREVIEW_PATH"] ?? "/tmp/claude-native-preview"
+func previewStep(_ index: Int) {
+    let sections = ["general", "features", "patch", "about"]
+    let names = ["dark", "features", "patch", "about"]
+    if index < sections.count {
+        previewDelegate.selectSection(sections[index])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            previewDelegate.renderPreview(to: previewBase + "-" + names[index] + ".png",
+                                          dark: true)
+            previewStep(index + 1)
+        }
+    } else {
+        previewDelegate.selectSection("general")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            previewDelegate.renderPreview(to: previewBase + "-light.png", dark: false)
+            previewApp.terminate(nil)
+        }
+    }
+}
+DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { previewStep(0) }
+previewApp.run()
+#else
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+#endif

@@ -4,13 +4,23 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Claude 原生助手 · 使用说明</title>
 <style>
-  body { font: 16px/1.8 -apple-system, BlinkMacSystemFont, sans-serif; max-width: 760px; margin: 56px auto; padding: 0 24px; color: #24353d; background: #f6f9f9; }
-  h1 { font-size: 30px; margin-bottom: 4px; }
-  h2 { font-size: 21px; margin-top: 34px; border-bottom: 1px solid #dbe5e5; padding-bottom: 6px; }
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.75 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; max-width: 760px; margin: 56px auto; padding: 0 28px 80px; color: #151515; background: #f9f9f7; }
+  h1 { font-family: ui-serif, Georgia, "Songti SC", serif; font-size: 34px; letter-spacing: -.5px; margin: 0 0 6px; }
+  h2 { font-size: 19px; margin-top: 38px; padding-bottom: 8px; border-bottom: 1px solid rgba(21,21,21,.10); }
   p, li { margin: 10px 0; }
-  code { font-size: 13px; overflow-wrap: anywhere; background: #e9efef; padding: 1px 5px; border-radius: 4px; }
-  .muted { color: #65787d; }
-  .tip { background: #fff; border-left: 4px solid #4d8b8b; padding: 10px 16px; border-radius: 6px; }
+  code { font-size: 13px; overflow-wrap: anywhere; background: #f0efec; padding: 1px 6px; border-radius: 5px; }
+  a { color: #b9542f; }
+  .muted { color: #8a8a8a; }
+  .tip { background: #fbf3ef; border-left: 3px solid #d97757; padding: 12px 18px; border-radius: 10px; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #f5f5f5; background: #0b0b0b; }
+    h2 { border-bottom-color: rgba(255,255,255,.12); }
+    code { background: #1f1f1e; }
+    a { color: #e08264; }
+    .muted { color: #9a9a9a; }
+    .tip { background: rgba(217,119,87,.14); }
+  }
 </style>
 <h1>Claude 原生助手</h1>
 <p class="muted">{{VERSION}} · 中文原生 Mac 应用，含菜单栏快捷入口。</p>
@@ -21,7 +31,7 @@
   <li>打开需要的官方功能开关。如果 Claude 正在运行，助手会先正常退出，再备份、校验并安装补丁；完成后自动重新打开 Claude。第一次安装会生成完整官方备份。</li>
   <li>使用 Computer Use 前，在 Claude 设置 → This computer → System 确认辅助功能和屏幕录制都显示 Granted。</li>
   <li>Claude 启动、退出或电脑唤醒后，助手会自动重新检测；也可以按 ⌘R 手动刷新。</li>
-  <li>窗口只放常用操作：Computer Use 主开关、七个原生配置开关、Code 自动整理、打开 Claude 和重新检测。更新补丁只在真的可更新时出现。</li>
+  <li>窗口采用 Claude 设置页布局：左侧搜索和分区导航（概览、原生配置、补丁与更新、系统授权、关于），右侧是开关和状态。Computer Use、七个原生配置开关和 Code 自动整理都在“原生配置”页。</li>
   <li>低频操作放在菜单栏图标里：显示主窗口、重新检测、打开 Claude、更新解锁补丁、为官方更新做准备、系统授权说明、使用说明、关于和退出。</li>
 </ol>
 
