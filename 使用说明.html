@@ -44,7 +44,7 @@
   <li><strong>官方内置浏览器</strong>：启用 Claude 官方内置浏览器，不是 Dia 或 Chrome。</li>
   <li><strong>官方定时任务</strong>：允许官方定时任务；是否执行仍由 Claude 决定。</li>
   <li><strong>Cowork 自动审批选项</strong>：显示官方自动审批选项；动作审查和权限流程保留。</li>
-  <li><strong>插件里的桌面扩展</strong>：允许插件打包的桌面扩展（.mcpb）加载；官方签名检查仍然生效。</li>
+  <li><strong>插件里的桌面扩展</strong>：允许插件打包的桌面扩展（.mcpb）加载；官方签名检查仍然生效。桌面扩展只能随 Cowork 插件加载，本地直接安装需要官方组织策略后端。</li>
   <li><strong>MCP 工具按需加载</strong>：MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。</li>
   <li><strong>WebFetch 免域名预检</strong>：跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。</li>
   <li><strong>Code 原生自动整理可用性</strong>：只解除 Code 自动整理的可用性限制；当前 CLI 版本由后端检测，用户开关保持。</li>
@@ -53,7 +53,7 @@
 
 <h2>验证新开关（可选）</h2>
 <ul>
-  <li><strong>插件里的桌面扩展</strong>：桌面扩展只能随插件安装。装好一个带 <code>.mcpb</code> 的插件后，助手会在这一行显示检测到的插件数和扩展数；本地直接安装 <code>.mcpb</code> 还需要官方组织策略后端，第三方部署没有，这是官方限制。</li>
+  <li><strong>插件里的桌面扩展</strong>：桌面扩展只能随 <strong>Cowork 插件</strong>安装。装好后助手会在这一行显示检测到的插件数和扩展数。本地直接安装 <code>.mcpb</code> 需要官方组织策略后端（第三方部署没有）；Code 插件校验只接受 <code>.json</code>，不接受 <code>.mcpb</code>。这是官方限制，不是开关失效。</li>
   <li><strong>MCP 工具按需加载</strong>：在 Code 会话里连接多个 MCP 服务器，确认工具按需出现。</li>
   <li><strong>WebFetch 免域名预检</strong>：在 Code 会话里让 Claude 抓取一个网页，确认不再报域名预检失败。</li>
 </ul>

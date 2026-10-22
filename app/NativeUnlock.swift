@@ -88,7 +88,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
         "允许官方定时任务；是否执行仍由 Claude 决定。",
         "显示 Cowork 官方自动审批选项；动作审查保留。",
-        "允许插件里打包的桌面扩展（.mcpb）加载；签名检查仍按官方策略。",
+        "允许插件里打包的桌面扩展（.mcpb）加载；第三方部署没有组织策略后端时不能直接安装 .mcpb，Code 插件也不接受。签名检查仍按官方策略。",
         "MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。",
         "跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。",
         "只解除 Code 自动整理的可用性限制；用户开关保持。"
@@ -229,13 +229,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let detail = NSTextField(labelWithString: "")
             detail.font = .systemFont(ofSize: 11)
             detail.textColor = .systemOrange
+            detail.lineBreakMode = .byTruncatingTail
             detail.isHidden = true
 
             // 只用于“装没装插件、有没有 .mcpb”这类可核对的事实，不是错误。
             let hint = NSTextField(labelWithString: "")
             hint.font = .systemFont(ofSize: 11)
             hint.textColor = .secondaryLabelColor
+            hint.lineBreakMode = .byTruncatingTail
             hint.isHidden = true
+            // 说明文字不能把整行撑宽，否则右对齐的开关会被挤到中间。
+            detail.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+            hint.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
             let control = NSSwitch()
             control.tag = index
@@ -243,6 +248,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             control.action = #selector(featureChanged(_:))
             control.setAccessibilityLabel(name + " 配置开关")
             control.isEnabled = false
+            // 开关始终贴右；说明文字变长时只压缩文字，不移动开关。
+            control.setContentHuggingPriority(.required, for: .horizontal)
+            control.setContentCompressionResistancePriority(.required, for: .horizontal)
             featureSwitches.append(control)
             featureLabels.append(detail)
             featureHints.append(hint)
@@ -252,8 +260,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             text.alignment = .leading
             text.spacing = 2
             text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            text.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
-            let row = NSStackView(views: [text, control])
+            // 弹簧视图吃掉多余宽度，保证开关始终贴右，不被说明文字推走。
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+            spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+            let row = NSStackView(views: [text, spacer, control])
             row.orientation = .horizontal
             row.alignment = .centerY
             row.spacing = 16
@@ -1200,12 +1214,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let plugins = counts["plugins"] as? Int ?? 0
         let bundles = counts["bundles"] as? Int ?? 0
         if bundles > 0 {
-            return "已安装 \(plugins) 个插件，检测到 \(bundles) 个 .mcpb 扩展。"
+            return "\(plugins) 个插件 · \(bundles) 个 .mcpb 扩展"
         }
         if plugins > 0 {
-            return "已安装 \(plugins) 个插件，未发现 .mcpb 扩展。"
+            return "\(plugins) 个插件 · 没有 .mcpb 扩展"
         }
-        return "还没有安装插件；装一个带 .mcpb 的插件后才会加载扩展。"
+        return "未检测到 Cowork 插件"
     }
 
     func applyFeatures(_ result: [String: Any]) {

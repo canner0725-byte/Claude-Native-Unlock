@@ -427,8 +427,8 @@ def report(application=None):
         {'title': '联网搜索', 'message': '沿用官方 Web Search；能否使用取决于你的 API 网关。'},
         {'title': '语音输入', 'message': 'Dictation 要求网关支持交互式 OIDC 并提供 user/dictation 端点；'
                                        '只开配置开关无法补齐。'},
-        {'title': '桌面扩展', 'message': '桌面扩展只能随插件加载；本地 .mcpb 直接安装还需要官方'
-                                       '组织策略后端，第三方部署没有。'},
+        {'title': '桌面扩展', 'message': '桌面扩展只能随 Cowork 插件加载；本地 .mcpb 直接安装还需要官方'
+                                       '组织策略后端，第三方部署没有；Code 插件不接受 .mcpb。'},
     ]
     return result
 
