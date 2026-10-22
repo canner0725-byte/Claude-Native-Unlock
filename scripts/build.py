@@ -11,8 +11,8 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.3.24'
-BUILD_NUMBER = '37'
+VERSION = '0.3.25'
+BUILD_NUMBER = '38'
 APP_NAME = 'Claude 原生助手'
 # 文件名保持 ASCII：非 ASCII 的发布文件名会被 GitHub 换成“.”，下载链接很难看。
 ARCHIVE_NAME = 'Claude-Native-Assistant'
@@ -70,8 +70,10 @@ def build():
     run('/usr/bin/swiftc', ROOT/'app/GenerateIcon.swift', '-o', work/'GenerateIcon')
     run(work/'GenerateIcon', work/'AppIcon.iconset')
     run('/usr/bin/iconutil', '-c', 'icns', work/'AppIcon.iconset', '-o', resources/'AppIcon.icns')
-    for name in ['使用说明.html', 'THIRD_PARTY_NOTICES.md']:
-        shutil.copy2(ROOT/name, resources/name)
+    # 使用说明里的版本号由构建时替换，避免每次发版都要手动改、改漏了还随包发出去。
+    guide = (ROOT/'使用说明.html').read_text()
+    (resources/'使用说明.html').write_text(guide.replace('{{VERSION}}', VERSION))
+    shutil.copy2(ROOT/'THIRD_PARTY_NOTICES.md', resources/'THIRD_PARTY_NOTICES.md')
     shutil.copy2(ROOT/'LICENSE', resources/'LICENSE')
     # Keep the redistributable runtime's license with the product.
     licenses = resources/'ThirdPartyLicenses'

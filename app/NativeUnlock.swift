@@ -58,6 +58,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 刚开启/更新补丁后，短时间内在窗口里提示一次系统权限；过期自动消失。
     var enabledHintUntil = Date.distantPast
     var justEnabledHint: Bool { Date() < enabledHintUntil }
+    /// 刚改过配置开关：Claude 重启后的第一份自检出来之前，给一句“重启后更新”。
+    var featureHintUntil = Date.distantPast
+    var justChangedFeature: Bool { Date() < featureHintUntil }
     var permissionReGrantLikely = false
 
     // 菜单栏。
@@ -442,6 +445,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let index = sender.tag
         let enabling = sender.state == .on
         sender.state = featureEnabled[index] ? .on : .off
+        featureHintUntil = Date().addingTimeInterval(120)
         let name = featureTitles[index]
         withClaudeQuitIfNeeded((enabling ? "开启「" : "关闭「") + name + "」", relaunch: true) {
             if self.featureIDs[index] == "code-auto-dream" {
@@ -1186,6 +1190,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let health = health, (health["healthy"] as? Bool) == false {
             // Claude 自己的配置自检不健康；开关已经写入，但不能说“没问题”。
             setSummary(result["message"] as? String ?? "Claude 的配置自检未通过；请检查连接或配置。")
+        } else if let health = health, (health["stale"] as? Bool) == true, justChangedFeature {
+            setSummary(result["message"] as? String ?? "开关已写入；Claude 下次启动后配置自检会更新。")
         } else if !recoveryRequired && officialSupported && (!enabled || backupVerified) {
             // 正常路径不再重复主状态，只在需要时提示一次权限。
             setSummary(justEnabledHint ? "如 Computer Use 无响应，请在系统设置里给 Claude 开启辅助功能与屏幕录制。"

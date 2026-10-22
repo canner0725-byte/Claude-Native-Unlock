@@ -183,7 +183,15 @@ def config_health(path=None):
     if not matches:
         return None
     at, state = matches[-1]
-    return {'state': state, 'at': at, 'healthy': state == 'healthy'}
+    health = {'state': state, 'at': at, 'healthy': state == 'healthy'}
+    # 这次自检早于最近一次开关修改时，不能拿旧结果当新配置的证明。
+    try:
+        newest = max((p.stat().st_mtime for p in STATE.glob('*.json') if p.is_file()), default=None)
+        checked = time.mktime(time.strptime(at, '%Y-%m-%d %H:%M:%S'))
+        health['stale'] = bool(newest is not None and checked < newest - 1)
+    except (OSError, ValueError):
+        health['stale'] = False
+    return health
 
 
 def report(application=None):
@@ -222,6 +230,8 @@ def report(application=None):
             if not health['healthy']:
                 result['message'] = ('Claude 的配置自检结果是 ' + health['state'] +
                                      '；开关仍已写入，请按提示检查连接或配置。')
+            elif health.get('stale'):
+                result['message'] = '开关已写入；Claude 下次启动后配置自检会更新。'
         if not application['supported'] or application.get('recoveryRequired'):
             result['configWritable'] = False
             result['message'] = application['message']

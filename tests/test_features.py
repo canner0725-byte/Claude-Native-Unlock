@@ -334,6 +334,31 @@ class ConfigHealthLog(unittest.TestCase):
         self.assertFalse(result['configHealth']['healthy'])
         self.assertIn('auth_failed', result['message'])
 
+    def test_health_from_before_the_last_change_is_marked_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            log = root / 'main.log'
+            log.write_text(
+                "2020-01-01 00:00:00 [info] [custom-3p] ConfigHealth recomputed "
+                "{ state: 'healthy', provider: 'gateway' }\n")
+            state = root / 'state'
+            state.mkdir()
+            (state / 'record.json').write_text('{}')  # mtime 是现在
+            with patch.object(features, 'STATE', state):
+                health = features.config_health(log)
+        self.assertTrue(health['stale'])
+        self.assertTrue(health['healthy'])
+
+    def test_stale_health_message_explains_restart(self):
+        application = {'version': '3.1623.0', 'supported': True, 'running': True}
+        with patch.object(features.official, 'status', return_value=application), \
+             patch.object(features.official, 'config_keys', return_value=None), \
+             patch.object(features, 'config_health',
+                          return_value={'state': 'healthy', 'at': '2026-10-22 00:15:15',
+                                        'healthy': True, 'stale': True}):
+            result = features.report()
+        self.assertIn('下次启动', result['message'])
+
 
 class InterfaceParity(unittest.TestCase):
     """界面里的开关列表必须和后端的 FEATURES 对得上，避免一边加了一边没加。"""
