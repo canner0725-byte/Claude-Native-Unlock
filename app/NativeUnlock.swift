@@ -1152,6 +1152,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setFeatureDetail(index, text: result["error"] as? String ?? "")
     }
 
+    /// 刚改过开关时，用正在运行的 Code 会话核对桌面端是否真的把设置传了下去。
+    /// 只在“还没带上”时给一行提示；确认带上后保持安静。
+    func codeSessionDetail(id: String, sessions: [String: Any]) -> String {
+        let count = sessions["count"] as? Int ?? 0
+        if id == "tool-search" {
+            if count == 0 { return "重启后新开的 Code 会话会带上这个设置。" }
+            if sessions["toolSearch"] as? Bool != true {
+                return "运行中的 Code 会话早于这次修改；新会话才会带上。"
+            }
+        } else if id == "webfetch-preflight" {
+            if count == 0 { return "重启后新开的 Code 会话会带上这个设置。" }
+            if sessions["preflight"] as? Bool != true {
+                return "运行中的 Code 会话早于这次修改；新会话才会带上。"
+            }
+        }
+        return ""
+    }
+
     /// 每行的补充说明只在出错时出现；正常状态保持一行一个开关。
     func setFeatureDetail(_ index: Int, text: String) {
         let label = featureLabels[index]
@@ -1172,6 +1190,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         featureConfigWritable = result["configWritable"] as? Bool ?? false
         officialRunning = result["running"] as? Bool ?? officialRunning
         let features = result["features"] as? [[String: Any]] ?? []
+        let sessions = result["codeSessions"] as? [String: Any]
         for (index, id) in featureIDs.enumerated() {
             guard let feature = features.first(where: { $0["id"] as? String == id }) else { continue }
             let on = feature["enabled"] as? Bool ?? false
@@ -1180,8 +1199,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             featureAvailable[index] = available
             featureRestorable[index] = feature["canRestore"] as? Bool ?? false
             featureSwitches[index].state = on ? .on : .off
-            setFeatureDetail(index, text: available ? ""
-                             : (feature["message"] as? String ?? "此版本没有这个设置"))
+            var detail = available ? "" : (feature["message"] as? String ?? "此版本没有这个设置")
+            if detail.isEmpty, on, justChangedFeature, let sessions = sessions {
+                detail = codeSessionDetail(id: id, sessions: sessions)
+            }
+            setFeatureDetail(index, text: detail)
         }
 
         let health = result["configHealth"] as? [String: Any]

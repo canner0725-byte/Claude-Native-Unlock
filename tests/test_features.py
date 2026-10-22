@@ -360,6 +360,43 @@ class ConfigHealthLog(unittest.TestCase):
         self.assertIn('下次启动', result['message'])
 
 
+class CodeSessionFlags(unittest.TestCase):
+    """只读运行中的 Code CLI，核对桌面端是否真的把设置传了下去。"""
+
+    def run_flags(self, listing, env=''):
+        from types import SimpleNamespace
+        def fake(*args):
+            if args[:2] == ('ps', '-axo'):
+                return SimpleNamespace(stdout=listing.encode())
+            if args[:2] == ('ps', 'eww'):
+                return SimpleNamespace(stdout=env.encode())
+            raise AssertionError(args)
+        with patch.object(features.official.core, 'run', side_effect=fake):
+            return features.code_session_flags()
+
+    def test_detects_settings_and_tool_search_env(self):
+        line = ('111 /Users/x/Library/Application Support/Claude-3p/claude-code/2.1.304/abc/'
+                'claude.app/Contents/MacOS/claude --output-format stream-json '
+                '--settings {skipWebFetchPreflight:true} --verbose\n')
+        flags = self.run_flags(line, 'claude ENABLE_TOOL_SEARCH=force')
+        self.assertEqual(flags['count'], 1)
+        self.assertTrue(flags['preflight'])
+        self.assertTrue(flags['toolSearch'])
+
+    def test_reports_false_when_switch_not_passed(self):
+        line = ('111 /Users/x/Library/Application Support/Claude-3p/claude-code/2.1.304/abc/'
+                'claude.app/Contents/MacOS/claude --output-format stream-json '
+                '--settings {deniedMcpServers:[]} --verbose\n')
+        flags = self.run_flags(line, 'claude CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1')
+        self.assertEqual(flags['count'], 1)
+        self.assertFalse(flags['preflight'])
+        self.assertFalse(flags['toolSearch'])
+
+    def test_ignores_other_processes(self):
+        flags = self.run_flags('222 /usr/bin/something --output-format stream-json\n')
+        self.assertEqual(flags['count'], 0)
+
+
 class InterfaceParity(unittest.TestCase):
     """界面里的开关列表必须和后端的 FEATURES 对得上，避免一边加了一边没加。"""
 
