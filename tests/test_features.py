@@ -297,6 +297,44 @@ class ConfigKeyAvailability(unittest.TestCase):
         self.assertEqual(item['message'], '此版本没有这个设置')
 
 
+class ConfigHealthLog(unittest.TestCase):
+    """只读 Claude 自己的日志判断配置自检结果，读不到就不猜。"""
+
+    def test_reads_the_last_health_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / 'main.log'
+            log.write_text(
+                "2026-10-21 22:22:21 [info] [custom-3p] ConfigHealth recomputed "
+                "{ state: 'healthy', provider: 'gateway' }\n"
+                "2026-10-22 00:15:15 [info] [custom-3p] ConfigHealth recomputed "
+                "{ state: 'provider_error', provider: 'gateway' }\n")
+            health = features.config_health(log)
+        self.assertEqual(health['state'], 'provider_error')
+        self.assertFalse(health['healthy'])
+        self.assertEqual(health['at'], '2026-10-22 00:15:15')
+
+    def test_missing_log_returns_none(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(features.config_health(pathlib.Path(directory) / 'none.log'))
+
+    def test_log_without_health_line_returns_none(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / 'main.log'
+            log.write_text('2026-10-22 00:15:15 [info] Starting app\n')
+            self.assertIsNone(features.config_health(log))
+
+    def test_unhealthy_health_is_surfaced_in_report(self):
+        application = {'version': '3.1623.0', 'supported': True, 'running': True}
+        with patch.object(features.official, 'status', return_value=application), \
+             patch.object(features.official, 'config_keys', return_value=None), \
+             patch.object(features, 'config_health',
+                          return_value={'state': 'auth_failed', 'at': '2026-10-22 00:15:15',
+                                        'healthy': False}):
+            result = features.report()
+        self.assertFalse(result['configHealth']['healthy'])
+        self.assertIn('auth_failed', result['message'])
+
+
 class InterfaceParity(unittest.TestCase):
     """界面里的开关列表必须和后端的 FEATURES 对得上，避免一边加了一边没加。"""
 

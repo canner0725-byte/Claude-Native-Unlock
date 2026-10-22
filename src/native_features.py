@@ -157,6 +157,35 @@ def matches(config, key, present, value):
     return (key in config) == present and (not present or type(config[key]) is type(value) and config[key] == value)
 
 
+LOG_TAIL_BYTES = 262144
+
+
+def config_health(path=None):
+    """只读 Claude 自己日志里的 3P 配置自检结果。
+
+    Claude 启动或配置变化后会写一行 `[custom-3p] ConfigHealth recomputed
+    { state: '…' }`。这里只读日志尾部，用来告诉用户“Claude 是否接受了
+    这份配置”；读不到就返回 None，不猜测。
+    """
+    path = pathlib.Path(path) if path is not None else (
+        pathlib.Path.home() / 'Library/Logs/Claude-3p/main.log')
+    try:
+        with path.open('rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - LOG_TAIL_BYTES))
+            text = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return None
+    matches = re.findall(
+        r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[info\] \[custom-3p\] ConfigHealth recomputed \{ state: '([a-z_]+)'",
+        text)
+    if not matches:
+        return None
+    at, state = matches[-1]
+    return {'state': state, 'at': at, 'healthy': state == 'healthy'}
+
+
 def report(application=None):
     """返回 UI 需要的配置状态；不包含密钥或完整配置内容。
 
@@ -187,6 +216,12 @@ def report(application=None):
                             else '已启用' if enabled else '未启用'),
                 'managedByUnlocker': owned})
         result['message'] = '官方配置可用；开关只改配置，实际功能以 Claude 为准。'
+        health = config_health()
+        if health is not None:
+            result['configHealth'] = health
+            if not health['healthy']:
+                result['message'] = ('Claude 的配置自检结果是 ' + health['state'] +
+                                     '；开关仍已写入，请按提示检查连接或配置。')
         if not application['supported'] or application.get('recoveryRequired'):
             result['configWritable'] = False
             result['message'] = application['message']

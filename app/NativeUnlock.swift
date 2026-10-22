@@ -1180,8 +1180,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                              : (feature["message"] as? String ?? "此版本没有这个设置"))
         }
 
+        let health = result["configHealth"] as? [String: Any]
         if !featureConfigWritable {
             setSummary(result["message"] as? String ?? "配置不可修改。")
+        } else if let health = health, (health["healthy"] as? Bool) == false {
+            // Claude 自己的配置自检不健康；开关已经写入，但不能说“没问题”。
+            setSummary(result["message"] as? String ?? "Claude 的配置自检未通过；请检查连接或配置。")
         } else if !recoveryRequired && officialSupported && (!enabled || backupVerified) {
             // 正常路径不再重复主状态，只在需要时提示一次权限。
             setSummary(justEnabledHint ? "如 Computer Use 无响应，请在系统设置里给 Claude 开启辅助功能与屏幕录制。"
