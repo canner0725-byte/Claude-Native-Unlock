@@ -289,7 +289,8 @@ class ConfigKeyAvailability(unittest.TestCase):
         application = {'version': '3.1623.0', 'supported': True, 'running': False}
         with patch.object(features.official, 'status', return_value=application), \
              patch.object(features.official, 'config_keys',
-                          return_value={'builtinBrowserEnabled'}):
+                          return_value={'builtinBrowserEnabled'}), \
+             patch.object(features, 'plugin_extensions', return_value=None):
             result = features.report()
         item = next(f for f in result['features'] if f['id'] == 'tool-search')
         self.assertFalse(item['available'])
@@ -327,6 +328,7 @@ class ConfigHealthLog(unittest.TestCase):
         application = {'version': '3.1623.0', 'supported': True, 'running': True}
         with patch.object(features.official, 'status', return_value=application), \
              patch.object(features.official, 'config_keys', return_value=None), \
+             patch.object(features, 'plugin_extensions', return_value=None), \
              patch.object(features, 'config_health',
                           return_value={'state': 'auth_failed', 'at': '2026-10-22 00:15:15',
                                         'healthy': False}):
@@ -353,6 +355,7 @@ class ConfigHealthLog(unittest.TestCase):
         application = {'version': '3.1623.0', 'supported': True, 'running': True}
         with patch.object(features.official, 'status', return_value=application), \
              patch.object(features.official, 'config_keys', return_value=None), \
+             patch.object(features, 'plugin_extensions', return_value=None), \
              patch.object(features, 'config_health',
                           return_value={'state': 'healthy', 'at': '2026-10-22 00:15:15',
                                         'healthy': True, 'stale': True}):
@@ -408,6 +411,69 @@ class CodeSessionFlags(unittest.TestCase):
         self.assertEqual(flags['count'], 0)
 
 
+class PluginExtensionCounts(unittest.TestCase):
+    """桌面扩展只能随插件安装；只读计数，用来判断这一项还有没有东西可加载。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temp.name).resolve()
+        self.plugins = self.base / 'account' / 'org' / 'cowork_plugins'
+        self.plugins.mkdir(parents=True)
+        self.registry = self.plugins / 'installed_plugins.json'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_registry(self, paths):
+        self.registry.write_text(json.dumps({'version': 2, 'plugins': {
+            'plugin%d@local' % index: [{'installPath': str(path), 'scope': 'user'}]
+            for index, path in enumerate(paths)}}))
+
+    def test_known_layout_without_registry_counts_zero(self):
+        self.assertEqual(features.plugin_extensions(self.base),
+                         {'plugins': 0, 'bundles': 0, 'complete': True})
+
+    def test_unknown_layout_is_not_guessed(self):
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertIsNone(features.plugin_extensions(pathlib.Path(empty)))
+
+    def test_counts_bundled_archives_and_unpacked_extensions(self):
+        plugin = self.plugins / 'local-desktop-app-uploads' / 'demo'
+        (plugin / 'extension').mkdir(parents=True)
+        (plugin / 'extension' / 'manifest.json').write_text(
+            json.dumps({'manifest_version': '0.4', 'server': {'type': 'node'}}))
+        (plugin / 'bundled.mcpb').write_bytes(b'PK\3\4')
+        self.write_registry([plugin])
+        self.assertEqual(features.plugin_extensions(self.base),
+                         {'plugins': 1, 'bundles': 2, 'complete': True})
+
+    def test_non_extension_manifest_is_not_counted(self):
+        plugin = self.plugins / 'plugin'
+        (plugin / '.claude-plugin').mkdir(parents=True)
+        (plugin / '.claude-plugin' / 'plugin.json').write_text('{"name": "demo"}')
+        self.write_registry([plugin])
+        self.assertEqual(features.plugin_extensions(self.base),
+                         {'plugins': 1, 'bundles': 0, 'complete': True})
+
+    def test_symlinked_or_outside_install_paths_are_skipped(self):
+        real = self.plugins / 'real'
+        real.mkdir()
+        link = self.plugins / 'link'
+        link.symlink_to(real)
+        outside = self.base.parent / ('outside-plugin-%d' % os.getpid())
+        outside.mkdir(exist_ok=True)
+        try:
+            self.write_registry([link, outside])
+            self.assertEqual(features.plugin_extensions(self.base),
+                             {'plugins': 0, 'bundles': 0, 'complete': True})
+        finally:
+            outside.rmdir()
+
+    def test_malformed_registry_is_not_guessed(self):
+        self.registry.write_text('{not json')
+        self.assertIsNone(features.plugin_extensions(self.base))
+
+
 class InterfaceParity(unittest.TestCase):
     """界面里的开关列表必须和后端的 FEATURES 对得上，避免一边加了一边没加。"""
 
@@ -426,6 +492,14 @@ class InterfaceParity(unittest.TestCase):
         self.assertEqual(len(re.findall(r'"', titles)) // 2, len(self.ids))
         descriptions = re.search(r'let featureDescriptions = \[(.*?)\]\n', self.source, re.S).group(1)
         self.assertEqual(len(re.findall(r'^\s*"', descriptions, re.M)), len(self.ids))
+
+    def test_detail_visibility_guard_is_not_inverted(self):
+        """曾经写成 `isHidden == !text.isEmpty`，结果提示永远不显示。"""
+        for name in ['setFeatureDetail', 'setFeatureHint']:
+            body = re.search(rf'func {name}\(.*?\n    \}}', self.source, re.S).group(0)
+            self.assertIn('label.isHidden == text.isEmpty', body)
+            self.assertNotIn('!text.isEmpty', body)
+        self.assertIn('featureSummary.isHidden != text.isEmpty', self.source)
 
     def test_ui_state_arrays_cover_every_row(self):
         for name in ['featureEnabled', 'featureRestorable']:

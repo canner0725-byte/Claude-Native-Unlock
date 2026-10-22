@@ -97,6 +97,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
     var featureSwitches: [NSSwitch] = []
     var featureLabels: [NSTextField] = []
+    var featureHints: [NSTextField] = []
     var featureRows: [NSView] = []
     var featureEnabled: [Bool] = Array(repeating: false, count: 8)
     /// 当前 Claude 版本是否还有这个配置键；没有就禁用而不是装作能点。
@@ -230,6 +231,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             detail.textColor = .systemOrange
             detail.isHidden = true
 
+            // 只用于“装没装插件、有没有 .mcpb”这类可核对的事实，不是错误。
+            let hint = NSTextField(labelWithString: "")
+            hint.font = .systemFont(ofSize: 11)
+            hint.textColor = .secondaryLabelColor
+            hint.isHidden = true
+
             let control = NSSwitch()
             control.tag = index
             control.target = self
@@ -238,8 +245,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             control.isEnabled = false
             featureSwitches.append(control)
             featureLabels.append(detail)
+            featureHints.append(hint)
 
-            let text = NSStackView(views: [label, detail])
+            let text = NSStackView(views: [label, detail, hint])
             text.orientation = .vertical
             text.alignment = .leading
             text.spacing = 2
@@ -1174,14 +1182,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setFeatureDetail(_ index: Int, text: String) {
         let label = featureLabels[index]
         label.stringValue = text
-        if label.isHidden == !text.isEmpty { return }
+        // 当前可见状态已经和文字是否为空一致时不用再动。
+        if label.isHidden == text.isEmpty { return }
         animate { label.animator().isHidden = text.isEmpty }
+    }
+
+    func setFeatureHint(_ index: Int, text: String) {
+        let label = featureHints[index]
+        label.stringValue = text
+        if label.isHidden == text.isEmpty { return }
+        animate { label.animator().isHidden = text.isEmpty }
+    }
+
+    /// 桌面扩展只能随插件安装；数出插件和 .mcpb 数量，比“开关已打开”更能说明现状。
+    func desktopExtensionHint(_ result: [String: Any]) -> String {
+        guard let counts = result["desktopExtensions"] as? [String: Any] else { return "" }
+        let plugins = counts["plugins"] as? Int ?? 0
+        let bundles = counts["bundles"] as? Int ?? 0
+        if bundles > 0 {
+            return "已安装 \(plugins) 个插件，检测到 \(bundles) 个 .mcpb 扩展。"
+        }
+        if plugins > 0 {
+            return "已安装 \(plugins) 个插件，未发现 .mcpb 扩展。"
+        }
+        return "还没有安装插件；装一个带 .mcpb 的插件后才会加载扩展。"
     }
 
     func applyFeatures(_ result: [String: Any]) {
         statusLoaded = true
         if let error = result["error"] as? String {
             featureConfigWritable = false
+            if let index = featureIDs.firstIndex(of: "desktop-extensions") {
+                setFeatureHint(index, text: "")
+            }
             setSummary(error + " 请重新检测。")
             if lastError == nil { setStatus(error, color: .systemOrange) }
             return
@@ -1206,6 +1239,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setFeatureDetail(index, text: detail)
         }
 
+        if let index = featureIDs.firstIndex(of: "desktop-extensions") {
+            let hint = featureEnabled[index] && featureAvailable[index]
+                ? desktopExtensionHint(result) : ""
+            setFeatureHint(index, text: hint)
+            if !hint.isEmpty {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }
+            }
+        }
+
         let health = result["configHealth"] as? [String: Any]
         if !featureConfigWritable {
             setSummary(result["message"] as? String ?? "配置不可修改。")
@@ -1224,7 +1266,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setSummary(_ text: String) {
-        guard featureSummary.stringValue != text || featureSummary.isHidden == !text.isEmpty else { return }
+        guard featureSummary.stringValue != text || featureSummary.isHidden != text.isEmpty else { return }
         featureSummary.stringValue = text
         animate { self.featureSummary.animator().isHidden = text.isEmpty }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { self.resizeToFit() }

@@ -214,6 +214,122 @@ def code_session_flags():
             'toolSearch': any(item['toolSearch'] for item in sessions)}
 
 
+PLUGIN_SCAN_LIMIT = 4000
+
+
+def _bundle_count(root, budget):
+    """数一个插件目录里的 .mcpb/.dxt 文件和解包后的扩展清单。
+
+    只读、跳过符号链接和官方自己的 `.mcpb-cache`；`budget` 是总扫描上限，
+    防止插件目录很大时拖慢状态检测。返回 (扩展数, 剩余预算)。
+    """
+    count = 0
+    stack = [(root, 0)]
+    while stack and budget > 0:
+        directory, depth = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            budget -= 1
+            if budget <= 0:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name == '.mcpb-cache' or depth >= 3:
+                        continue
+                    manifest = pathlib.Path(entry.path) / 'manifest.json'
+                    if manifest.is_file() and not manifest.is_symlink():
+                        try:
+                            if manifest.stat().st_size <= 262144:
+                                info = json.loads(safe_read(manifest))
+                                if isinstance(info, dict) and (
+                                        'dxt_version' in info or 'manifest_version' in info):
+                                    count += 1
+                                    continue
+                        except (OSError, ValueError):
+                            pass
+                    stack.append((pathlib.Path(entry.path), depth + 1))
+                elif entry.name.lower().endswith(('.mcpb', '.dxt')):
+                    count += 1
+            except OSError:
+                continue
+    return count, budget
+
+
+def plugin_extensions(base=None):
+    """只读统计官方插件里打包的桌面扩展（.mcpb）。
+
+    桌面扩展只能随插件安装；这里读官方 `installed_plugins.json` 和插件
+    目录，返回插件数量与检测到的扩展数量。只返回计数，不返回插件名、
+    路径或内容；读不到返回 None，不猜测。
+    """
+    base = pathlib.Path(base) if base is not None else (
+        DATA / 'local-agent-mode-sessions')
+    try:
+        base = base.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    registries = []
+    layout = False
+    try:
+        accounts = [path for path in base.iterdir() if path.is_dir() and not path.is_symlink()]
+    except OSError:
+        return None
+    for account in accounts:
+        try:
+            orgs = [path for path in account.iterdir() if path.is_dir() and not path.is_symlink()]
+        except OSError:
+            continue
+        layout = layout or bool(orgs)
+        for org in orgs:
+            registry = org / 'cowork_plugins' / 'installed_plugins.json'
+            if registry.is_file() and not registry.is_symlink():
+                registries.append(registry)
+    if not registries:
+        # 目录结构对得上、但没有安装记录：确实是 0 个插件，不是“读不到”。
+        return {'plugins': 0, 'bundles': 0, 'complete': True} if layout else None
+    plugins = bundles = 0
+    budget = PLUGIN_SCAN_LIMIT
+    read = False
+    for registry in registries:
+        try:
+            data = json.loads(safe_read(registry))
+        except (OSError, ValueError):
+            continue
+        read = True
+        entries = data.get('plugins') if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            continue
+        for value in entries.values():
+            for record in value if isinstance(value, list) else [value]:
+                if not isinstance(record, dict):
+                    continue
+                install = record.get('installPath')
+                if not isinstance(install, str):
+                    continue
+                path = pathlib.Path(install)
+                if not path.is_absolute() or path.is_symlink():
+                    continue
+                try:
+                    resolved = path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+                if base != resolved and base not in resolved.parents:
+                    continue
+                if not resolved.is_dir():
+                    continue
+                plugins += 1
+                found, budget = _bundle_count(resolved, budget)
+                bundles += found
+    if not read:
+        return None
+    return {'plugins': plugins, 'bundles': bundles, 'complete': budget > 0}
+
+
 def config_health(path=None):
     """只读 Claude 自己日志里的 3P 配置自检结果。
 
@@ -277,6 +393,13 @@ def report(application=None):
                 'message': ('此版本没有这个设置' if not available
                             else '已启用' if enabled else '未启用'),
                 'managedByUnlocker': owned})
+        # 桌面扩展只能随插件安装；给出计数，让“这一项到底有没有东西可加载”可判断。
+        try:
+            desktop_extensions = plugin_extensions()
+        except Exception:
+            desktop_extensions = None
+        if desktop_extensions is not None:
+            result['desktopExtensions'] = desktop_extensions
         result['message'] = '官方配置可用；开关只改配置，实际功能以 Claude 为准。'
         sessions = code_session_flags()
         if sessions is not None:
@@ -302,6 +425,10 @@ def report(application=None):
         {'title': 'Claude Design', 'message': '需要官方 Design 授权；第三方 API 不能替代。'},
         {'title': 'Claude Security', 'message': '需要官方组织服务与 GitHub 连接。'},
         {'title': '联网搜索', 'message': '沿用官方 Web Search；能否使用取决于你的 API 网关。'},
+        {'title': '语音输入', 'message': 'Dictation 要求网关支持交互式 OIDC 并提供 user/dictation 端点；'
+                                       '只开配置开关无法补齐。'},
+        {'title': '桌面扩展', 'message': '桌面扩展只能随插件加载；本地 .mcpb 直接安装还需要官方'
+                                       '组织策略后端，第三方部署没有。'},
     ]
     return result
 
