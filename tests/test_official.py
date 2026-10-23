@@ -42,9 +42,17 @@ class OfficialSafety(unittest.TestCase):
 
     def test_prompt_suggestion_setting_flag_is_added_once(self):
         for adapter in [official.core.ADAPTER_37337, official.core.ADAPTER_42304,
-                        official.core.ADAPTER_42304_ARM64, official.core.ADAPTER_42304_2]:
+                        official.core.ADAPTER_42304_ARM64, official.core.ADAPTER_42304_2,
+                        official.core.ADAPTER_31623]:
             text = official.core.main_availability(adapter)
             self.assertEqual(text.count('2120747855:{rule:"forced",value:!0}'), 1)
+
+    def test_31623_restores_status_and_worktree_gates(self):
+        text = official.core.web_availability(official.core.ADAPTER_31623)
+        self.assertEqual(text.count('3858164079:{rule:"always",value:!0}'), 1)
+        self.assertEqual(text.count('1235690166:{rule:"always",value:!0}'), 1)
+        self.assertNotIn('3264789062', text)
+        self.assertNotIn('3335190042', text)
 
     def test_42304_2_is_a_single_verified_build(self):
         adapter = official.core.ADAPTER_42304_2

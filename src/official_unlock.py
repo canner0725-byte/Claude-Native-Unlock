@@ -34,7 +34,9 @@ ASAR = 'Contents/Resources/app.asar'
 # 这样以后新增功能不会被旧逻辑误判为“已经是最新”。
 # revision 11：补丁改用固定的本地签名身份（见 native_unlock 的说明）。
 # revision 12：适配 Desktop 3.1623.0，并按表内实际内容决定追加哪些开关。
-PATCH_REVISION = 12
+# revision 13：3.1623.0 补回状态分组（3858164079）与每文件夹工作树（1235690166）
+# 的渲染进程可用性默认值；只改可用性，不改官方分桶/工作树行为。
+PATCH_REVISION = 13
 
 # 只读诊断会读取这些固定文件；不会读取配置、密钥或会话。
 DIAGNOSTIC_SOURCE_FILES = [

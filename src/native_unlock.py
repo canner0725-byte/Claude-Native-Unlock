@@ -179,7 +179,9 @@ ADAPTER_42304_2 = {
 # 与 2.42304.2 的差异都在表里，所以适配器只追加真正还缺的开关：
 # - 2371478310 / 857846362 官方已自行强制，不再追加（重复键会被后出现的官方值覆盖）；
 # - 3264789062 改成 rule:"follows"，是官方有意跟随“会话是否跑在本机”，不覆盖；
-# - 1235690166 / 3335190042 / 3858164079 已从整个包里消失，不再追加；
+# - 3858164079（状态分组）/ 1235690166（每文件夹工作树）的数值默认项已从 Aen 里
+#   消失，但渲染进程仍按名字查这两个门；继续追加，只恢复可用性默认值，不改行为；
+# - 3335190042 是无关的面板实验，不追加；
 # - 2120747855（提示建议设置项）仍然缺失，继续强制。
 ADAPTER_31623 = {
  'version': '3.1623.0',
@@ -188,7 +190,7 @@ ADAPTER_31623 = {
  'featureAnchor': 'var ken={',
  'mainAvailability': '2120747855:{rule:"forced",value:!0},',
  'webFeatureAnchor': 'Aen={',
- 'webAvailability': '',
+ 'webAvailability': '3858164079:{rule:"always",value:!0},1235690166:{rule:"always",value:!0},',
  'files': {
   '.vite/build/index.pre.js': '3061f02edf85b68dc862372a93d68986f83ee0a39e60859eb44f8a7f12ada8a2',
   '.vite/build/index.chunk-BLvpT1n4.js': 'b842b02003a350a14dd76bf6d56a8fda75255fb76576a2a7ac7407ad3c057315',

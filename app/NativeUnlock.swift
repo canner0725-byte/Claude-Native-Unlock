@@ -192,6 +192,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let root = FocusRootView()
+        root.wantsLayer = true
         window.contentView = root
         let sidebar = buildSidebar()
         let pane = buildContentPane()
@@ -242,6 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stack.alignment = .leading
         stack.distribution = .fill
         stack.spacing = 0
+        stack.wantsLayer = true
         stack.edgeInsets = NSEdgeInsets(top: 50, left: 14, bottom: 16, right: 14)
         stack.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(stack)
@@ -1851,39 +1853,39 @@ enum ClaudeTheme {
     static let claySoft = dynamic(rgb(0xFBF3EF), rgb(0xD97757, alpha: 0.18))
 }
 
-/// 左侧栏底色；右侧一条 1px 分隔线。
+/// 左侧栏底色：图层化并用 updateLayer 上色，外观切换时由 AppKit 自动重画。
 final class SidebarBackgroundView: NSView {
-    override var isOpaque: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
 
-    override func draw(_ dirtyRect: NSRect) {
-        ClaudeTheme.sidebar.setFill()
-        dirtyRect.fill()
-        ClaudeTheme.border.setStroke()
-        let line = NSBezierPath()
-        line.move(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.minY))
-        line.line(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.maxY))
-        line.lineWidth = 1
-        line.stroke()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
     }
 
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = ClaudeTheme.sidebar.cgColor
+        }
     }
 }
 
-/// 右侧面板底色。
+/// 右侧面板底色：同样走 updateLayer。
 final class ContentBackgroundView: NSView {
-    override var isOpaque: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
 
-    override func draw(_ dirtyRect: NSRect) {
-        ClaudeTheme.pane.setFill()
-        dirtyRect.fill()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
     }
 
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = ClaudeTheme.pane.cgColor
+        }
     }
 }
 
@@ -2055,6 +2057,8 @@ final class SidebarRowView: NSView {
     }
 
     private func updateAppearance() {
+        // 动态颜色必须在外观上下文里解析，否则选中行可能取到另一种外观的取值，
+        // 深色底上出现近黑文字、看起来像“灰掉了”。
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let background: NSColor
             if isSelected {
@@ -2065,10 +2069,10 @@ final class SidebarRowView: NSView {
                 background = .clear
             }
             layer?.backgroundColor = background.cgColor
+            let color = isSelected ? ClaudeTheme.textPrimary : ClaudeTheme.textSecondary
+            label.textColor = color
+            iconView.contentTintColor = color
         }
-        let color = isSelected ? ClaudeTheme.textPrimary : ClaudeTheme.textSecondary
-        label.textColor = color
-        iconView.contentTintColor = color
         label.font = .systemFont(ofSize: 14.5, weight: isSelected ? .medium : .regular)
     }
 }
