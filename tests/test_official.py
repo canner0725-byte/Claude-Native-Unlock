@@ -43,7 +43,7 @@ class OfficialSafety(unittest.TestCase):
     def test_prompt_suggestion_setting_flag_is_added_once(self):
         for adapter in [official.core.ADAPTER_37337, official.core.ADAPTER_42304,
                         official.core.ADAPTER_42304_ARM64, official.core.ADAPTER_42304_2,
-                        official.core.ADAPTER_31623]:
+                        official.core.ADAPTER_31623, official.core.ADAPTER_36556]:
             text = official.core.main_availability(adapter)
             self.assertEqual(text.count('2120747855:{rule:"forced",value:!0}'), 1)
 
@@ -53,6 +53,34 @@ class OfficialSafety(unittest.TestCase):
         self.assertEqual(text.count('1235690166:{rule:"always",value:!0}'), 1)
         self.assertNotIn('3264789062', text)
         self.assertNotIn('3335190042', text)
+
+    def test_36556_restores_renderer_defaults_only(self):
+        """3.6556.2 只补渲染进程默认值；不覆盖官方 when/follows 条件。"""
+        adapter = official.core.ADAPTER_36556
+        self.assertEqual(adapter['featureAnchor'], 'var Hon={')
+        self.assertEqual(adapter['webFeatureAnchor'], 'Uon={')
+        self.assertEqual(adapter['mainAvailability'],
+                         '2120747855:{rule:"forced",value:!0},')
+        text = official.core.web_availability(adapter)
+        for gate in ('3858164079', '1235690166', '1282344890',
+                     '3774822426', '2280470525'):
+            self.assertEqual(text.count(gate + ':{rule:"always",value:!0}'), 1)
+        # 这一版官方自带的条件门不在追加列表里，避免覆盖官方语义。
+        self.assertNotIn('3264789062', text)
+        self.assertNotIn('3716359568', text)
+
+    def test_renderer_conflict_is_rejected_not_overridden(self):
+        """渲染进程表里的官方 when/follows 必须拒绝覆盖，而不是追加表尾。"""
+        text = 'Uon={123:{rule:"follows",condition:"x"}}'
+        with self.assertRaisesRegex(ValueError, '拒绝覆盖'):
+            official.core.insert_entries(text, 'Uon={',
+                                         [('123', 'rule:"always",value:!0')],
+                                         conflict='reject')
+        # 主进程表仍允许覆盖：官方改了取值时我们的解锁要能生效。
+        changed = official.core.insert_entries(
+            'var Hon={123:{rule:"forced",value:!1}}', 'var Hon={',
+            [('123', 'rule:"forced",value:!0')])
+        self.assertIn('123:{rule:"forced",value:!1},123:{rule:"forced",value:!0}', changed)
 
     def test_42304_2_is_a_single_verified_build(self):
         adapter = official.core.ADAPTER_42304_2

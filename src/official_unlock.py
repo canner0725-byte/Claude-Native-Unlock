@@ -36,7 +36,10 @@ ASAR = 'Contents/Resources/app.asar'
 # revision 12：适配 Desktop 3.1623.0，并按表内实际内容决定追加哪些开关。
 # revision 13：3.1623.0 补回状态分组（3858164079）与每文件夹工作树（1235690166）
 # 的渲染进程可用性默认值；只改可用性，不改官方分桶/工作树行为。
-PATCH_REVISION = 13
+# revision 14：适配 Desktop 3.6556.2（官方已升到新版）；补回这一版被删掉的
+# 渲染进程默认值：状态分组、每文件夹工作树、PR 自动修复、PR 面板、
+# Code 权限请求分类。渲染进程表改为“形状不同即拒绝”，不覆盖官方 when/follows。
+PATCH_REVISION = 14
 
 # 只读诊断会读取这些固定文件；不会读取配置、密钥或会话。
 DIAGNOSTIC_SOURCE_FILES = [
@@ -282,8 +285,10 @@ def build(app):
         web_availability = core.web_availability(adapter)
         web_entries = core.split_entries(web_availability)
         if web_entries:
+            # 渲染进程表里的 when/follows 是官方语义（例如“仅本机会话”“跟随
+            # 定时任务开关”）。同形状跳过，形状不同一律拒绝，绝不覆盖。
             changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
-                                          web_entries, gates)
+                                          web_entries, gates, conflict='reject')
             verify_gates(changed, adapter['webFeatureAnchor'], web_entries)
         # 改完先过一遍语法检查，避免把 Claude 写成打不开的应用。
         core.check_js(changed)

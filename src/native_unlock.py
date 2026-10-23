@@ -203,9 +203,68 @@ ADAPTER_31623 = {
  }
 }
 
+# 3.6556.2：官方大版本更新后的构建。功能表仍是两张，变量名换成
+# `var Hon={…}`（强制项）与 `Uon={…}`（下发渲染进程项）。
+# 表内已有 2371478310 / 857846362（Code 工作台），不再重复追加；
+# 2120747855（提示建议设置项）仍然缺失，继续强制。
+# 渲染进程表里这一版没有任何“状态分组 / 每文件夹工作树 / PR 面板”的默认值，
+# 而 claude.ai 前端仍按名字查这些门，所以补回默认值；只改“设置项是否可见”
+# 这类部署可用性，不改官方分桶、分类、PR 或工作树逻辑。
+ADAPTER_36556 = {
+ 'version': '3.6556.2',
+ 'asarHash': 'd1315bccfdb85cfcd79fcc34f194f3a5154d383bff1518fde95d39e821e3852d',
+ 'main': '.vite/build/index.chunk-jPKPzV-P.js',
+ 'featureAnchor': 'var Hon={',
+ 'mainAvailability': '2120747855:{rule:"forced",value:!0},',
+ 'webFeatureAnchor': 'Uon={',
+ 'webAvailability': (
+  '3858164079:{rule:"always",value:!0},'   # claudeai_session_state：会话状态分组
+  '1235690166:{rule:"always",value:!0},'   # cai_epitaxy_worktree：每文件夹工作树
+  '1282344890:{rule:"always",value:!0},'   # ccr_autofix_ui：PR 自动修复设置
+  '3774822426:{rule:"always",value:!0},'   # epitaxy_pr_panel：PR 面板/在浏览器打开
+  '2280470525:{rule:"always",value:!0},'   # ccr_code_requires_action_category_enabled
+  # 下面 6 个是 3.6556.2 里前端仍在读取、但两张表都没有的纯界面开关。
+  # 官方缺省即关闭，功能入口整个不出现；补回 true 只恢复入口，动作仍走官方逻辑。
+  # 灰度门（如 ccr_plan_mode_enabled）不在此列：那是官方逐步放量，不属于部署可用性。
+  '69389141:{rule:"always",value:!0},'     # ccd_palette_session_actions：命令面板会话操作
+  '3619252400:{rule:"always",value:!0},'   # claudeai_cc_epitaxy_folder_browser：SSH 文件夹浏览
+  '4000837158:{rule:"always",value:!0},'   # epitaxy_plan_pane_auto_open：计划面板自动打开
+  '273163521:{rule:"always",value:!0},'    # claudeai_cc_epitaxy_sticky_prompt：置顶提示
+  '2149681774:{rule:"always",value:!0},'   # ccd_prompt_jump：上一/下一提示跳转
+  '2697147784:{rule:"always",value:!0},'   # ccd_checkin_noop_rollup：检查点折叠
+ ),
+ 'files': {
+  '.vite/build/index.pre.js': '87806ce239d643852bf9ac06987f4f48415f7afc3046546f6c1654a1a7670a5b',
+  '.vite/build/index.chunk-jPKPzV-P.js': '6e898798943b990e6eefa9209c61d977866b7898f681864f02c8cad3bb691ed5',
+  '.vite/build/index.chunk-BzjccvJJ.js': 'cb0a1d0fdd1e22011a989396876a484a7317e4507dcf5d5831921fde1630daaa',
+ },
+ 'sourceFiles': {
+  'Contents/Info.plist': '00075ca3f823a0b7731e0591a25f512136ada6d5c208cad1a5dce562b392a276',
+  'Contents/MacOS/Claude': '6dc844c1b12bea0d46f3840a97dbab121aa64bad4710730eed46ef0cce6ac4b5',
+  'Contents/Resources/app.asar.unpacked/node_modules/@ant/claude-swift/build/Release/computer_use.node': '301ce0ba38ac3725d5b5833abfaae9c7e453d54fddd509850344f821f2931aa1',
+ }
+}
+
 # 这些版本才有“新版 Code 工作台”相关界面；补丁 revision 5 起按版本判断。
 CODE_UI_VERSIONS = (ADAPTER_37337['version'], ADAPTER_42304['version'],
-                    ADAPTER_42304_2['version'], ADAPTER_31623['version'])
+                    ADAPTER_42304_2['version'], ADAPTER_31623['version'],
+                    ADAPTER_36556['version'])
+
+# 补回渲染进程默认值的门。官方每一版都可能删掉其中几条，前端却仍按名字查；
+# 未登记版本现场适配时也沿用这一组，避免“能打补丁但少了功能”。
+RENDERER_AVAILABILITY = (
+ '3858164079:{rule:"always",value:!0},'
+ '1235690166:{rule:"always",value:!0},'
+ '1282344890:{rule:"always",value:!0},'
+ '3774822426:{rule:"always",value:!0},'
+ '2280470525:{rule:"always",value:!0},'
+ '69389141:{rule:"always",value:!0},'
+ '3619252400:{rule:"always",value:!0},'
+ '4000837158:{rule:"always",value:!0},'
+ '273163521:{rule:"always",value:!0},'
+ '2149681774:{rule:"always",value:!0},'
+ '2697147784:{rule:"always",value:!0},'
+)
 
 
 def adapters_for_version(version):
@@ -224,6 +283,8 @@ def adapters_for_version(version):
         return [ADAPTER_42304_2]
     if version == ADAPTER_31623['version']:
         return [ADAPTER_31623]
+    if version == ADAPTER_36556['version']:
+        return [ADAPTER_36556]
     return []
 
 
@@ -346,15 +407,17 @@ def table_definition(text, anchor, key):
     raise ValueError('Unterminated gate definition: ' + key)
 
 
-def insert_entries(text, anchor, entries, report=None):
+def insert_entries(text, anchor, entries, report=None, conflict='override'):
     """把可用性条目写进功能表，返回 (新文本, 实际结果)。
 
     三种情况分开处理：
 
     - 表里没有这个键：插到表头。
     - 表里已有完全相同的定义：跳过，什么都不做。
-    - 表里已有不同定义：追加到**表尾**。对象字面量里后出现的定义获胜，
-      所以追加在末尾能覆盖官方值；如果放在表头反而会被官方值覆盖。
+    - 表里已有不同定义：`conflict='override'` 时追加到**表尾**（对象字面量里
+      后出现的定义获胜，放在表头反而会被官方值覆盖）；`conflict='reject'`
+      时直接报错——渲染进程表里的 `when`/`follows` 条件表达官方语义，
+      覆盖它就等于改官方行为，必须拒绝。
 
     结果写进 report（若提供），用于安装记录和界面提示：
     `inserted` / `skipped` / `overridden`。
@@ -368,6 +431,8 @@ def insert_entries(text, anchor, entries, report=None):
             result['inserted'].append(key)
         elif current.replace(' ', '') == body.replace(' ', ''):
             result['skipped'].append(key)
+        elif conflict == 'reject':
+            raise ValueError('目标开关形状冲突，拒绝覆盖官方语义：' + key)
         else:
             tail.append((key, body))
             result['overridden'].append(key)
@@ -438,7 +503,8 @@ def discover_adapter(app):
         'mainAvailability': ('2371478310:{rule:"forced",value:!0},'
                              '857846362:{rule:"forced",value:!0},'
                              '2120747855:{rule:"forced",value:!0},'),
-        'webAvailability': '',
+        # 渲染进程表用 reject：表里已有的 when/follows 是官方语义，不能覆盖。
+        'webAvailability': RENDERER_AVAILABILITY,
         # 未登记构建没有固定文件指纹；安全性来自官方签名和结构校验。
         'files': {},
         'sourceFiles': {},

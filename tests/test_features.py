@@ -245,6 +245,22 @@ class NativeConfigurationSafety(unittest.TestCase):
         self.assertTrue(result['configWritable'])
         self.assertTrue(any(item['id'] == 'browser' for item in result['features']))
 
+    def test_report_keeps_catalog_order_and_carries_group_and_desc(self):
+        """界面直接按 report 的顺序分组显示，字段缺一个就会少一行说明。"""
+        application = {'version': features.official.core.VERSION,
+                       'supported': True, 'running': False}
+        with patch.object(features.official, 'config_keys', return_value=None), \
+             patch.object(features, 'plugin_extensions', return_value=None), \
+             patch.object(features, 'code_session_flags', return_value=None), \
+             patch.object(features, 'config_health', return_value=None):
+            result = features.report(application)
+        self.assertEqual([item['id'] for item in result['features']], list(features.FEATURES))
+        for item in result['features']:
+            spec = features.FEATURES[item['id']]
+            self.assertEqual(item['title'], spec['title'])
+            self.assertEqual(item['group'], spec['group'])
+            self.assertEqual(item['desc'], spec['desc'])
+
     def test_malformed_config_error_does_not_echo_credentials(self):
         self.config.write_text('{"SYNTHETIC-SECRET": invalid}')
         output = io.StringIO()
@@ -472,6 +488,89 @@ class PluginExtensionCounts(unittest.TestCase):
     def test_malformed_registry_is_not_guessed(self):
         self.registry.write_text('{not json')
         self.assertIsNone(features.plugin_extensions(self.base))
+
+
+class FeatureCatalog(unittest.TestCase):
+    """FEATURES 是唯一事实来源：每项都要有界面需要的字段和固定的官方键。"""
+
+    GROUPS = ['工作台', '工具与网络', '扩展与插件', '外观与通知']
+
+    # 2026-10-24 新增的 13 项：id → (flatKey, group)，顺序固定。
+    NEW_FEATURES = [
+        ('chat-tab', 'chatTabEnabled', '工作台'),
+        ('cowork-tab', 'coworkTabEnabled', '工作台'),
+        ('code-tab', 'isClaudeCodeForDesktopEnabled', '工作台'),
+        ('advanced-file-analysis', 'chatAdvancedFileAnalysisEnabled', '工作台'),
+        ('extension-directory', 'isDesktopExtensionDirectoryEnabled', '扩展与插件'),
+        ('plugin-marketplaces', 'userPluginMarketplacesEnabled', '扩展与插件'),
+        ('plugin-uploads', 'userPluginUploadsEnabled', '扩展与插件'),
+        ('skill-creation', 'skillCreationEnabled', '扩展与插件'),
+        ('keep-awake', 'keepAwakeEnabled', '外观与通知'),
+        ('quick-entry-screenshots', 'quickEntryScreenshotsEnabled', '外观与通知'),
+        ('quick-entry-files', 'quickEntryFileSharingEnabled', '外观与通知'),
+        ('hide-announcements', 'disableFeatureDiscovery', '外观与通知'),
+        ('persistent-approvals', 'mcpPersistentAlwaysAllowEnabled', '工具与网络'),
+    ]
+
+    def test_every_feature_has_title_key_value_group_and_desc(self):
+        for identifier, spec in features.FEATURES.items():
+            self.assertEqual(set(spec), {'title', 'key', 'value', 'group', 'desc'}, identifier)
+            self.assertTrue(spec['title'].strip(), identifier)
+            self.assertTrue(spec['desc'].strip(), identifier)
+            self.assertIn(spec['group'], self.GROUPS, identifier)
+            self.assertRegex(spec['key'], r'^[A-Za-z][A-Za-z0-9_]*$')
+            self.assertTrue(features.valid_value(identifier, spec['value']), identifier)
+
+    def test_file_analysis_keeps_its_string_values(self):
+        self.assertEqual(features.FEATURES['file-analysis']['value'], 'standard')
+        for value in ['standard', 'simple', 'no-vm', 'off']:
+            self.assertTrue(features.valid_value('file-analysis', value), value)
+        self.assertFalse(features.valid_value('file-analysis', 'other'))
+        self.assertFalse(features.valid_value('browser', 'standard'))
+
+    def test_new_feature_keys_and_groups_match_the_catalog(self):
+        identifiers = list(features.FEATURES)
+        self.assertEqual(identifiers[7:], [item[0] for item in self.NEW_FEATURES])
+        for identifier, key, group in self.NEW_FEATURES:
+            spec = features.FEATURES[identifier]
+            self.assertEqual(spec['key'], key, identifier)
+            self.assertEqual(spec['group'], group, identifier)
+            self.assertIs(spec['value'], True, identifier)
+
+    def test_existing_features_keep_their_order(self):
+        self.assertEqual(list(features.FEATURES)[:7], [
+            'file-analysis', 'browser', 'scheduled-tasks', 'auto-approve',
+            'desktop-extensions', 'tool-search', 'webfetch-preflight'])
+
+    def test_new_switches_roundtrip_through_change(self):
+        """新项不需要 change() 特殊分支；照常写配置并留恢复记录。"""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = pathlib.Path(temp.name).resolve()
+        data = root / 'data'
+        library = data / 'configLibrary'
+        library.mkdir(parents=True)
+        config = library / 'test.json'
+        (library / '_meta.json').write_text(json.dumps({'appliedId': 'test'}))
+        original = {'inferenceProvider': 'gateway', 'inferenceGatewayApiKey': 'SYNTHETIC-SECRET'}
+        config.write_text(json.dumps(original))
+        state = root / 'state'
+        state.mkdir()
+        keys = {spec['key'] for spec in features.FEATURES.values()}
+        with contextlib.ExitStack() as stack:
+            for name, value in [('DATA', data), ('STATE', state)]:
+                stack.enter_context(patch.object(features, name, value))
+            stack.enter_context(patch.object(features, 'managed', return_value=False))
+            stack.enter_context(patch.object(features.official, 'running', return_value=False))
+            stack.enter_context(patch.object(features.official, 'status', return_value={
+                'supported': True, 'version': features.official.core.VERSION, 'running': False}))
+            stack.enter_context(patch.object(features.official, 'config_keys', return_value=keys))
+            for identifier, key, _ in self.NEW_FEATURES:
+                features.change(identifier)
+                self.assertIs(json.loads(config.read_text())[key], True, identifier)
+                self.assertTrue(features.effective(identifier, json.loads(config.read_text())), identifier)
+                features.change(identifier, restore=True)
+                self.assertEqual(json.loads(config.read_text()), original, identifier)
 
 
 class InterfaceParity(unittest.TestCase):

@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 
 // 一个窗口 + 菜单栏入口的小工具。
 // 所有真正的补丁操作都在内置 Python 后端里完成；这里只负责显示状态、
@@ -8,7 +9,7 @@ import AppKit
 // 配色、开关、按钮和间距对齐 Claude 桌面端（深色近黑、蓝色开关、灰色按钮）。
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
-    var scrollView: NSScrollView!
+    var scrollView: PlainScrollView!
     var contentTitleLabel: NSTextField!
     var sectionViews: [String: NSView] = [:]
     var sidebarRows: [String: SidebarRowView] = [:]
@@ -57,7 +58,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastError: String?
     var pendingClaudeRefresh = false
     var featureConfigWritable = false
-    var featureRestorable: [Bool] = Array(repeating: false, count: 8)
+    var featureRestorable: [Bool] = Array(repeating: false, count: 21)
 
     // 一键退出 Claude 并应用修改。
     var quittingClaude = false
@@ -87,12 +88,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let storageURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Claude 原生助手")
 
+    // 顺序必须和 native_features.FEATURES 完全一致，最后一项是走 CLI 后端的
+    // Code 自动整理；tests/test_features.py 会逐项核对。
     let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve",
                       "desktop-extensions", "tool-search", "webfetch-preflight",
+                      "chat-tab", "cowork-tab", "code-tab", "advanced-file-analysis",
+                      "extension-directory", "plugin-marketplaces", "plugin-uploads",
+                      "skill-creation", "keep-awake", "quick-entry-screenshots",
+                      "quick-entry-files", "hide-announcements", "persistent-approvals",
                       "code-auto-dream"]
     let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务",
                          "Cowork 自动审批选项", "插件里的桌面扩展", "MCP 工具按需加载",
-                         "WebFetch 免域名预检", "Code 自动整理"]
+                         "WebFetch 免域名预检", "Chat 工作台", "Cowork 工作台",
+                         "Code 工作台", "高级文件分析", "扩展目录", "自建插件市场",
+                         "上传自建插件", "自建 Skills", "保持电脑唤醒", "快速输入截图",
+                         "快速输入附带文件", "隐藏新功能提示", "记住工具授权", "Code 自动整理"]
     let featureDescriptions = [
         "Chat 使用标准工作台，启用官方高级文件分析。",
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
@@ -101,7 +111,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         "允许插件里打包的桌面扩展（.mcpb）加载；第三方部署没有组织策略后端时不能直接安装 .mcpb，Code 插件也不接受。签名检查仍按官方策略。",
         "MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。",
         "跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。",
+        "在桌面端显示官方 Chat 工作台；模型仍走你配置的第三方 API。",
+        "显示官方 Cowork 工作台；任务执行和授权仍由 Claude 处理。",
+        "显示官方 Code 工作台：新版会话页、会话侧栏和嵌套会话。",
+        "允许 Chat 分析上传的文件；解析在官方本地工作台里完成。",
+        "显示官方桌面扩展目录入口；安装仍按官方签名策略。",
+        "允许添加自己的插件市场；市场内容由你提供。",
+        "允许上传自己打包的插件；加载仍走官方插件加载器。",
+        "允许创建和保存自己的 Skills；扫描与执行仍按官方策略。",
+        "任务运行期间允许 Claude 请求保持电脑唤醒；开关仍由官方界面控制。",
+        "允许快速输入窗口附带屏幕截图；截取哪块屏幕由你选择。",
+        "允许把其他应用里打开的文件附到快速输入。",
+        "隐藏官方新功能公告；不改变任何功能本身。",
+        "允许 MCP 工具使用「始终允许」；逐次审批仍然可用。",
         "只解除 Code 自动整理的可用性限制；用户开关保持。"
+    ]
+    /// 官方设置页式的分组：标题 + 该组里的功能 id（按界面顺序排列）。
+    let featureGroups: [(String, [String])] = [
+        ("工作台", ["file-analysis", "chat-tab", "cowork-tab", "code-tab", "advanced-file-analysis"]),
+        ("工具与网络", ["browser", "scheduled-tasks", "auto-approve", "tool-search",
+                       "webfetch-preflight", "persistent-approvals"]),
+        ("扩展与插件", ["desktop-extensions", "extension-directory", "plugin-marketplaces",
+                       "plugin-uploads", "skill-creation"]),
+        ("外观与通知", ["keep-awake", "quick-entry-screenshots", "quick-entry-files",
+                       "hide-announcements"]),
+        ("Code", ["code-auto-dream"])
     ]
     /// Code 自动整理在列表里的位置；它走 CLI 后端，不是 3P 配置项。
     var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
@@ -109,9 +143,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var featureLabels: [NSTextField] = []
     var featureHints: [NSTextField] = []
     var featureRows: [NSView] = []
-    var featureEnabled: [Bool] = Array(repeating: false, count: 8)
+    var featureEnabled: [Bool] = Array(repeating: false, count: 21)
     /// 当前 Claude 版本是否还有这个配置键；没有就禁用而不是装作能点。
-    var featureAvailable: [Bool] = Array(repeating: true, count: 8)
+    var featureAvailable: [Bool] = Array(repeating: true, count: 21)
     // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
     let featureSummary = NSTextField(wrappingLabelWithString: "")
 
@@ -168,6 +202,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window.title = "Claude 原生助手"
         window.isReleasedWhenClosed = false
+        // 窗口状态不参与系统恢复：强制退出后 macOS 的「要恢复窗口吗」弹窗
+        // 会在完成启动之前弹出，把这个只有一扇窗的工具挡在外面。
+        window.isRestorable = false
+        window.restorationClass = nil
         window.minSize = NSSize(width: 880, height: 600)
         window.backgroundColor = ClaudeTheme.pane
         window.titlebarAppearsTransparent = true
@@ -204,7 +242,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             sidebar.topAnchor.constraint(equalTo: root.topAnchor),
             sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 240),
+            sidebar.widthAnchor.constraint(equalToConstant: ClaudeTheme.Metric.navWidth),
             pane.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             pane.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             pane.topAnchor.constraint(equalTo: root.topAnchor),
@@ -231,7 +269,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.window.center()
             }
         }
+        #if PREVIEW
+        // 预览构建不跑后端：一是避免在用户机器上做真实检测，二是能稳定截到静态界面。
+        if ProcessInfo.processInfo.environment["PREVIEW_NO_BACKEND"] == nil {
+            execute("status-all", backend: "all")
+        }
+        #else
         execute("status-all", backend: "all")
+        #endif
     }
 
     // MARK: - 左侧栏
@@ -244,7 +289,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stack.distribution = .fill
         stack.spacing = 0
         stack.wantsLayer = true
-        stack.edgeInsets = NSEdgeInsets(top: 50, left: 14, bottom: 16, right: 14)
+        // 官方设置页侧栏：p-2 外边距，搜索框与导航行左右再收 8pt。
+        stack.edgeInsets = NSEdgeInsets(top: 44, left: 16, bottom: 12, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -259,9 +305,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         searchBox.onChange = { [weak self] in self?.filterSidebar() }
         searchBox.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(searchBox)
-        searchBox.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
-        searchBox.heightAnchor.constraint(equalToConstant: 38).isActive = true
-        stack.setCustomSpacing(22, after: searchBox)
+        searchBox.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
+        searchBox.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        stack.setCustomSpacing(18, after: searchBox)
 
         addSidebarHeader("设置", ids: ["general", "patch"], to: stack)
         addSidebarRow("general", title: "概览", symbol: "slider.horizontal.3", to: stack)
@@ -287,33 +333,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let accountLine = HairlineView()
         accountLine.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(accountLine)
-        accountLine.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
+        accountLine.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         accountLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        stack.setCustomSpacing(10, after: accountLine)
+        stack.setCustomSpacing(8, after: accountLine)
 
         sidebarAccount.translatesAutoresizingMaskIntoConstraints = false
         sidebarAccount.onAbout = { [weak self] in self?.selectSection("about") }
         stack.addArrangedSubview(sidebarAccount)
-        sidebarAccount.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
-        sidebarAccount.heightAnchor.constraint(equalToConstant: 54).isActive = true
+        sidebarAccount.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
+        sidebarAccount.heightAnchor.constraint(equalToConstant: 48).isActive = true
 
         return sidebar
     }
 
     func addSidebarHeader(_ title: String, ids: [String], to stack: NSStackView) {
         let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        label.font = ClaudeFont.caption(.medium)
         label.textColor = ClaudeTheme.textMuted
         let wrap = NSView()
         label.translatesAutoresizingMaskIntoConstraints = false
         wrap.addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 10),
-            label.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 20),
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 8),
+            label.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 16),
             label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -6)
         ])
         stack.addArrangedSubview(wrap)
-        wrap.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
+        wrap.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         sidebarHeaders.append((wrap, ids))
     }
 
@@ -328,8 +374,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         row.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28).isActive = true
-        row.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
+        row.heightAnchor.constraint(equalToConstant: ClaudeTheme.Metric.controlHeight).isActive = true
         sidebarRows[id] = row
     }
 
@@ -351,9 +397,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ][id] ?? ""
         // 等这次布局完成后再回到顶部；滚动容器高度刚变化时立即 scroll 会停在旧位置。
         DispatchQueue.main.async {
-            guard let scrollView = self.scrollView else { return }
-            scrollView.contentView.setBoundsOrigin(.zero)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            self.scrollView?.scrollToTop()
         }
     }
 
@@ -366,11 +410,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pane.addSubview(topBar)
 
         contentTitleLabel = NSTextField(labelWithString: "概览")
-        contentTitleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        contentTitleLabel.font = ClaudeFont.title()
         contentTitleLabel.textColor = ClaudeTheme.textPrimary
         contentTitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        // Claude 设置页不在内容顶部放页面标题；层级由左侧选中项和分组标题表达。
-        contentTitleLabel.isHidden = true
+        // 与官方设置页一致：内容顶部是 22pt semibold 的页面标题，右侧放关闭按钮。
         topBar.addSubview(contentTitleLabel)
 
         progress.style = .spinning
@@ -391,33 +434,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         topBar.addSubview(refreshIconButton)
         topBar.addSubview(closeButton)
 
-        scrollView = NSScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
-        scrollView.automaticallyAdjustsContentInsets = false
-        scrollView.contentInsets = NSEdgeInsetsZero
-        pane.addSubview(scrollView)
+        let scroller = PlainScrollView()
+        scrollView = scroller
+        scroller.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(scroller)
 
         NSLayoutConstraint.activate([
             topBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
             topBar.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             topBar.topAnchor.constraint(equalTo: pane.topAnchor),
-            topBar.heightAnchor.constraint(equalToConstant: 64),
-            contentTitleLabel.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 40),
-            contentTitleLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
+            topBar.heightAnchor.constraint(equalToConstant: 60),
+            contentTitleLabel.leadingAnchor.constraint(equalTo: topBar.leadingAnchor,
+                                                       constant: ClaudeTheme.Metric.contentInsetX),
+            contentTitleLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
             progress.trailingAnchor.constraint(equalTo: refreshIconButton.leadingAnchor, constant: -12),
-            progress.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
-            closeButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -18),
-            closeButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
-            closeButton.widthAnchor.constraint(equalToConstant: 30),
-            closeButton.heightAnchor.constraint(equalToConstant: 30),
-            refreshIconButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
-            refreshIconButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 3),
-            refreshIconButton.widthAnchor.constraint(equalToConstant: 30),
-            refreshIconButton.heightAnchor.constraint(equalToConstant: 30),
+            progress.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
+            closeButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -16),
+            closeButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
+            closeButton.widthAnchor.constraint(equalToConstant: 28),
+            closeButton.heightAnchor.constraint(equalToConstant: 28),
+            refreshIconButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -4),
+            refreshIconButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
+            refreshIconButton.widthAnchor.constraint(equalToConstant: 28),
+            refreshIconButton.heightAnchor.constraint(equalToConstant: 28),
             scrollView.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
@@ -440,11 +479,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             doc.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
             doc.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             doc.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
-            sections.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 40),
-            sections.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -40),
+            sections.leadingAnchor.constraint(equalTo: doc.leadingAnchor,
+                                              constant: ClaudeTheme.Metric.contentInsetX),
+            sections.trailingAnchor.constraint(equalTo: doc.trailingAnchor,
+                                               constant: -ClaudeTheme.Metric.contentInsetX),
             sections.topAnchor.constraint(equalTo: doc.topAnchor, constant: 4),
-            sections.bottomAnchor.constraint(lessThanOrEqualTo: doc.bottomAnchor, constant: -36),
-            doc.heightAnchor.constraint(greaterThanOrEqualTo: sections.heightAnchor, constant: 40)
+            sections.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -40),
+            doc.heightAnchor.constraint(greaterThanOrEqualTo: sections.heightAnchor, constant: 44)
         ])
 
         let builders: [(String, NSView)] = [
@@ -493,46 +534,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.target = self
         refreshButton.action = #selector(refresh)
 
-        var featureViews: [NSView] = []
+        var featureViews: [Int: NSView] = [:]
         for index in featureTitles.indices {
-            featureViews.append(featureRow(index))
+            featureViews[index] = featureRow(index)
         }
-        featureSummary.font = .systemFont(ofSize: 12)
+        featureSummary.font = ClaudeFont.caption()
         featureSummary.textColor = ClaudeTheme.warning
         featureSummary.isHidden = true
         featureSummary.maximumNumberOfLines = 3
         featureSummary.lineBreakMode = .byWordWrapping
 
-        return section([
-            featureSummary,
-            settingsGroup("解锁", rows: [computerUse, versionRow], first: true),
-            settingsGroup("原生配置", rows: featureViews),
-            settingsGroup("操作", rows: [openRow, refreshRow])
-        ], intro: "Computer Use、原生配置与 Code 自动整理的可用性开关。动作授权、拒绝与中断仍由 Claude 处理。")
+        // 按官方设置页的方式分成若干组，每组一个 15pt 标题和带分隔线的行。
+        var groups: [NSView] = [featureSummary,
+                                settingsGroup("解锁", rows: [computerUse, versionRow])]
+        for (title, ids) in featureGroups {
+            let rows = ids.compactMap { id in
+                featureIDs.firstIndex(of: id).flatMap { featureViews[$0] }
+            }
+            guard !rows.isEmpty else { continue }
+            groups.append(settingsGroup(title, rows: rows))
+        }
+        groups.append(settingsGroup("操作", rows: [openRow, refreshRow]))
+
+        return section(groups,
+                       intro: "Computer Use、原生配置与 Code 自动整理的可用性开关。动作授权、拒绝与中断仍由 Claude 处理。")
     }
 
     func featureRow(_ index: Int) -> NSView {
         let title = NSTextField(labelWithString: featureTitles[index])
-        title.font = .systemFont(ofSize: 15, weight: .medium)
+        title.font = ClaudeFont.body()
         title.textColor = ClaudeTheme.textPrimary
         title.toolTip = featureDescriptions[index]
 
         let desc = NSTextField(wrappingLabelWithString: featureDescriptions[index])
-        desc.font = .systemFont(ofSize: 14)
-        desc.textColor = ClaudeTheme.textSecondary
+        desc.font = ClaudeFont.body()
+        desc.textColor = ClaudeTheme.textMuted
         desc.maximumNumberOfLines = 0
         desc.lineBreakMode = .byWordWrapping
         desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let detail = NSTextField(wrappingLabelWithString: "")
-        detail.font = .systemFont(ofSize: 12)
+        detail.font = ClaudeFont.caption()
         detail.textColor = ClaudeTheme.warning
         detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byWordWrapping
         detail.isHidden = true
 
         let hint = NSTextField(wrappingLabelWithString: "")
-        hint.font = .systemFont(ofSize: 12)
+        hint.font = ClaudeFont.caption()
         hint.textColor = ClaudeTheme.textMuted
         hint.maximumNumberOfLines = 2
         hint.lineBreakMode = .byWordWrapping
@@ -581,7 +630,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             control: prepareButton)
 
         return section([
-            settingsGroup("状态", rows: [stateRow, versionRow, backupRow], first: true),
+            settingsGroup("状态", rows: [stateRow, versionRow, backupRow]),
             settingsGroup("维护", rows: [updateRow, prepareRow])
         ], intro: "补丁只在已适配的 Claude 版本上安装；更新或恢复都会先校验当前文件和官方备份。")
     }
@@ -605,7 +654,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             description: "Dia、Chrome 等外部浏览器受官方只读授权限制，Computer Use 不能点击或输入。网页操作请用 Claude 官方内置浏览器或 Claude in Chrome。")
 
         return section([
-            settingsGroup("权限", rows: [permissionRow], first: true),
+            settingsGroup("权限", rows: [permissionRow]),
             settingsGroup("边界", rows: [reviewRow, browserRow])
         ], intro: "系统授权由 macOS 管理，只有你本人在系统设置里才能勾选；本工具只能把你带到对应页面。")
     }
@@ -627,7 +676,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             settingsRow(title: "退出助手", description: "菜单栏图标也会一起退出。", control: keycap("⌘Q"))
         ]
         return section([
-            settingsGroup("键盘", rows: rows, first: true)
+            settingsGroup("键盘", rows: rows)
         ], intro: "这些快捷键在助手窗口激活时可用；菜单栏菜单里也有同样的入口。")
     }
 
@@ -653,7 +702,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             description: "备份与恢复记录保存在 ~/Library/Application Support/Claude 原生助手/，请勿手动删除。")
 
         return section([
-            settingsGroup("应用", rows: [versionRow, guideRow, githubRow], first: true),
+            settingsGroup("应用", rows: [versionRow, guideRow, githubRow]),
             settingsGroup("数据", rows: [dataRow])
         ], intro: "只解除已适配版本的原生功能可用性条件，不修改官方功能行为。")
     }
@@ -667,8 +716,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stack.distribution = .fill
         stack.spacing = 0
 
+        // 官方设置页的分组说明：13pt 次级文字，位于页面标题下方。
         let introLabel = NSTextField(wrappingLabelWithString: intro)
-        introLabel.font = .systemFont(ofSize: 13.5)
+        introLabel.font = ClaudeFont.footnote()
         introLabel.textColor = ClaudeTheme.textSecondary
         introLabel.maximumNumberOfLines = 0
         introLabel.lineBreakMode = .byWordWrapping
@@ -677,41 +727,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         introLabel.setContentHuggingPriority(.required, for: .vertical)
         stack.addArrangedSubview(introLabel)
         introLabel.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        stack.setCustomSpacing(28, after: introLabel)
+        stack.setCustomSpacing(32, after: introLabel)
 
-        for group in groups {
+        for (index, group) in groups.enumerated() {
             stack.addArrangedSubview(group)
             group.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            if index < groups.count - 1 {
+                // 官方分组之间是 40pt 空白加 1px 分隔线。
+                stack.setCustomSpacing(ClaudeTheme.Metric.groupGap, after: group)
+            }
         }
         return stack
     }
 
-    func settingsGroup(_ title: String, rows: [NSView], first: Bool = false) -> NSView {
+    func settingsGroup(_ title: String, rows: [NSView]) -> NSView {
         let group = NSStackView()
         group.orientation = .vertical
         group.alignment = .leading
         group.distribution = .fill
         group.spacing = 0
-        if !first {
-            let line = HairlineView()
-            line.translatesAutoresizingMaskIntoConstraints = false
-            group.addArrangedSubview(line)
-            line.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
-            line.heightAnchor.constraint(equalToConstant: 1).isActive = true
-            group.setCustomSpacing(26, after: line)
-        }
         let heading = NSTextField(labelWithString: title)
-        heading.font = .systemFont(ofSize: 17, weight: .semibold)
+        heading.font = ClaudeFont.heading()
         heading.textColor = ClaudeTheme.textPrimary
         heading.setContentHuggingPriority(.required, for: .vertical)
         group.addArrangedSubview(heading)
-        group.setCustomSpacing(8, after: heading)
+        group.setCustomSpacing(ClaudeTheme.Metric.headerGap, after: heading)
         for (index, row) in rows.enumerated() {
             row.setContentHuggingPriority(.required, for: .vertical)
             group.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
             if index < rows.count - 1 {
-                group.setCustomSpacing(6, after: row)
+                // 官方设置行之间是 1px 细分隔线，没有额外间距。
+                let line = HairlineView()
+                line.translatesAutoresizingMaskIntoConstraints = false
+                group.addArrangedSubview(line)
+                line.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+                line.heightAnchor.constraint(equalToConstant: 1).isActive = true
             }
         }
         return group
@@ -719,11 +770,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func settingsRow(title: String, description: String, control: NSView? = nil) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        titleLabel.font = ClaudeFont.body()
         titleLabel.textColor = ClaudeTheme.textPrimary
         let desc = NSTextField(wrappingLabelWithString: description)
-        desc.font = .systemFont(ofSize: 14)
-        desc.textColor = ClaudeTheme.textSecondary
+        desc.font = ClaudeFont.body()
+        desc.textColor = ClaudeTheme.textMuted
         desc.maximumNumberOfLines = 0
         desc.lineBreakMode = .byWordWrapping
         desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -733,7 +784,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func settingsRow(title: String, descriptionView: NSView, control: NSView? = nil) -> NSView {
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        titleLabel.font = ClaudeFont.body()
         titleLabel.textColor = ClaudeTheme.textPrimary
         return settingsRow(titleView: titleLabel, descriptionView: descriptionView,
                            extraViews: [], control: control)
@@ -745,11 +796,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 3
+        text.spacing = ClaudeTheme.Metric.rowLabelGap
         text.translatesAutoresizingMaskIntoConstraints = false
         text.addArrangedSubview(titleView)
         text.addArrangedSubview(descriptionView)
         for view in extraViews { text.addArrangedSubview(view) }
+        // 说明文字允许换行但不要被拉伸；否则 NSTextField 的默认竖直抗压缩会把行高撑大。
+        for view in text.arrangedSubviews {
+            view.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        }
         row.addSubview(text)
 
         if let control = control {
@@ -763,17 +818,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             text.trailingAnchor.constraint(equalTo: row.trailingAnchor).isActive = true
         }
+        // 官方设置行：上下各 12pt（--cds-pad-md）。
         NSLayoutConstraint.activate([
             text.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            text.topAnchor.constraint(equalTo: row.topAnchor, constant: 24),
-            text.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -16)
+            text.topAnchor.constraint(equalTo: row.topAnchor,
+                                      constant: ClaudeTheme.Metric.rowPaddingY),
+            text.bottomAnchor.constraint(equalTo: row.bottomAnchor,
+                                         constant: -ClaudeTheme.Metric.rowPaddingY)
         ])
         return row
     }
 
     func configureDynamicLabel(_ label: NSTextField) {
-        label.font = .systemFont(ofSize: 14.5)
-        label.textColor = ClaudeTheme.textSecondary
+        label.font = ClaudeFont.body()
+        label.textColor = ClaudeTheme.textMuted
         label.maximumNumberOfLines = 0
         label.lineBreakMode = .byWordWrapping
     }
@@ -826,6 +884,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // 这个工具只有一个窗口，窗口状态没有恢复价值；强制退出或崩溃后，
+    // 系统的「要恢复窗口吗」弹窗会挡住启动（而且它出现在完成启动之前）。
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
+    func applicationShouldSaveApplicationState(_ app: NSApplication) -> Bool { false }
+    func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
         quitTimer?.invalidate()
@@ -1507,7 +1571,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 处理后端结果
 
     /// 状态文案统一从这里写，顺带做一次淡入，避免文字突然跳变。
-    func setStatus(_ text: String, color: NSColor = ClaudeTheme.textSecondary) {
+    func setStatus(_ text: String, color: NSColor = ClaudeTheme.textMuted) {
         guard text != statusLabel.stringValue else {
             statusLabel.textColor = color
             return
@@ -1811,6 +1875,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Claude 设置页视觉
 
+/// 数值取自 Claude 3.6556.2 内置的 CDS 设计系统（desktop / comfortable 密度）：
+/// --cds-h-control 2rem、--cds-pad-md .75rem、--cds-gap-xl 2.5rem、
+/// --cds-font-size-body .875rem、--cds-font-size-title 1.375rem、--cds-switch-h 1.25rem。
+/// 颜色取自同一份 gray/blue 色阶与 alpha 叠加规则，深浅色各一套。
 enum ClaudeTheme {
     static func dynamic(_ light: NSColor, _ dark: NSColor) -> NSColor {
         NSColor(name: nil) { appearance in
@@ -1825,35 +1893,100 @@ enum ClaudeTheme {
                 alpha: alpha)
     }
 
-    // Claude 设置页：近黑侧栏、稍亮的右侧面板、蓝色开关、灰色按钮。
-    static let pane = dynamic(rgb(0xFFFFFF), rgb(0x1D1D1C))
-    static let sidebar = dynamic(rgb(0xF0EFEC), rgb(0x171716))
-    static let sidebarHover = dynamic(rgb(0xE9E8E2), rgb(0x232322))
-    static let sidebarSelected = dynamic(rgb(0xE1E0D9), rgb(0x30302E))
-    static let searchFill = dynamic(rgb(0xEDECE7), rgb(0x242423))
+    // 尺寸与间距（pt）。
+    enum Metric {
+        static let controlHeight: CGFloat = 32      // --cds-h-control
+        static let navWidth: CGFloat = 232
+        static let rowPaddingY: CGFloat = 12        // --cds-pad-md
+        static let rowLabelGap: CGFloat = 4         // gap-1
+        static let groupGap: CGFloat = 40           // --cds-gap-xl
+        static let headerGap: CGFloat = 16          // --cds-gap-md
+        static let contentInsetX: CGFloat = 24      // px-xl
+        static let contentInsetTop: CGFloat = 28
+        static let switchWidth: CGFloat = 36        // 1.8 × --cds-switch-h
+        static let switchHeight: CGFloat = 20
+    }
 
-    static let textPrimary = dynamic(rgb(0x151515), rgb(0xF2F1EE))
-    static let textSecondary = dynamic(rgb(0x5F5E5A), rgb(0xA3A19C))
-    static let textMuted = dynamic(rgb(0x8A8A8A), rgb(0x77756F))
-    static let border = dynamic(rgb(0x151515, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.09))
-    static let separator = dynamic(rgb(0x151515, alpha: 0.08), rgb(0xFFFFFF, alpha: 0.08))
+    // surface-1 侧栏 / surface-2 内容面板；深色下内容比侧栏略亮。
+    static let pane = dynamic(rgb(0xFFFFFF), rgb(0x1A1A19))
+    // 图层背景用静态色：动态 NSColor 的 cgColor 在 CALayer 上会被解析成系统占位灰。
+    static let paneLight = rgb(0xFFFFFF)
+    static let paneDark = rgb(0x1A1A19)
+    static let sidebarLight = rgb(0xFCFCFB)
+    static let sidebarDark = rgb(0x151515)
+    static let sidebar = dynamic(rgb(0xFCFCFB), rgb(0x151515))
+    static let sidebarHover = dynamic(rgb(0x0B0B0B, alpha: 0.05), rgb(0xFFFFFF, alpha: 0.05))
+    static let sidebarSelected = dynamic(rgb(0x0B0B0B, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.10))
+    static let searchFill = dynamic(rgb(0xFFFFFF), rgb(0xFFFFFF, alpha: 0.05))
 
-    static let accent = dynamic(rgb(0x007AFF), rgb(0x0A84FF))
-    static let accentHover = dynamic(rgb(0x0066D6), rgb(0x3B9CFF))
-    static let switchOff = dynamic(rgb(0xD2D1C7), rgb(0x4A4A47))
-    static let switchOffHover = dynamic(rgb(0xC3C2B7), rgb(0x55554F))
+    static let textPrimary = dynamic(rgb(0x0B0B0B), rgb(0xF0EFEC))
+    static let textSecondary = dynamic(rgb(0x5F5E5A), rgb(0xC3C2B7))
+    static let textMuted = dynamic(rgb(0x898781), rgb(0x6D6B67))
+    static let border = dynamic(rgb(0x0B0B0B, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.10))
+    static let separator = dynamic(rgb(0x0B0B0B, alpha: 0.05), rgb(0xFFFFFF, alpha: 0.05))
 
-    static let buttonFill = dynamic(rgb(0xE7E6E1), rgb(0x383735))
-    static let buttonHover = dynamic(rgb(0xDDDCD6), rgb(0x45443F))
-    static let buttonPressed = dynamic(rgb(0xD2D1C7), rgb(0x2E2E2C))
-    static let buttonBorder = dynamic(rgb(0xD9D8D2), rgb(0x45443F))
+    // --cds-role-accent-fill = blue-450；悬停取相邻一档。
+    static let accent = rgb(0x2A78D6)
+    static let accentHover = dynamic(rgb(0x256ABF), rgb(0x3987E5))
+    static let switchOff = dynamic(rgb(0x0B0B0B, alpha: 0.20), rgb(0xFFFFFF, alpha: 0.10))
+    static let switchOffHover = dynamic(rgb(0x0B0B0B, alpha: 0.35), rgb(0xFFFFFF, alpha: 0.20))
+    static let switchKnob = rgb(0xFFFFFF)
 
-    static let warning = dynamic(rgb(0xB4531F), rgb(0xE0A075))
+    static let buttonFill = dynamic(rgb(0xEDECE8), rgb(0x2C2C2A))
+    static let buttonHover = dynamic(rgb(0xE4E3DD), rgb(0x383835))
+    static let buttonPressed = dynamic(rgb(0xD2D1C7), rgb(0x20201F))
+    static let buttonBorder = dynamic(rgb(0x0B0B0B, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.10))
+
+    static let warning = dynamic(rgb(0x863311), rgb(0xEC835A))
     static let clay = rgb(0xD97757)
     static let claySoft = dynamic(rgb(0xFBF3EF), rgb(0xD97757, alpha: 0.18))
 }
 
-/// 左侧栏底色：图层化并用 updateLayer 上色，外观切换时由 AppKit 自动重画。
+/// 官方界面用的是 Anthropic Sans 可变字体（随 Claude 安装包提供）。
+/// 运行时注册并优先使用它，取不到时退回系统字体，保证工具单独运行时也不缺字。
+enum ClaudeFont {
+    private static var registered = false
+
+    static func registerBundledFonts() {
+        guard !registered else { return }
+        registered = true
+        let candidates = [
+            "/Applications/Claude.app/Contents/Resources/fonts/AnthropicSans-Romans-Variable-25x258.ttf",
+            NSHomeDirectory() + "/Applications/Claude.app/Contents/Resources/fonts/AnthropicSans-Romans-Variable-25x258.ttf",
+        ]
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            var error: Unmanaged<CFError>?
+            _ = CTFontManagerRegisterFontsForURL(URL(fileURLWithPath: path) as CFURL, .process, &error)
+            break
+        }
+    }
+
+    private static let faces: [NSFont.Weight: String] = [
+        .regular: "AnthropicSansVariable-TextRegular",
+        .medium: "AnthropicSansVariable-TextMedium",
+        .semibold: "AnthropicSansVariable-TextSemibold",
+    ]
+
+    static func ui(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
+        registerBundledFonts()
+        if let name = faces[weight], let font = NSFont(name: name, size: size) {
+            return font
+        }
+        return .systemFont(ofSize: size, weight: weight)
+    }
+
+    // 与 CDS 字号一一对应：caption 12 / footnote 13 / body 14 / heading 15 / title 22。
+    static func caption(_ weight: NSFont.Weight = .regular) -> NSFont { ui(12, weight) }
+    static func footnote(_ weight: NSFont.Weight = .regular) -> NSFont { ui(13, weight) }
+    static func body(_ weight: NSFont.Weight = .regular) -> NSFont { ui(14, weight) }
+    static func heading(_ weight: NSFont.Weight = .semibold) -> NSFont { ui(15, weight) }
+    static func title() -> NSFont { ui(22, .semibold) }
+}
+
+/// 左侧栏底色：直接绘制，滚动/截图/打印时都不会丢。
+/// 左侧栏底色：图层化并用 updateLayer 上色。
+/// 窗口里只要有一个子视图带图层，整棵子树就进入图层合成，`draw(_:)` 里的
+/// 底色会在离屏/滚动合成时丢掉；0.3.34 踩过一次，这里必须保持 updateLayer。
 final class SidebarBackgroundView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
@@ -1865,13 +1998,13 @@ final class SidebarBackgroundView: NSView {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = ClaudeTheme.sidebar.cgColor
-        }
+        let resolved = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? ClaudeTheme.sidebarDark : ClaudeTheme.sidebarLight
+        layer?.backgroundColor = resolved.cgColor
     }
 }
 
-/// 右侧面板底色：同样走 updateLayer。
+/// 右侧面板底色：与侧栏一样走 updateLayer。
 final class ContentBackgroundView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
@@ -1883,9 +2016,85 @@ final class ContentBackgroundView: NSView {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = ClaudeTheme.pane.cgColor
+        // 动态色（NSColor(name:dynamicProvider:)）取 .cgColor 时拿不到当前外观，
+        // 会退化成系统占位灰；这里先按当前外观取静态色再转 CGColor。
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = (dark ? ClaudeTheme.paneDark : ClaudeTheme.paneLight).cgColor
+    }
+}
+
+/// 普通滚动容器：一个裁剪层加一个文档视图，自己处理滚轮，不用 NSScrollView。
+/// 需要的是「不透明、无材质、可裁剪」：设置页内容整块跟着滚，不需要系统滚动条。
+/// （右侧面板曾整块发灰，原因不在这个容器，而是 HairlineView 用 dirtyRect
+/// 填充，图层化后 dirtyRect 可能是整块图层，十几条分隔线叠成了灰雾。）
+final class PlainScrollView: NSView {
+    /// 裁剪层：普通 NSView + clipsToBounds，只负责裁掉视口外的内容。
+    private let clip = FlippedView()
+    private var offset: CGFloat = 0
+    private weak var document: NSView?
+
+    var documentView: NSView? {
+        get { document }
+        set {
+            document?.removeFromSuperview()
+            document = newValue
+            guard let newValue else { return }
+            newValue.translatesAutoresizingMaskIntoConstraints = false
+            clip.addSubview(newValue)
+            NSLayoutConstraint.activate([
+                newValue.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
+                newValue.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
+                newValue.topAnchor.constraint(equalTo: clip.topAnchor),
+                newValue.widthAnchor.constraint(equalTo: clip.widthAnchor)
+            ])
         }
+    }
+
+    var contentView: NSView { clip }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        clipsToBounds = true
+        clip.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(clip)
+        NSLayoutConstraint.activate([
+            clip.leadingAnchor.constraint(equalTo: leadingAnchor),
+            clip.trailingAnchor.constraint(equalTo: trailingAnchor),
+            clip.topAnchor.constraint(equalTo: topAnchor),
+            clip.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private var maximumOffset: CGFloat {
+        guard let document else { return 0 }
+        return max(0, document.frame.height - bounds.height)
+    }
+
+    private func applyOffset() {
+        guard let document else { return }
+        offset = min(max(0, offset), maximumOffset)
+        var frame = document.frame
+        frame.origin.y = -offset
+        document.frame = frame
+    }
+
+    override func layout() {
+        super.layout()
+        applyOffset()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY * 10
+        guard delta != 0 else { return }
+        offset += delta
+        applyOffset()
+    }
+
+    func scrollToTop() {
+        offset = 0
+        applyOffset()
     }
 }
 
@@ -1907,9 +2116,6 @@ final class SearchBoxView: NSView, NSTextFieldDelegate {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.cornerRadius = 9
-
         if let image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) {
             icon.image = image
             icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
@@ -1921,12 +2127,12 @@ final class SearchBoxView: NSView, NSTextFieldDelegate {
         field.isBezeled = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .systemFont(ofSize: 14)
+        field.font = ClaudeFont.body()
         field.textColor = ClaudeTheme.textPrimary
         field.placeholderAttributedString = NSAttributedString(
             string: "搜索设置",
             attributes: [.foregroundColor: ClaudeTheme.textMuted,
-                         .font: NSFont.systemFont(ofSize: 14)])
+                         .font: ClaudeFont.body()])
         field.delegate = self
         field.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1969,12 +2175,18 @@ final class SearchBoxView: NSView, NSTextFieldDelegate {
         applyColors()
     }
 
-    private func applyColors() {
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = ClaudeTheme.searchFill.cgColor
-            layer?.borderColor = (focused ? ClaudeTheme.accent : ClaudeTheme.border).cgColor
-            layer?.borderWidth = focused ? 1.5 : 1
+            ClaudeTheme.searchFill.setFill()
+            path.fill()
+            (focused ? ClaudeTheme.accent : ClaudeTheme.border).setStroke()
+            path.lineWidth = focused ? 1.5 : 1
+            path.stroke()
         }
+    }
+
+    private func applyColors() {
         needsDisplay = true
     }
 }
@@ -2003,22 +2215,22 @@ final class SidebarRowView: NSView {
 
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             iconView.image = image
-            iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
         }
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.contentTintColor = ClaudeTheme.textSecondary
         label.stringValue = title
-        label.font = .systemFont(ofSize: 14.5)
+        label.font = ClaudeFont.body()
         label.textColor = ClaudeTheme.textSecondary
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(iconView)
         addSubview(label)
         NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 18),
-            iconView.heightAnchor.constraint(equalToConstant: 18),
-            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 9),
+            iconView.widthAnchor.constraint(equalToConstant: 20),
+            iconView.heightAnchor.constraint(equalToConstant: 20),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
             label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
             label.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
@@ -2056,24 +2268,33 @@ final class SidebarRowView: NSView {
         updateAppearance()
     }
 
+    override func draw(_ dirtyRect: NSRect) {
+        // 选中/悬停底色直接绘制：滚动、截图和打印时都不会丢。
+        let background: NSColor
+        if isSelected {
+            background = ClaudeTheme.sidebarSelected
+        } else if hovered {
+            background = ClaudeTheme.sidebarHover
+        } else {
+            background = .clear
+        }
+        guard background.alphaComponent > 0 else { return }
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            background.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        }
+    }
+
     private func updateAppearance() {
         // 动态颜色必须在外观上下文里解析，否则选中行可能取到另一种外观的取值，
         // 深色底上出现近黑文字、看起来像“灰掉了”。
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let background: NSColor
-            if isSelected {
-                background = ClaudeTheme.sidebarSelected
-            } else if hovered {
-                background = ClaudeTheme.sidebarHover
-            } else {
-                background = .clear
-            }
-            layer?.backgroundColor = background.cgColor
             let color = isSelected ? ClaudeTheme.textPrimary : ClaudeTheme.textSecondary
             label.textColor = color
             iconView.contentTintColor = color
         }
-        label.font = .systemFont(ofSize: 14.5, weight: isSelected ? .medium : .regular)
+        label.font = ClaudeFont.body(isSelected ? .medium : .regular)
+        needsDisplay = true
     }
 }
 
@@ -2089,8 +2310,6 @@ final class ClaudeIconButton: NSButton {
         super.init(frame: .zero)
         isBordered = false
         bezelStyle = .regularSquare
-        wantsLayer = true
-        layer?.cornerRadius = 7
         title = ""
         target = self
         self.action = #selector(performAction)
@@ -2144,13 +2363,18 @@ final class ClaudeIconButton: NSButton {
         updateAppearance()
     }
 
-    private func updateAppearance() {
+    override func draw(_ dirtyRect: NSRect) {
+        guard hovered, isEnabled else { return }
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let color = hovered ? ClaudeTheme.sidebarHover : NSColor.clear
-            layer?.backgroundColor = color.cgColor
+            ClaudeTheme.sidebarHover.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
         }
+    }
+
+    private func updateAppearance() {
         symbolView.contentTintColor = isEnabled ? ClaudeTheme.textSecondary
             : ClaudeTheme.textMuted.withAlphaComponent(0.5)
+        needsDisplay = true
     }
 }
 
@@ -2159,8 +2383,11 @@ final class HairlineView: NSView {
     override var isOpaque: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
+        // 只填自己这一条。图层化之后 AppKit 给的 dirtyRect 可能是整块图层
+        // （实测 768×540），直接 dirtyRect.fill() 会把 5% 白色铺满整个面板，
+        // 叠十几层就是 #A7A7A6 的灰。这里始终用 bounds 与 dirtyRect 的交集。
         ClaudeTheme.separator.setFill()
-        dirtyRect.fill()
+        bounds.intersection(dirtyRect).fill()
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -2194,7 +2421,9 @@ final class ClaudeSwitch: NSControl {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 40, height: 24) }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: ClaudeTheme.Metric.switchWidth, height: ClaudeTheme.Metric.switchHeight)
+    }
 
     override var isEnabled: Bool {
         didSet { needsDisplay = true }
@@ -2249,7 +2478,11 @@ final class ClaudeSwitch: NSControl {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let track = NSRect(x: 0, y: (bounds.height - 24) / 2, width: 40, height: 24)
+        // 官方开关：高 20pt、宽 1.8 倍，圆钮 16pt，两端各留 2pt。
+        let height = ClaudeTheme.Metric.switchHeight
+        let width = ClaudeTheme.Metric.switchWidth
+        let track = NSRect(x: (bounds.width - width) / 2, y: (bounds.height - height) / 2,
+                           width: width, height: height)
         let alpha: CGFloat = isEnabled ? 1 : 0.42
         let on = state == .on
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -2257,9 +2490,9 @@ final class ClaudeSwitch: NSControl {
                 ? (hovered ? ClaudeTheme.accentHover : ClaudeTheme.accent)
                 : (hovered ? ClaudeTheme.switchOffHover : ClaudeTheme.switchOff)
             trackColor.withAlphaComponent(alpha).setFill()
-            NSBezierPath(roundedRect: track, xRadius: 12, yRadius: 12).fill()
+            NSBezierPath(roundedRect: track, xRadius: height / 2, yRadius: height / 2).fill()
 
-            let knobSize: CGFloat = 20
+            let knobSize = height - 4
             let travel = track.width - knobSize - 4
             let knobX = track.minX + 2 + travel * knobFraction
             let knobRect = NSRect(x: knobX, y: track.minY + 2,
@@ -2270,13 +2503,14 @@ final class ClaudeSwitch: NSControl {
             shadow.shadowOffset = NSSize(width: 0, height: -0.5)
             NSGraphicsContext.saveGraphicsState()
             shadow.set()
-            NSColor.white.withAlphaComponent(alpha).setFill()
+            ClaudeTheme.switchKnob.withAlphaComponent(alpha).setFill()
             NSBezierPath(ovalIn: knobRect).fill()
             NSGraphicsContext.restoreGraphicsState()
         }
         if window?.firstResponder === self {
-            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: -0.5, dy: -0.5),
-                                    xRadius: 14, yRadius: 14)
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: -1, dy: -1),
+                                    xRadius: bounds.height / 2 + 1,
+                                    yRadius: bounds.height / 2 + 1)
             ClaudeTheme.accent.withAlphaComponent(0.60).setStroke()
             ring.lineWidth = 1.5
             ring.stroke()
@@ -2331,7 +2565,7 @@ final class ClaudeButton: NSButton {
         bezelStyle = .regularSquare
         wantsLayer = true
         focusRingType = .none
-        font = .systemFont(ofSize: 13.5, weight: .medium)
+        font = ClaudeFont.footnote(.medium)
         setButtonType(.momentaryPushIn)
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -2340,7 +2574,7 @@ final class ClaudeButton: NSButton {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override var intrinsicContentSize: NSSize {
-        let width = (title as NSString).size(withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 13)]).width
+        let width = (title as NSString).size(withAttributes: [.font: font ?? ClaudeFont.footnote()]).width
         return NSSize(width: ceil(width) + 30, height: 30)
     }
 
@@ -2402,7 +2636,7 @@ final class ClaudeButton: NSButton {
             }
             let solidText = text.usingColorSpace(.sRGB) ?? text
             let attributes: [NSAttributedString.Key: Any] = [
-                .font: font ?? NSFont.systemFont(ofSize: 13, weight: .medium),
+                .font: font ?? ClaudeFont.footnote(.medium),
                 .foregroundColor: solidText.withAlphaComponent(alpha),
                 .paragraphStyle: {
                     let style = NSMutableParagraphStyle()
@@ -2461,16 +2695,14 @@ final class SidebarAccountView: NSView {
     override init(frame: NSRect) {
         gear = ClaudeIconButton(symbol: "gearshape", accessibility: "关于") {}
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.cornerRadius = 8
 
         avatar.translatesAutoresizingMaskIntoConstraints = false
-        title.font = .systemFont(ofSize: 13, weight: .medium)
+        title.font = ClaudeFont.footnote(.medium)
         title.textColor = ClaudeTheme.textPrimary
         title.translatesAutoresizingMaskIntoConstraints = false
 
         statusDot.translatesAutoresizingMaskIntoConstraints = false
-        status.font = .systemFont(ofSize: 11.5)
+        status.font = ClaudeFont.caption()
         status.textColor = ClaudeTheme.textSecondary
         status.lineBreakMode = .byTruncatingTail
         status.translatesAutoresizingMaskIntoConstraints = false
@@ -2552,10 +2784,15 @@ final class SidebarAccountView: NSView {
         applyColors()
     }
 
-    private func applyColors() {
+    override func draw(_ dirtyRect: NSRect) {
+        guard hovered else { return }
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = (hovered ? ClaudeTheme.sidebarHover : NSColor.clear).cgColor
+            ClaudeTheme.sidebarHover.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
         }
+    }
+
+    private func applyColors() {
         needsDisplay = true
     }
 
@@ -2746,15 +2983,29 @@ extension AppDelegate {
         window.displayIfNeeded()
         window.contentView?.subviews.forEach { $0.displayIfNeeded() }
         CATransaction.flush()
-        guard let view = window.contentView,
-              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
+        guard let view = window.contentView else { return }
+        // layer.render 会漏掉滚动容器里的自绘内容，PDF 路径是完整的；再从 PDF 光栅化出 PNG。
+        let pdf = view.dataWithPDF(inside: view.bounds)
+        try? pdf.write(to: URL(fileURLWithPath: path + ".pdf"))
+        guard let provider = CGDataProvider(data: pdf as CFData),
+              let document = CGPDFDocument(provider),
+              let page = document.page(at: 1) else { return }
+        let scale: CGFloat = 2
+        let width = Int(view.bounds.width * scale)
+        let height = Int(view.bounds.height * scale)
+        guard let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.scaleBy(x: scale, y: scale)
+        context.drawPDFPage(page)
+        guard let image = context.makeImage() else { return }
+        let rep = NSBitmapImageRep(cgImage: image)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))
         }
-        // cacheDisplay 不含滚动容器里的图层；PDF 是更接近打印的完整渲染，便于核对。
-        let pdf = view.dataWithPDF(inside: view.bounds)
-        try? pdf.write(to: URL(fileURLWithPath: path + ".pdf"))
     }
 }
 
@@ -2762,6 +3013,31 @@ let previewDelegate = AppDelegate()
 let previewApp = NSApplication.shared
 previewApp.delegate = previewDelegate
 let previewBase = ProcessInfo.processInfo.environment["PREVIEW_PATH"] ?? "/tmp/claude-native-preview"
+
+/// 预览构建专用：抓真实窗口的离屏快照。
+/// 注意：PDF 与 cacheDisplay 两条路径都会漏掉图层背景色，layer.render 对
+/// 滚动层也不可靠；这里只用来核对文字排版，颜色一律以真机截图为准。
+func debugCapture(to path: String) {
+    let window = previewDelegate.window!
+    print("NSApp=\(NSApp.effectiveAppearance.name.rawValue) window=\(window.effectiveAppearance.name.rawValue)")
+    guard let view = window.contentView, let layer = view.layer else { return }
+    let scale: CGFloat = 2
+    let width = Int(view.bounds.width * scale)
+    let height = Int(view.bounds.height * scale)
+    guard let context = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+    context.scaleBy(x: scale, y: scale)
+    layer.render(in: context)
+    guard let image = context.makeImage() else { return }
+    let rep = NSBitmapImageRep(cgImage: image)
+    if let data = rep.representation(using: .png, properties: [:]) {
+        try? data.write(to: URL(fileURLWithPath: path))
+        print("captured \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+    }
+}
+
 func previewStep(_ index: Int) {
     let sections = ["general", "patch", "shortcuts", "about"]
     let names = ["dark", "patch", "shortcuts", "about"]
@@ -2780,9 +3056,29 @@ func previewStep(_ index: Int) {
         }
     }
 }
-DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { previewStep(0) }
+DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+    if ProcessInfo.processInfo.environment["DEBUG_CAPTURE"] != nil {
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+        previewDelegate.window.appearance = NSApp.appearance
+        previewDelegate.selectSection("general")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            debugCapture(to: previewBase + "-debug-dark.png")
+            NSApp.appearance = NSAppearance(named: .aqua)
+            previewDelegate.window.appearance = NSApp.appearance
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                debugCapture(to: previewBase + "-debug-light.png")
+                previewApp.terminate(nil)
+            }
+        }
+    } else {
+        previewStep(0)
+    }
+}
 previewApp.run()
 #else
+// 这个工具只有一扇窗，不需要系统恢复窗口；关掉之后，即使上次是被强制退出，
+// macOS 也不会在启动时弹出「要恢复窗口吗」并挡住界面。
+UserDefaults.standard.register(defaults: ["NSQuitAlwaysKeepsWindows": false])
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

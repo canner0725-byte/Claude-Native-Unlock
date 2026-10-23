@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """官方第三方 API（3P）配置的可用性开关。
 
-只改 Claude 已有配置里的几个非秘密字段，不新增执行器、服务或账号：
-- desktopHome
-- builtinBrowserEnabled
-- scheduledTasksEnabled
-- autoModeEnabled
-- isDesktopExtensionEnabled
-- toolSearchEnabled
-- skipWebFetchPreflight
-
-所有修改都先留恢复记录，支持原值回滚；管理员策略、配置服务器、
-符号链接和并发修改都会被拒绝。
+只改 Claude 已有 3P 配置里的官方 flatKey 开关（完整清单见 FEATURES），
+不新增执行器、服务或账号。所有修改都先留恢复记录，支持原值回滚；
+管理员策略、配置服务器、符号链接和并发修改都会被拒绝。
 """
 import argparse
 import fcntl
@@ -36,24 +28,63 @@ SUPPORTED_VERSIONS = {
     official.core.ADAPTER_42304['version'],
     official.core.ADAPTER_42304_2['version'],
     official.core.ADAPTER_31623['version'],
+    official.core.ADAPTER_36556['version'],
 }
 
+# 唯一事实来源：界面按这里的顺序显示开关，change() 按 key/value 写入。
+# 每项都只改官方 3P 配置里的一个 flatKey，不新增执行器或服务。
 FEATURES = {
-    'file-analysis': {'title': 'Chat 与高级文件分析', 'key': 'desktopHome', 'value': 'standard'},
-    'browser': {'title': '官方内置浏览器', 'key': 'builtinBrowserEnabled', 'value': True},
-    'scheduled-tasks': {'title': '官方定时任务', 'key': 'scheduledTasksEnabled', 'value': True},
-    'auto-approve': {'title': 'Cowork 自动审批选项', 'key': 'autoModeEnabled', 'value': True},
+    'file-analysis': {'title': 'Chat 与高级文件分析', 'key': 'desktopHome', 'value': 'standard',
+                      'group': '工作台', 'desc': 'Chat 使用标准工作台，启用官方高级文件分析。'},
+    'browser': {'title': '官方内置浏览器', 'key': 'builtinBrowserEnabled', 'value': True,
+                'group': '工具与网络', 'desc': '启用 Claude 官方内置浏览器（不是 Dia / Chrome）。'},
+    'scheduled-tasks': {'title': '官方定时任务', 'key': 'scheduledTasksEnabled', 'value': True,
+                        'group': '工具与网络', 'desc': '允许官方定时任务；是否执行仍由 Claude 决定。'},
+    'auto-approve': {'title': 'Cowork 自动审批选项', 'key': 'autoModeEnabled', 'value': True,
+                     'group': '工具与网络', 'desc': '显示 Cowork 官方自动审批选项；动作审查保留。'},
     # 官方文档：桌面扩展（.mcpb）默认不加载，把这一项设成 true 才允许插件里
     # 打包的扩展运行；扩展本身仍由官方加载器和签名策略检查。
-    'desktop-extensions': {'title': '插件里的桌面扩展', 'key': 'isDesktopExtensionEnabled', 'value': True},
+    'desktop-extensions': {'title': '插件里的桌面扩展', 'key': 'isDesktopExtensionEnabled', 'value': True,
+                           'group': '扩展与插件',
+                           'desc': '允许插件里打包的桌面扩展（.mcpb）加载；第三方部署没有组织策略后端，安装与签名仍按官方策略。'},
     # 官方文档：MCP 工具定义默认全部塞进上下文；打开后改为按需加载。
     # 第三方网关若支持，桌面端会额外注入 ENABLE_TOOL_SEARCH；不支持时
     # 走官方旧路径，不会伪造工具或替换检索服务。
-    'tool-search': {'title': 'MCP 工具按需加载', 'key': 'toolSearchEnabled', 'value': True},
+    'tool-search': {'title': 'MCP 工具按需加载', 'key': 'toolSearchEnabled', 'value': True,
+                    'group': '工具与网络',
+                    'desc': 'MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。'},
     # 官方文档：Code 会话里的 WebFetch 默认先向 api.anthropic.com 做域名
     # 预检；第三方部署连不上那个域名，WebFetch 就一直失败。打开这一项
     # 让官方跳过预检，抓取仍走官方 WebFetch 与既有 egress 规则。
-    'webfetch-preflight': {'title': 'WebFetch 免域名预检', 'key': 'skipWebFetchPreflight', 'value': True},
+    'webfetch-preflight': {'title': 'WebFetch 免域名预检', 'key': 'skipWebFetchPreflight', 'value': True,
+                           'group': '工具与网络',
+                           'desc': '跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。'},
+    'chat-tab': {'title': 'Chat 工作台', 'key': 'chatTabEnabled', 'value': True,
+                 'group': '工作台', 'desc': '在桌面端显示官方 Chat 工作台；模型仍走你配置的第三方 API。'},
+    'cowork-tab': {'title': 'Cowork 工作台', 'key': 'coworkTabEnabled', 'value': True,
+                   'group': '工作台', 'desc': '显示官方 Cowork 工作台；任务执行和授权仍由 Claude 处理。'},
+    'code-tab': {'title': 'Code 工作台', 'key': 'isClaudeCodeForDesktopEnabled', 'value': True,
+                 'group': '工作台', 'desc': '显示官方 Code 工作台：新版会话页、会话侧栏和嵌套会话。'},
+    'advanced-file-analysis': {'title': '高级文件分析', 'key': 'chatAdvancedFileAnalysisEnabled', 'value': True,
+                               'group': '工作台', 'desc': '允许 Chat 分析上传的文件；解析在官方本地工作台里完成。'},
+    'extension-directory': {'title': '扩展目录', 'key': 'isDesktopExtensionDirectoryEnabled', 'value': True,
+                            'group': '扩展与插件', 'desc': '显示官方桌面扩展目录入口；安装仍按官方签名策略。'},
+    'plugin-marketplaces': {'title': '自建插件市场', 'key': 'userPluginMarketplacesEnabled', 'value': True,
+                            'group': '扩展与插件', 'desc': '允许添加自己的插件市场；市场内容由你提供。'},
+    'plugin-uploads': {'title': '上传自建插件', 'key': 'userPluginUploadsEnabled', 'value': True,
+                       'group': '扩展与插件', 'desc': '允许上传自己打包的插件；加载仍走官方插件加载器。'},
+    'skill-creation': {'title': '自建 Skills', 'key': 'skillCreationEnabled', 'value': True,
+                       'group': '扩展与插件', 'desc': '允许创建和保存自己的 Skills；扫描与执行仍按官方策略。'},
+    'keep-awake': {'title': '保持电脑唤醒', 'key': 'keepAwakeEnabled', 'value': True,
+                   'group': '外观与通知', 'desc': '任务运行期间允许 Claude 请求保持电脑唤醒；开关仍由官方界面控制。'},
+    'quick-entry-screenshots': {'title': '快速输入截图', 'key': 'quickEntryScreenshotsEnabled', 'value': True,
+                                'group': '外观与通知', 'desc': '允许快速输入窗口附带屏幕截图；截取哪块屏幕由你选择。'},
+    'quick-entry-files': {'title': '快速输入附带文件', 'key': 'quickEntryFileSharingEnabled', 'value': True,
+                          'group': '外观与通知', 'desc': '允许把其他应用里打开的文件附到快速输入。'},
+    'hide-announcements': {'title': '隐藏新功能提示', 'key': 'disableFeatureDiscovery', 'value': True,
+                           'group': '外观与通知', 'desc': '隐藏官方新功能公告；不改变任何功能本身。'},
+    'persistent-approvals': {'title': '记住工具授权', 'key': 'mcpPersistentAlwaysAllowEnabled', 'value': True,
+                             'group': '工具与网络', 'desc': '允许 MCP 工具使用「始终允许」；逐次审批仍然可用。'},
 }
 
 
@@ -389,6 +420,7 @@ def report(application=None):
             available = keys is None or spec['key'] in keys
             enabled = effective(identifier, config) and available
             result['features'].append({'id': identifier, 'title': spec['title'],
+                'group': spec['group'], 'desc': spec['desc'],
                 'enabled': enabled, 'canRestore': owned, 'available': available,
                 'message': ('此版本没有这个设置' if not available
                             else '已启用' if enabled else '未启用'),
