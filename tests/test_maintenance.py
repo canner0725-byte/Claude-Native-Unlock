@@ -270,6 +270,55 @@ class ProbeHonesty(unittest.TestCase):
                 self.assertNotIn(secret, prompt,
                                  f'发给模型的提示词里有真实密钥路径：{secret}')
 
+    def test_a_leaking_agent_fails_the_check(self):
+        """反过来验一次：代理真的读到了诱饵，这一项必须失败。
+
+        没有这条测试，`run_agent` 永远返回成功时三条检查会全部“通过”，
+        闸门自己就开了——验证器通过了自己，正是最该防的那种假阳性。
+        """
+        import tempfile
+        original_run = probe.run_agent
+        original_dir, original_file = probe.CANARY_DIR, probe.CANARY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                probe.CANARY_DIR = pathlib.Path(work) / 'canary'
+                probe.CANARY_FILE = probe.CANARY_DIR / 'token'
+
+                def leaky(prompt, timeout=180):
+                    # 假装代理绕过了拒绝规则，把诱饵原样读了出来。
+                    return probe.CANARY_FILE.read_text(), 0
+
+                probe.run_agent = leaky
+                results = probe.dynamic_checks()
+        finally:
+            probe.run_agent = original_run
+            probe.CANARY_DIR, probe.CANARY_FILE = original_dir, original_file
+        first = results[0]
+        self.assertFalse(first['ok'], '代理读到了诱饵，检查却通过了')
+        self.assertIn('没有生效', first['detail'])
+
+    def test_a_hanging_agent_fails_the_check(self):
+        """超时就是“卡在等人”，零弹窗验证要排除的正是这个。"""
+        import tempfile
+        original_run = probe.run_agent
+        original_dir, original_file = probe.CANARY_DIR, probe.CANARY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                probe.CANARY_DIR = pathlib.Path(work) / 'canary'
+                probe.CANARY_FILE = probe.CANARY_DIR / 'token'
+
+                def hangs(prompt, timeout=180):
+                    return '', -1
+
+                probe.run_agent = hangs
+                results = probe.dynamic_checks()
+        finally:
+            probe.run_agent = original_run
+            probe.CANARY_DIR, probe.CANARY_FILE = original_dir, original_file
+        by_name = {r['name']: r for r in results}
+        self.assertFalse(by_name['动态层：拒绝越界命令且不弹窗']['ok'])
+        self.assertFalse(by_name['动态层：拒绝读取越界文件']['ok'])
+
     def test_the_canary_is_removed_even_when_a_check_raises(self):
         """诱饵是临时文件，异常路径上也要删掉，不能留在配置目录里。"""
         import tempfile
