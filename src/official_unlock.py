@@ -233,7 +233,7 @@ def status():
         if detected_version is not None and not result['enabled']:
             result['message'] = (
                 f'检测到 Claude {detected_version}，但这个版本或文件尚未适配；'
-                '已停止修改。可以生成只读适配报告。'
+                '已停止修改。可以打开 Claude 或恢复官方备份。'
             )
         else:
             result['message'] = '版本、文件或签名不匹配；已停止修改。'
@@ -566,7 +566,7 @@ def disable():
     if TARGET.exists():
         target_version = plistlib.loads((TARGET / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString')
         if target_version != record.get('version', core.VERSION):
-            raise ValueError('Claude 已升级；不会用旧版本备份覆盖新版。请重新检测并生成适配报告。')
+            raise ValueError('Claude 已升级；不会用旧版本备份覆盖新版。请重新检测。')
         # 用“已验证的官方备份”的 ASAR 指纹判断目标是否已经是官方原版。
         # 备份必须是已登记的官方构建，所以这里用不做结构识别的取法。
         official_asar_hash = core.registered_adapter(backup)['asarHash']
@@ -634,7 +634,7 @@ def prepare_update():
         else:
             raise ValueError(
                 '检测到安装记录，但当前 Claude 不是已校验的官方版本；'
-                '请先生成适配报告，不要直接覆盖。'
+                '请先重新检测，不要直接覆盖。'
             )
 
     result = status()
