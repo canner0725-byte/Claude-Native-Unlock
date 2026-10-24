@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    # 纯 Python 测试不依赖 macOS：平台判断全部由参数传入，同一份测试在
+    # Linux 上也必须给出相同结果。macOS 专属能力（JavaScriptCore 语法检查、
+    # codesign、真实 Claude.app）由 macOS 作业覆盖。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run public tests
+        run: python -m unittest discover -s tests -v
+
+  build:
+    # 构建与签名校验只在 macOS 上跑：产物是 arm64 的 .app。
+    needs: python
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Build, sign and package
+        run: python scripts/build.py
+      - name: Verify the packaged app
+        run: |
+          codesign --verify --deep --strict "dist/Claude 原生助手.app"
+          cd dist && shasum -a 256 -c SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS.txt

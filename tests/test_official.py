@@ -13,6 +13,19 @@ import official_unlock as official
 
 
 class OfficialSafety(unittest.TestCase):
+    @staticmethod
+    def synthetic_asar(script: bytes) -> bytes:
+        """合成一个最小可读的 ASAR：固定头 + 索引 + 文件内容。
+
+        恢复路径现在直接读备份的 ASAR / Info.plist 指纹，不能再塞任意字节。
+        """
+        header = {'files': {'.vite': {'files': {'build': {'files': {'index.js': {
+            'offset': '0', 'size': len(script)}}}}}}}
+        raw = json.dumps(header, separators=(',', ':')).encode()
+        payload = ((len(raw) + 7) // 4) * 4
+        return (struct.pack('<IIII', 4, payload + 4, payload, len(raw))
+                + raw + b'\0' * (payload - 4 - len(raw)) + script)
+
     def test_revision6_enable_installs_new_side_session_availability(self):
         current = {'enabled': True, 'supported': True, 'availabilityOnly': True,
                    'version': official.core.ADAPTER_37337['version'], 'nativeCodeStateUI': True,
@@ -76,11 +89,20 @@ class OfficialSafety(unittest.TestCase):
             official.core.insert_entries(text, 'Uon={',
                                          [('123', 'rule:"always",value:!0')],
                                          conflict='reject')
-        # 主进程表仍允许覆盖：官方改了取值时我们的解锁要能生效。
+
+    def test_main_table_conflict_also_stops(self):
+        """主进程表有不同定义时同样停止：官方强制关闭/换取值时不覆盖。"""
+        text = 'var Hon={123:{rule:"forced",value:!1}}'
+        with self.assertRaises(official.core.OfficialDefinitionConflict):
+            official.core.insert_entries(
+                text, 'var Hon={', [('123', 'rule:"forced",value:!0')])
+        # 表里没有这个键才插入。
         changed = official.core.insert_entries(
-            'var Hon={123:{rule:"forced",value:!1}}', 'var Hon={',
+            'var Hon={1:{rule:"forced",value:!1}}', 'var Hon={',
             [('123', 'rule:"forced",value:!0')])
-        self.assertIn('123:{rule:"forced",value:!1},123:{rule:"forced",value:!0}', changed)
+        self.assertEqual(
+            changed.count('123:{rule:"forced",value:!0}'), 1)
+        self.assertNotIn('123:{rule:"forced",value:!1},123', changed)
 
     def test_42304_2_is_a_single_verified_build(self):
         adapter = official.core.ADAPTER_42304_2
@@ -294,9 +316,14 @@ class OfficialSafety(unittest.TestCase):
             target.mkdir()
             (target / 'marker').write_text('previous')
             backup = state / 'official-backup-1.app'
-            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Resources').mkdir(parents=True)
             (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
-            record = {'backup': str(backup), 'installedFiles': {official.ASAR: 'old'}, 'phase': 'enabled'}
+            (backup / official.ASAR).write_bytes(b'inert backup')
+            record = {'backup': str(backup), 'installedFiles': {official.ASAR: 'old'},
+                      'phase': 'enabled',
+                      'original': {'version': official.core.VERSION,
+                                   'asarHash': official.core.sha(b'inert backup'),
+                                   'files': {}, 'sourceFiles': {}}}
             real_rename = pathlib.Path.rename
             def rename(path, destination):
                 if path.name.startswith('upgrade-prepared-'):
@@ -306,10 +333,11 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
                  patch.object(official, 'status', return_value={'enabled': True, 'supported': True, 'version': official.core.VERSION}), \
-                 patch.object(official.core, 'verify_source'), patch.object(official, 'verify_patched'), \
+                 patch.object(official.core, 'verify_official_signature'), \
+                 patch.object(official, 'verify_patched'), \
                  patch.object(official, 'prepare_identity'), \
-                 patch.object(official.platform, 'machine', return_value='arm64'), \
-                 patch.object(official.platform, 'mac_ver', return_value=('27.0.1', (), '')), \
+                 patch.object(official, 'host_machine', return_value='arm64'), \
+                 patch.object(official, 'host_mac_version', return_value='27.0.1'), \
                  patch.object(official, 'clone', side_effect=lambda source, destination: destination.mkdir()), \
                  patch.object(official, 'build', return_value=({official.ASAR: 'new'}, {})), \
                  patch.object(pathlib.Path, 'rename', rename):
@@ -322,13 +350,14 @@ class OfficialSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
             backup = state / 'official-backup-1.app'
-            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Resources').mkdir(parents=True)
+            (backup / official.ASAR).write_bytes(self.synthetic_asar(b'official original'))
             (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             with patch.object(official, 'STATE', state), \
                  patch.object(official, 'TARGET', state / 'Missing.app'), \
                  patch.object(official, 'manifest', return_value={'backup': str(state / 'official-backup-1.app')}), \
                  patch.object(official, 'running', return_value=False), \
-                 patch.object(official.core, 'verify_source'):
+                 patch.object(official.core, 'verify_official_signature'):
                 self.assertTrue(official.status()['recoveryRequired'])
                 with self.assertRaisesRegex(ValueError, '先关闭开关'):
                     official.enable()
@@ -370,23 +399,22 @@ class OfficialSafety(unittest.TestCase):
             record = {
                 'version': official.core.ADAPTER_42304['version'],
                 'backup': str(backup),
+                # 恢复以安装记录里的原始指纹为准，不读内置登记表。
+                'original': {'version': official.core.ADAPTER_42304['version'],
+                             'asarHash': official.core.sha(b'original'),
+                             'files': {}, 'sourceFiles': {}},
                 'installedFiles': {official.ASAR: official.core.sha(b'patched')},
                 'phase': 'enabled',
             }
-            official_hash = official.core.sha(b'original')
 
             def adapter(app):
-                # 补丁版目标的 ASAR 已经改变，不能再用它判断官方指纹。
-                if app == backup:
-                    return {'version': official.core.ADAPTER_42304['version'],
-                            'asarHash': official_hash}
-                raise AssertionError('不应读取补丁版目标的适配器')
+                raise AssertionError('恢复不应再依赖内置登记表')
 
             with patch.object(official, 'STATE', state), \
                  patch.object(official, 'TARGET', target), \
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
-                 patch.object(official.core, 'verify_source'), \
+                 patch.object(official.core, 'verify_official_signature'), \
                  patch.object(official.core, 'registered_adapter', side_effect=adapter), \
                  patch.object(official, 'verify_patched'), \
                  patch.object(official, 'clone', side_effect=shutil.copytree):
@@ -395,16 +423,22 @@ class OfficialSafety(unittest.TestCase):
             self.assertEqual((target / official.ASAR).read_bytes(), b'original')
 
     def test_damaged_backup_refuses_restore(self):
+        """备份签名/指纹与记录不符时拒绝恢复，不复制任何东西。"""
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
             backup = state / 'official-backup-1.app'
             (backup / 'Contents').mkdir(parents=True)
-            (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': '99.0'}))
+            (backup / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': '99.0'}))
+            record = {'backup': str(backup), 'version': official.core.VERSION,
+                      'original': {'version': official.core.VERSION,
+                                   'asarHash': 'expected', 'files': {}, 'sourceFiles': {}}}
             with patch.object(official, 'STATE', state), \
-                 patch.object(official, 'manifest', return_value={'backup': str(backup)}), \
+                 patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
+                 patch.object(official.core, 'verify_official_signature'), \
                  patch.object(official, 'clone') as clone:
-                with self.assertRaisesRegex(ValueError, 'Unknown version'):
+                with self.assertRaisesRegex(ValueError, '备份版本'):
                     official.disable()
                 clone.assert_not_called()
 
@@ -420,20 +454,21 @@ class OfficialSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = pathlib.Path(directory).resolve()
             backup = state / 'official-backup-1.app'
-            (backup / 'Contents').mkdir(parents=True)
+            (backup / 'Contents/Resources').mkdir(parents=True)
+            (backup / official.ASAR).write_bytes(b'official original')
             (backup / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             target = state / 'Claude.app'
             (target / 'Contents/Resources').mkdir(parents=True)
             (target / official.ASAR).write_bytes(b'changed application')
             (target / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
-            record = {'backup': str(backup), 'installedFiles': {official.ASAR: 'expected'}}
+            record = {'backup': str(backup), 'installedFiles': {official.ASAR: 'expected'},
+                      'original': {'version': official.core.VERSION,
+                                   'asarHash': official.core.sha(b'official original'),
+                                   'files': {}, 'sourceFiles': {}}}
             with patch.object(official, 'STATE', state), patch.object(official, 'TARGET', target), \
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
-                 patch.object(official.core, 'verify_source'), \
-                 patch.object(official.core, 'registered_adapter',
-                              return_value={'version': official.core.VERSION,
-                                            'asarHash': official.core.sha(b'official original')}), \
+                 patch.object(official.core, 'verify_official_signature'), \
                  patch.object(official, 'clone') as clone:
                 with self.assertRaisesRegex(ValueError, '已安装文件发生变化'):
                     official.disable()
@@ -447,21 +482,30 @@ class OfficialSafety(unittest.TestCase):
             target.mkdir()
             (target / 'marker').write_text('patched app remains recoverable')
             backup = state / 'official-backup-1.app'
-            backup.mkdir()
-            record = {'backup': str(backup)}
+            (backup / 'Contents/Resources').mkdir(parents=True)
+            (backup / official.ASAR).write_bytes(b'inert backup')
+            (backup / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
+            record = {'backup': str(backup),
+                      'original': {'version': official.core.VERSION,
+                                   'asarHash': official.core.sha(b'inert backup'),
+                                   'files': {}, 'sourceFiles': {}}}
             real_rename = pathlib.Path.rename
             def rename(path, destination):
                 if path.name.startswith('restore-prepared-'):
                     raise OSError('simulated swap failure')
                 return real_rename(path, destination)
+            # 目标的 ASAR 与记录的官方指纹不同 → 走“已安装补丁”分支，
+            # 再由 rename() 模拟替换阶段失败。
+            (target / 'Contents/Resources').mkdir(parents=True)
+            (target / official.ASAR).write_bytes(b'patched application')
+            (target / 'Contents/Info.plist').write_bytes(
+                plistlib.dumps({'CFBundleShortVersionString': official.core.VERSION}))
             with patch.object(official, 'STATE', state), patch.object(official, 'TARGET', target), \
                  patch.object(official, 'manifest', return_value=record), \
                  patch.object(official, 'running', return_value=False), \
-                 patch.object(official.core, 'verify_source'), \
+                 patch.object(official.core, 'verify_official_signature'), \
                  patch.object(official, 'verify_patched'), \
-                 patch.object(official.core, 'sha', return_value='patched'), \
-                 patch.object(pathlib.Path, 'read_bytes', return_value=b'patched'), \
-                 patch.object(official.plistlib, 'loads', return_value={'CFBundleShortVersionString': official.core.VERSION}), \
                  patch.object(official, 'clone', side_effect=lambda source, destination: destination.mkdir()), \
                  patch.object(pathlib.Path, 'rename', rename):
                 with self.assertRaisesRegex(OSError, 'simulated'):
@@ -601,6 +645,211 @@ class OfficialSafety(unittest.TestCase):
                     official.launch()
 
 
+class SigningPasswordProtection(unittest.TestCase):
+    """签名密码不落盘，只放登录钥匙串；读取失败必须降级而不是卡住。"""
+
+    def setUp(self):
+        import native_unlock as core
+        import keychain
+        self.core, self.keychain = core, keychain
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        patcher = patch.object(core, 'WORK', pathlib.Path(self.directory.name).resolve())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_password_is_read_from_the_keychain_not_a_file(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('plaintext\n')
+        with patch.object(self.keychain, 'read', return_value='from-keychain'):
+            self.assertEqual(self.core.signing_password(), 'from-keychain')
+        # 钥匙串里有值时不会退回明文文件。
+        self.assertTrue(password_file.exists())
+
+    def test_plaintext_file_is_only_a_migration_fallback(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.keychain, 'read', return_value=None):
+            self.assertEqual(self.core.signing_password(), 'legacy')
+
+    def test_missing_password_degrades_instead_of_raising(self):
+        with patch.object(self.keychain, 'read', return_value=None):
+            self.assertIsNone(self.core.signing_password())
+
+    def test_store_deletes_the_plaintext_file(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(True, '')), \
+             patch.object(self.keychain, 'store', return_value=0):
+            self.core.store_keychain_password('new-secret')
+        self.assertFalse(password_file.exists())
+
+    def test_store_failure_keeps_the_file_so_signing_still_works(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(True, '')), \
+             patch.object(self.keychain, 'store', return_value=-60008):
+            with self.assertRaises(ValueError):
+                self.core.store_keychain_password('new-secret')
+        self.assertTrue(password_file.exists())
+
+    def test_migration_keeps_the_file_when_the_keychain_refuses(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(True, '')), \
+             patch.object(self.keychain, 'store', return_value=-60008):
+            self.assertFalse(self.core.migrate_keychain_password())
+        self.assertTrue(password_file.exists())
+
+    def test_migration_removes_the_file_on_success(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(True, '')), \
+             patch.object(self.keychain, 'store', return_value=0):
+            self.assertTrue(self.core.migrate_keychain_password())
+        self.assertFalse(password_file.exists())
+
+    def test_migration_from_a_development_interpreter_is_refused(self):
+        """ACL 认写入进程的签名：从解释器迁移等于把密码交给任何 Python 脚本。"""
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.keychain, 'store') as store:
+            # 不 mock 闸门：测试就是跑在开发解释器里，真实闸门应当拒绝。
+            self.assertFalse(self.core.migrate_keychain_password())
+            store.assert_not_called()
+        self.assertTrue(password_file.exists())
+
+    def test_ad_hoc_backend_is_not_a_trustworthy_writer(self):
+        """ad-hoc 的指定要求是 cdhash，重建即失效，不能让条目绑在它上面。"""
+        with patch.object(self.core.sys, 'executable',
+                          '/Applications/Claude 原生助手.app/Contents/Resources/'
+                          'Backend/NativeUnlockBackend'), \
+             patch.object(self.core, 'app_signing_identity', return_value=None):
+            allowed, reason = self.core.keychain_writer_is_trustworthy()
+        self.assertFalse(allowed)
+        self.assertIn('ad-hoc', reason)
+
+    def test_writer_gate_follows_the_signature_not_the_path(self):
+        """判定看签名：换个安装位置仍可写，同位置换成别的程序则不行。
+
+        ACL 本身只认签名，按路径判断既会误伤也会漏判。
+        """
+        _, keychain_path, _, marker = self.core.signing_paths()
+        keychain_path.parent.mkdir(parents=True, exist_ok=True)
+        keychain_path.write_text('keychain')
+        marker.write_text('89de5d74\n')
+        # 换到别处、但签名就是本地身份 -> 允许。
+        with patch.object(self.core.sys, 'executable', '/opt/other/NativeUnlockBackend'), \
+             patch.object(self.core, 'app_signing_identity', return_value='89de5d74'):
+            self.assertEqual(self.core.keychain_writer_is_trustworthy(), (True, ''))
+        # 同一位置、但签名是另一个身份 -> 拒绝。
+        with patch.object(self.core.sys, 'executable', '/opt/other/NativeUnlockBackend'), \
+             patch.object(self.core, 'app_signing_identity', return_value='deadbeef'):
+            allowed, reason = self.core.keychain_writer_is_trustworthy()
+            self.assertFalse(allowed)
+            self.assertIn('不一致', reason)
+
+
+class MigratePasswordCommand(unittest.TestCase):
+    """迁移要有独立入口：已是最新 revision 时 update() 直接返回，走不到 prepare_identity。"""
+
+    def setUp(self):
+        import native_unlock as core
+        import official_unlock
+        self.core, self.official = core, official_unlock
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        patcher = patch.object(core, 'WORK', pathlib.Path(self.directory.name).resolve())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_already_migrated_is_a_no_op(self):
+        with patch.object(self.core, 'signing_password_location', return_value='keychain'):
+            result = self.official.migrate_password()
+        self.assertFalse(result['migrated'])
+        self.assertEqual(result['location'], 'keychain')
+
+    def test_missing_password_is_reported_not_invented(self):
+        with patch.object(self.core, 'signing_password_location', return_value='missing'):
+            result = self.official.migrate_password()
+        self.assertFalse(result['migrated'])
+        self.assertEqual(result['location'], 'missing')
+
+    def test_blocked_by_the_gate_keeps_the_plaintext_file(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'signing_password_location', return_value='plaintext'), \
+             patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(False, '当前进程是 ad-hoc 签名')):
+            result = self.official.migrate_password()
+        self.assertFalse(result['migrated'])
+        self.assertTrue(result['blocked'])
+        self.assertIn('签名仍可用', result['message'])
+        self.assertTrue(password_file.exists())
+
+    def test_successful_migration_reports_the_new_location(self):
+        _, _, password_file, _ = self.core.signing_paths()
+        password_file.parent.mkdir(parents=True, exist_ok=True)
+        password_file.write_text('legacy\n')
+        with patch.object(self.core, 'signing_password_location',
+                          side_effect=['plaintext', 'keychain']), \
+             patch.object(self.core, 'keychain_writer_is_trustworthy',
+                          return_value=(True, '')), \
+             patch.object(self.core, 'migrate_keychain_password', return_value=True):
+            result = self.official.migrate_password()
+        self.assertTrue(result['migrated'])
+        self.assertEqual(result['location'], 'keychain')
+
+    def test_command_is_reachable_from_the_cli(self):
+        source = (pathlib.Path(self.official.__file__)).read_text()
+        self.assertIn("'migrate-password'", source)
+        self.assertIn('migrate_password()', source)
+
+    def test_signing_locks_the_keychain_even_when_signing_fails(self):
+        """解锁窗口只有一次 codesign 的时长；失败也必须重新锁上。"""
+        _, keychain_path, _, marker = self.core.signing_paths()
+        keychain_path.parent.mkdir(parents=True, exist_ok=True)
+        keychain_path.write_text('keychain')
+        marker.write_text('aabb\n')
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            if args[0] == '/usr/bin/codesign' and '--sign' in args and 'aabb' in args:
+                raise subprocess.CalledProcessError(1, args)
+            return type('R', (), {'stdout': b'', 'stderr': b''})()
+
+        with patch.object(self.core, 'signing_password', return_value='pw'), \
+             patch.object(self.core, 'run', side_effect=fake_run):
+            self.assertIsNone(self.core.sign_app(pathlib.Path('X.app'), pathlib.Path('e.plist')))
+        verbs = [args[1] for args in calls if args[0] == '/usr/bin/security']
+        self.assertEqual(verbs, ['unlock-keychain', 'lock-keychain'])
+
+    def test_keychain_module_never_shells_out_to_the_security_cli(self):
+        """走 security CLI 时 ACL 认的是 security 自己，等于谁都读得到。
+
+        只查代码、不查解释原因的注释，所以按“有没有启动子进程”判断。
+        """
+        source = (pathlib.Path(self.core.__file__).parent / 'keychain.py').read_text()
+        self.assertIn('SecKeychainFindGenericPassword', source)
+        self.assertNotIn('subprocess', source)
+        for verb in ('find-generic-password', 'add-generic-password',
+                     'delete-generic-password'):
+            self.assertNotIn(verb, source)
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -627,26 +876,28 @@ class FeatureTableEditing(unittest.TestCase):
                                   core.split_entries('857846362:{rule:"forced",value:!0},'))
         self.assertEqual(out, self.TABLE)
 
-    def test_conflicting_definition_is_overridden_at_the_table_end(self):
-        """官方已有不同取值时，追加到表尾——对象字面量里后定义获胜。"""
+    def test_conflicting_definition_stops_instead_of_overriding(self):
+        """官方已有不同取值时停止：覆盖等于改官方行为，进入研究而不是绕过。"""
         import native_unlock as core
-        report = {}
-        # 官方把它设成关闭，我们要开启——这才是真正的冲突
         table = ('var ken={857846362:{rule:"forced",value:!1}},'
                  'Aen={101380594:{rule:"always",value:!0}};')
+        with self.assertRaises(core.OfficialDefinitionConflict) as caught:
+            core.insert_entries(table, 'var ken={',
+                                core.split_entries('857846362:{rule:"forced",value:!0},'))
+        self.assertEqual(caught.exception.key, '857846362')
+        # 提醒：文本本身没有任何改动路径可言，调用方拿不到被改过的表。
+
+    def test_override_requires_explicit_opt_in(self):
+        """覆盖只在显式 opt-in 时可用，供维护工具在副本上研究，不用于生产。"""
+        import native_unlock as core
+        table = ('var ken={857846362:{rule:"forced",value:!1}},'
+                 'Aen={101380594:{rule:"always",value:!0}};')
+        report = {}
         out = core.insert_entries(table, 'var ken={',
                                   core.split_entries('857846362:{rule:"forced",value:!0},'),
-                                  report)
+                                  report, conflict='override')
         self.assertEqual(report['overridden'], ['857846362'])
-        # 覆盖项必须出现在官方定义之后，且在表内
-        official_pos = out.index('857846362:{rule:"forced",value:!1}')
-        ours_pos = out.index('857846362:{rule:"forced",value:!0}', official_pos)
-        self.assertGreater(ours_pos, official_pos)
-        _, end = core.table_bounds(out, 'var ken={')
-        self.assertLess(ours_pos, end)
-        # 解析后确实是我们想要的值
-        body = core.table_definition(out, 'var ken={', '857846362')
-        self.assertIn('value:!0', body)
+        self.assertIn('value:!0', core.table_definition(out, 'var ken={', '857846362'))
 
     def test_lookup_is_scoped_to_the_table(self):
         """同名键出现在另一张表里，不算本表已有。"""
@@ -701,17 +952,21 @@ class FutureBuildCompatibility(unittest.TestCase):
     TABLE = ('var ken={123929380:{rule:"forced",value:!0},'
              '857846362:{rule:"forced",value:!0}},Aen={101380594:{rule:"always",value:!0}};')
 
-    def test_override_is_placed_before_the_closing_brace_with_valid_separator(self):
+    def test_same_version_different_build_is_refused(self):
+        """版本号没变但构建变了：拒绝，不再按结构现场适配。"""
         import native_unlock as core
-        # 表末条目没有尾逗号时，追加覆盖项不能产生非法 JS
-        table = 'var ken={857846362:{rule:"forced",value:!1}},Aen={1:{rule:"always",value:!0}};'
-        out = core.insert_entries(table, 'var ken={',
-                                  core.split_entries('857846362:{rule:"forced",value:!0},'))
-        self.assertIn('value:!1},857846362:{rule:"forced",value:!0},}', out)
-        self.assertNotIn(',,', out)
-        # 覆盖项必须在表内
-        _, end = core.table_bounds(out, 'var ken={')
-        self.assertLess(out.index('value:!0}'), end)
+        with tempfile.TemporaryDirectory() as directory:
+            app = pathlib.Path(directory).resolve() / 'Claude.app'
+            (app / 'Contents').mkdir(parents=True)
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                'CFBundleIdentifier': 'com.anthropic.claudefordesktop',
+                'CFBundleShortVersionString': official.core.ADAPTER_31623['version']}))
+            with patch.object(core, 'discover_adapter') as discover, \
+                 patch.object(core, 'read_asar', return_value=(b'changed', {}, 0)), \
+                 patch.object(core, 'sha', return_value='different'):
+                with self.assertRaises(core.FingerprintMismatch):
+                    core.source_adapter(app)
+            discover.assert_not_called()
 
     def test_effective_definition_is_the_last_one(self):
         import native_unlock as core
@@ -737,8 +992,8 @@ class FutureBuildCompatibility(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '未生效'):
             official.verify_gates(self.TABLE, 'var ken={', entries)
 
-    def test_changed_build_with_same_version_falls_back_to_discovery(self):
-        """版本号没变但构建变了：不能套用旧锚点。"""
+    def test_changed_build_with_same_version_is_refused(self):
+        """版本号没变但构建变了：拒绝（旧行为是按结构现场适配）。"""
         import native_unlock as core
         with tempfile.TemporaryDirectory() as directory:
             app = pathlib.Path(directory).resolve() / 'Claude.app'
@@ -751,9 +1006,9 @@ class FutureBuildCompatibility(unittest.TestCase):
                  patch.object(core, 'discover_adapter', return_value={'discovered': True}) as discover, \
                  patch.object(core, 'read_asar', return_value=(b'changed', {}, 0)), \
                  patch.object(core, 'sha', return_value='different'):
-                adapter = core.source_adapter(app)
-            discover.assert_called_once()
-            self.assertTrue(adapter['discovered'])
+                with self.assertRaises(core.FingerprintMismatch):
+                    core.source_adapter(app)
+            discover.assert_not_called()
 
     def test_status_exposes_permission_regrant_hint(self):
         current = {'enabled': True, 'supported': True, 'patchRevision': official.PATCH_REVISION,

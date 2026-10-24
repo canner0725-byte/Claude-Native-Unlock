@@ -294,6 +294,16 @@ def verify_installed(app, record):
     core.run('codesign', '--verify', '--deep', '--strict', str(app))
 
 
+def host_machine():
+    """本机架构；单独成函数，测试可以换成确定值，不受宿主机影响。"""
+    return platform.machine()
+
+
+def host_mac_version():
+    """本机 macOS 版本；同上。"""
+    return platform.mac_ver()[0]
+
+
 def running(target, desktop):
     prefixes = [str(p / 'Contents') + '/' for p in (target, desktop)]
     return any(any(prefix in line for prefix in prefixes)
@@ -380,8 +390,9 @@ def enable(profile):
     if desktop_version not in SUPPORTED_DESKTOP_VERSIONS:
         raise ValueError('Desktop ' + desktop_version + ' 尚未适配；停止修改')
     check_idle(target, desktop)
-    if platform.machine() != 'arm64' or platform.mac_ver()[0] != '27.0.1':
-        raise ValueError('Only arm64 / macOS 27.0.1 verified; no modification')
+    # 已验证的系统范围跟着 Desktop 构建登记；CLI 适配器只描述二进制指纹。
+    core.check_platform(core.VERIFIED_SYSTEM.get(desktop_version),
+                        host_machine(), host_mac_version())
     verify_source(target, adapter)
     if state.stat().st_dev != target.parent.stat().st_dev:
         raise ValueError('Backup must be on the same volume')
@@ -455,9 +466,9 @@ def main():
         with (state / 'operation.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = {'status': status, 'enable': enable, 'restore': restore}[args.command](args.profile)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        core.emit(result)
     except Exception as exc:
-        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+        core.emit({'ok': False, 'error': str(exc)})
         sys.exit(1)
 
 

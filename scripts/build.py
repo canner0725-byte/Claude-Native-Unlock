@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import os
+import pathlib
 from pathlib import Path
 import plistlib
 import shutil
@@ -20,6 +21,47 @@ ARCHIVE_NAME = 'Claude-Native-Assistant'
 
 def run(*args):
     subprocess.run([str(a) for a in args], cwd=ROOT, check=True)
+
+
+def sign(app):
+    """用固定的本地身份签助手；没有身份就退回 ad-hoc。
+
+    这不只是省一次系统授权：登录钥匙串里的签名密码条目，ACL 认的是
+    **创建条目那个二进制**的指定要求。ad-hoc 的要求是 cdhash，重新构建
+    就变，用户每次更新助手都会被要求重新确认；固定身份的要求只跟证书
+    有关，重建多少次都不变。
+
+    私钥只在本机钥匙串里，构建脚本从不出售或导出它。
+    """
+    sys.path.insert(0, str(ROOT / 'src'))
+    # 必须走真实入口：直接 import 拿到的是仓库内的 work/，而签名身份在
+    # 用户数据目录里。漏了这一步会静默退回 ad-hoc，而且构建看起来是成功的。
+    import backend
+    backend.configure()
+    import native_unlock as core
+    identity = core.local_identity()
+    if identity:
+        # entitlements 是中间产物，写临时目录：仓库里不能留 work/
+        # （有测试守着这一点，因为那里以前泄漏过真实的签名身份）。
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='cnu-sign-') as work:
+            entitlements = pathlib.Path(work) / 'assistant-entitlements.plist'
+            entitlements.write_bytes(plistlib.dumps({
+                'com.apple.security.cs.allow-jit': True,
+                'com.apple.security.cs.disable-library-validation': True,
+            }))
+            try:
+                used = core.sign_app(app, entitlements)
+            except Exception:
+                used = None
+        if used:
+            print(f'已用本地身份签名：{used}')
+            return used
+        print('本地身份签名失败，退回 ad-hoc', file=sys.stderr)
+    else:
+        print('未建立本地签名身份，助手使用 ad-hoc 签名', file=sys.stderr)
+    run('/usr/bin/codesign', '--force', '--sign', '-', app)
+    return None
 
 
 def prune_artifacts():
@@ -100,8 +142,12 @@ def build():
         'NSHighResolutionCapable': True, 'LSMinimumSystemVersion': '15.0',
         'NSHumanReadableCopyright': 'Copyright © 2026 Claude Native Unlock contributors',
     }))
-    # Nested Python binaries are already ad-hoc signed by PyInstaller.
-    run('/usr/bin/codesign', '--force', '--sign', '-', app)
+    # 后端可执行文件要单独用固定身份签：登录钥匙串条目的 ACL 认的是
+    # **直接调用 Security 框架的那个进程**，也就是这个后端，而不是外层
+    # .app。只签外层时，后端每次重建都会换 cdhash，密码条目就又要重新确认。
+    sign(resources / 'Backend' / 'NativeUnlockBackend')
+    # 其余嵌套的 Python 二进制已由 PyInstaller 做过 ad-hoc 签名。
+    sign(app)
     run('/usr/bin/codesign', '--verify', '--deep', '--strict', app)
     archive = dist/f'{ARCHIVE_NAME}-{VERSION}-arm64.zip'
     if archive.exists():

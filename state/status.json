@@ -1,0 +1,186 @@
+{
+  "assistant": {
+    "version": "0.3.38",
+    "build": "51"
+  },
+  "protocol": 1,
+  "patchRevision": 14,
+  "cliAdapters": [
+    "2.1.295",
+    "2.1.299",
+    "2.1.304",
+    "2.1.308"
+  ],
+  "adapters": [
+    {
+      "version": "2.31226.1",
+      "asarHash": "e0f0a70911d2d206f17572e82636c80a15173281db4966a44c2558e8f8ae6bb8",
+      "main": ".vite/build/index.chunk-Cyt2WTko.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [],
+      "rendererGates": []
+    },
+    {
+      "version": "2.37337.1",
+      "asarHash": "82a54170115e3e20c9600a257a5b2679cbadb83f38baf5111235f123af484163",
+      "main": ".vite/build/index.chunk-BWk6pVUt.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2371478310",
+        "857846362",
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3264789062",
+        "3335190042",
+        "3858164079",
+        "1235690166"
+      ]
+    },
+    {
+      "version": "2.42304.0",
+      "asarHash": "e952a1c0f603e6c2f54f2fc9551843f6d7ccf9c73071a814e5ce4a49ee4c2f4d",
+      "main": ".vite/build/index.chunk-muI2IV6k.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2371478310",
+        "857846362",
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3264789062",
+        "3335190042",
+        "3858164079",
+        "1235690166"
+      ]
+    },
+    {
+      "version": "2.42304.0",
+      "asarHash": "bfa22ac393906762fa04b9607ff202907405b089c1ae7db257159202f31bb3d0",
+      "main": ".vite/build/index.chunk-muI2IV6k.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2371478310",
+        "857846362",
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3264789062",
+        "3335190042",
+        "3858164079",
+        "1235690166"
+      ]
+    },
+    {
+      "version": "2.42304.2",
+      "asarHash": "f0a063c8c2c7fb21eb51bca00f086e5b7355d7208e3d9f28600ea79961830907",
+      "main": ".vite/build/index.chunk-BkhOOUzl.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2371478310",
+        "857846362",
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3264789062",
+        "3335190042",
+        "3858164079",
+        "1235690166"
+      ]
+    },
+    {
+      "version": "3.1623.0",
+      "asarHash": "760e7cbb6f861f0bc0e71e71fd9c6b721ba735f0f638b6ea623645daff4261a7",
+      "main": ".vite/build/index.chunk-BLvpT1n4.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3858164079",
+        "1235690166"
+      ]
+    },
+    {
+      "version": "3.6556.2",
+      "asarHash": "d1315bccfdb85cfcd79fcc34f194f3a5154d383bff1518fde95d39e821e3852d",
+      "main": ".vite/build/index.chunk-jPKPzV-P.js",
+      "verifiedArchitecture": "arm64",
+      "verifiedSystem": "27.0.1",
+      "systemCeiling": "{major:27,minor:0}",
+      "mainGates": [
+        "2120747855"
+      ],
+      "rendererGates": [
+        "3858164079",
+        "1235690166",
+        "1282344890",
+        "3774822426",
+        "2280470525",
+        "69389141",
+        "3619252400",
+        "4000837158",
+        "273163521",
+        "2149681774",
+        "2697147784"
+      ]
+    }
+  ],
+  "configKeys": [
+    "file-analysis",
+    "browser",
+    "auto-approve",
+    "desktop-extensions",
+    "tool-search",
+    "webfetch-preflight"
+  ],
+  "uiRows": [
+    {
+      "id": "file-analysis",
+      "title": "Chat 与高级文件分析",
+      "group": "工作台"
+    },
+    {
+      "id": "browser",
+      "title": "官方内置浏览器",
+      "group": "工具与网络"
+    },
+    {
+      "id": "auto-approve",
+      "title": "Cowork 自动审批选项",
+      "group": "工具与网络"
+    },
+    {
+      "id": "desktop-extensions",
+      "title": "插件里的桌面扩展",
+      "group": "扩展与插件"
+    },
+    {
+      "id": "tool-search",
+      "title": "MCP 工具按需加载",
+      "group": "工具与网络"
+    },
+    {
+      "id": "webfetch-preflight",
+      "title": "WebFetch 免域名预检",
+      "group": "工具与网络"
+    },
+    {
+      "id": "code-auto-dream",
+      "title": "Code 自动整理",
+      "group": "Code"
+    }
+  ]
+}

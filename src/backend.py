@@ -8,6 +8,11 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import traceback
+
+# 协议版本和输出格式在引擎里定义，所有后端共用一套。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from native_unlock import PROTOCOL_VERSION, emit, envelope  # noqa: E402
 
 
 ROOT_NAME = 'Claude 原生助手'
@@ -137,7 +142,7 @@ def status_all():
         result['features'] = native_features.report(application)
     except Exception:
         result['features'] = {'error': '原生配置检测未完成；请重新检测。'}
-    return result
+    return envelope(result)
 
 
 def main():
@@ -150,7 +155,7 @@ def main():
         import native_features
         import native_cli_unlock
         if sys.argv[1:2] == ['status-all']:
-            print(json.dumps(status_all(), ensure_ascii=False))
+            emit(status_all())
             return
         routes = {'official_unlock': official_unlock.main,
                   'native_features': native_features.main,
@@ -162,10 +167,12 @@ def main():
         sys.argv = [sys.argv[0], *sys.argv[2:]]
         route()
     except ValueError as error:
-        print(json.dumps({'error': str(error)}, ensure_ascii=False))
+        emit({'error': str(error)})
         raise SystemExit(1)
     except Exception:
-        print(json.dumps({'error': '操作未完成；已保留备份，请重新检测。'}, ensure_ascii=False))
+        # 真正的 traceback 走 stderr；stdout 只留给界面能解析的 JSON。
+        traceback.print_exc()
+        emit({'error': '操作未完成；已保留备份，请重新检测。'})
         raise SystemExit(1)
 
 

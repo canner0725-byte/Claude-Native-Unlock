@@ -9,7 +9,9 @@
 不在这里实现任何 Computer Use、浏览器或模型功能，也不修改 Claude 的
 逐应用授权、系统权限、截图过滤、拒绝、中断或动作审查。
 """
-import hashlib, json, os, pathlib, plistlib, re, secrets, shutil, struct, subprocess, tempfile
+import hashlib, json, os, pathlib, plistlib, re, secrets, shutil, struct, subprocess, sys, tempfile
+
+import keychain
 
 # 源码仓库根目录。打包成独立助手后，backend.py 会把 WORK 指到用户数据目录，
 # 避免把备份写进只读或会被替换的应用包。
@@ -37,9 +39,58 @@ def sha(b):
     return hashlib.sha256(b).hexdigest()
 
 
-def run(*args):
-    """运行系统命令；失败时抛出异常，不吞掉错误。"""
-    return subprocess.run(args, check=True, capture_output=True)
+# 界面与后端之间的协议版本。只有字段含义变化或删字段时才加 1；
+# 单纯新增字段不加，旧界面会忽略不认识的字段。
+PROTOCOL_VERSION = 1
+
+
+def envelope(result):
+    """每个响应都带上协议版本，界面据此判断能否解析。"""
+    if isinstance(result, dict):
+        result.setdefault('protocol', PROTOCOL_VERSION)
+    return result
+
+
+def emit(result):
+    """把结果按协议打印成一行 JSON（界面只读标准输出）。"""
+    print(json.dumps(envelope(result), ensure_ascii=False))
+
+
+def run(*args, timeout=None):
+    """运行系统命令；失败时抛出异常，不吞掉错误。
+
+    timeout 只给“可能等用户点系统对话框”的命令用：这类命令没人点就会
+    永远卡住，宁可超时后明确报错，也不让后台线程无声挂死。
+    """
+    return subprocess.run(args, check=True, capture_output=True, timeout=timeout)
+
+
+class BuildRefused(ValueError):
+    """构建不符合写入条件；调用方应当拒绝修改，而不是换个办法继续。"""
+
+
+class UnregisteredBuild(BuildRefused):
+    """这个版本没有登记过固定指纹：只允许只读诊断，不允许补丁。"""
+
+
+class FingerprintMismatch(BuildRefused):
+    """版本号认识，但构建内容与登记的不一致：可能被改过，一律拒绝。"""
+
+
+class OfficialDefinitionConflict(BuildRefused):
+    """官方对目标门已有不同定义：停止，进入研究，绝不覆盖。"""
+
+    def __init__(self, key):
+        super().__init__('目标开关形状冲突，拒绝覆盖官方语义：' + key)
+        self.key = key
+
+
+class SyntaxCheckUnavailable(BuildRefused):
+    """找不到可用的语法检查器：按失败即拒绝，不写入。"""
+
+
+class SyntaxCheckFailed(BuildRefused):
+    """改动后的表达式语法不成立：拒绝写入。"""
 
 
 def read_asar(path):
@@ -245,6 +296,62 @@ ADAPTER_36556 = {
  }
 }
 
+# 已验证能安全写入的系统范围，按构建登记。空表示“还没有任何系统验证过”，
+# 未知构建永远不会进入写入路径。系统升级超出登记范围时保持官方行为，
+# 直到完成静态检查和真机回归——不随系统升级自动抬高。
+VERIFIED_SYSTEM = {
+    ADAPTER_31226['version']: ('arm64', (27, 0, 1)),
+    ADAPTER_37337['version']: ('arm64', (27, 0, 1)),
+    ADAPTER_42304['version']: ('arm64', (27, 0, 1)),
+    ADAPTER_42304_2['version']: ('arm64', (27, 0, 1)),
+    ADAPTER_31623['version']: ('arm64', (27, 0, 1)),
+    ADAPTER_36556['version']: ('arm64', (27, 0, 1)),
+}
+
+
+def verified_system(adapter):
+    """返回这套构建已验证的 (架构, 系统版本)；没登记就是 (None, None)。"""
+    return VERIFIED_SYSTEM.get(adapter['version'], (None, None))
+
+
+def system_name(value):
+    return '.'.join(str(part) for part in value) if value else '未知'
+
+
+def system_ceiling(adapter):
+    """Computer Use 的系统版本上限：等于这套构建已验证的 macOS 主/次版本。
+
+    上限只随登记表变化，不随系统升级自动抬高；系统升级后超出已验证范围
+    时保持官方行为，等静态检查和真机回归完成后再登记。
+    """
+    _, version = verified_system(adapter)
+    if version is None:
+        raise BuildRefused('这个构建没有登记已验证的系统版本；停止修改。')
+    return '{major:%d,minor:%d}' % (version[0], version[1])
+
+
+def check_platform(verified, machine, mac_version):
+    """架构和系统版本都必须在登记范围内，否则拒绝写入。
+
+    `verified` 是 (架构, 版本元组)；`machine`/`mac_version` 由调用方传入
+    （生产代码传 platform 的结果），这样测试可以在任何主机上给出确定的
+    结果，不受宿主机影响。
+    """
+    architecture, version = verified or (None, None)
+    if architecture is None:
+        raise BuildRefused('这个构建没有登记已验证的系统范围；停止修改。')
+    actual = tuple(int(part) for part in re.findall(r'\d+', mac_version or ''))[:3]
+    if machine != architecture or actual != tuple(version):
+        raise BuildRefused(
+            '当前适配仅验证 %s / macOS %s；检测到 %s / macOS %s，停止修改。'
+            % (architecture, system_name(version), machine or '未知', mac_version or '未知'))
+
+
+def check_system(adapter, machine, mac_version):
+    """Desktop 补丁的系统范围：按构建登记。"""
+    check_platform(verified_system(adapter), machine, mac_version)
+
+
 # 这些版本才有“新版 Code 工作台”相关界面；补丁 revision 5 起按版本判断。
 CODE_UI_VERSIONS = (ADAPTER_37337['version'], ADAPTER_42304['version'],
                     ADAPTER_42304_2['version'], ADAPTER_31623['version'],
@@ -407,17 +514,17 @@ def table_definition(text, anchor, key):
     raise ValueError('Unterminated gate definition: ' + key)
 
 
-def insert_entries(text, anchor, entries, report=None, conflict='override'):
+def insert_entries(text, anchor, entries, report=None, conflict='reject'):
     """把可用性条目写进功能表，返回 (新文本, 实际结果)。
 
     三种情况分开处理：
 
     - 表里没有这个键：插到表头。
     - 表里已有完全相同的定义：跳过，什么都不做。
-    - 表里已有不同定义：`conflict='override'` 时追加到**表尾**（对象字面量里
-      后出现的定义获胜，放在表头反而会被官方值覆盖）；`conflict='reject'`
-      时直接报错——渲染进程表里的 `when`/`follows` 条件表达官方语义，
-      覆盖它就等于改官方行为，必须拒绝。
+    - 表里已有不同定义：默认直接报错。官方对目标门有自己的定义
+      （强制关闭、`when`/`follows` 条件、下调的系统上限）时，覆盖它就等于
+      改官方行为，必须停下来进入研究。`conflict='override'` 只留给测试和
+      维护工具显式调用，生产路径不再使用。
 
     结果写进 report（若提供），用于安装记录和界面提示：
     `inserted` / `skipped` / `overridden`。
@@ -432,7 +539,7 @@ def insert_entries(text, anchor, entries, report=None, conflict='override'):
         elif current.replace(' ', '') == body.replace(' ', ''):
             result['skipped'].append(key)
         elif conflict == 'reject':
-            raise ValueError('目标开关形状冲突，拒绝覆盖官方语义：' + key)
+            raise OfficialDefinitionConflict(key)
         else:
             tail.append((key, body))
             result['overridden'].append(key)
@@ -468,11 +575,11 @@ DISCOVERY_CACHE = {}
 
 
 def discover_adapter(app):
-    """未登记版本：按官方身份和功能表结构现场生成适配器。
+    """未登记版本：按官方身份和功能表结构做**只读**定位。
 
-    这是给“官方又升级了”准备的兜底：只读结构，不猜语义。调用方仍然要先
-    通过官方签名校验；表找不到、表不唯一、或目标开关的现有形状和我们要写
-    的不一致，都会抛异常，不会修改应用。
+    只给诊断和维护工具用，不参与任何写入路径。补丁只认登记表里的固定
+    指纹：未知构建一律只诊断、不写入。调用方仍然要先通过官方签名校验；
+    表找不到、表不唯一都会抛异常。
     """
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     if info.get('CFBundleIdentifier') != 'com.anthropic.claudefordesktop':
@@ -538,50 +645,39 @@ def registered_adapter(app):
 
 
 def source_adapter(app):
-    """按版本和 ASAR 指纹选择适配器。
+    """按版本和 ASAR 指纹选择已登记的适配器；任何不符都拒绝。
 
-    已登记版本走固定指纹；未登记的新版本按官方身份和功能表结构现场识别，
-    这样官方再升级也不用等人改代码。识别不出来一律拒绝。
+    只认登记表里的固定指纹。版本没登记 → UnregisteredBuild（只允许只读诊断）；
+    版本登记了但构建内容不同 → FingerprintMismatch（可能被改过，绝不写入）。
+    不再按结构现场识别：自动适配会让“固定指纹”这条安全前提形同虚设。
     """
-    info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
-    version=info['CFBundleShortVersionString']
-    adapters=adapters_for_version(version)
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    version = info['CFBundleShortVersionString']
+    adapters = adapters_for_version(version)
     if not adapters:
-        try:
-            return discover_adapter(app)
-        except ValueError as error:
-            if 'Not the expected application' in str(error):
-                raise ValueError('Unknown version; no patch applied')
-            raise
-    if len(adapters) == 1:
-        # 只有一种已登记构建：仍要核对整包指纹。官方可能不升版本号就换构建，
-        # 此时按结构重新识别，而不是套用旧锚点。ASAR 读不出来就直接拒绝。
-        try:
-            b,_,_=read_asar(app/'Contents/Resources/app.asar')
-        except Exception:
-            raise ValueError('ASAR fingerprint mismatch; no patch applied')
-        if sha(b) == adapters[0]['asarHash']:
-            return adapters[0]
-        return _rediscover_or_refuse(app, 'ASAR fingerprint mismatch; no patch applied')
-    # 同一个版本号可能对应两种官方构建：官网 universal DMG 和更新器 arm64。
-    # 版本号相同，只能靠 ASAR 指纹区分，绝不能混用整包指纹。
+        raise UnregisteredBuild('Unknown version; no patch applied')
     try:
-        b,_,_=read_asar(app/'Contents/Resources/app.asar')
+        b, _, _ = read_asar(app / 'Contents/Resources/app.asar')
     except Exception:
-        raise ValueError('ASAR fingerprint mismatch; no patch applied')
-    digest=sha(b)
+        raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
+    digest = sha(b)
     for adapter in adapters:
         if digest == adapter['asarHash']:
             return adapter
-    return _rediscover_or_refuse(app, 'ASAR fingerprint mismatch; no patch applied')
+    # 同一版本号可能有多种官方构建（universal / arm64）；登记过的都不匹配就是不符。
+    raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
 
 
-def _rediscover_or_refuse(app, message):
-    """指纹对不上时尝试按结构重新识别；任何失败都回落到原来的拒绝。"""
-    try:
-        return discover_adapter(app)
-    except Exception:
-        raise ValueError(message)
+def verify_official_signature(app):
+    """只校验官方签名与签名有效性，不比对登记指纹。
+
+    恢复路径用它检查备份：备份可能来自已经淘汰的版本，但它的签名必须
+    仍然是 Anthropic 官方签名（TeamIdentifier=Q6L2SF6YDW）。
+    """
+    run('codesign','--verify','--deep','--strict',str(app))
+    signature=run('codesign','-dvv',str(app)).stderr.decode()
+    if 'TeamIdentifier=Q6L2SF6YDW' not in signature:
+        raise ValueError('Source is not signed by the expected official team')
 
 
 def verify_source(app, adapter=None):
@@ -589,24 +685,67 @@ def verify_source(app, adapter=None):
     adapter = adapter or source_adapter(app)
     b,h,base=read_asar(app/'Contents/Resources/app.asar')
     if sha(b) != adapter['asarHash']:
-        raise ValueError('ASAR fingerprint mismatch; no patch applied')
+        raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
     for p,digest in adapter['files'].items():
         if sha(content(b,h,base,p)) != digest:
-            raise ValueError('File fingerprint mismatch: '+p)
+            raise FingerprintMismatch('File fingerprint mismatch: '+p)
     for path,digest in adapter['sourceFiles'].items():
         if sha((app/path).read_bytes())!=digest:
-            raise ValueError('Source component fingerprint mismatch: '+path)
-    run('codesign','--verify','--deep','--strict',str(app))
-    signature=run('codesign','-dvv',str(app)).stderr.decode()
-    if 'TeamIdentifier=Q6L2SF6YDW' not in signature:
-        raise ValueError('Source is not signed by the expected official team')
+            raise FingerprintMismatch('Source component fingerprint mismatch: '+path)
+    verify_official_signature(app)
     return b,h,base
 
 
-def check_js(text):
-    """本机有 node 时对改过的 JS 做一次语法检查，没有就跳过。
+JSC_CANDIDATES = (
+    '/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc',
+    '/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc',
+)
 
-    这是给“未登记版本自动适配”加的一道保险：语法不成立就绝不安裝。
+
+def javascript_core():
+    """系统自带的 JavaScriptCore 命令行；没有就返回 None。"""
+    for candidate in JSC_CANDIDATES:
+        if pathlib.Path(candidate).exists():
+            return candidate
+    return None
+
+
+def check_table_syntax(text, anchor):
+    """用系统自带的 JavaScriptCore 只解析被改动的那张表，失败即拒绝。
+
+    不依赖用户机器上的 node：检查器随 macOS 提供。这里只编译、不执行
+    （`checkSyntax` 在解析阶段就返回），所以表里即使混进未知内容也不会
+    运行。找不到检查器同样拒绝写入——没有检查就不写。
+    """
+    jsc = javascript_core()
+    if jsc is None:
+        raise SyntaxCheckUnavailable('缺少系统自带的 JavaScriptCore；停止写入。')
+    start, end = table_bounds(text, anchor)
+    source = 'var __table=' + text[start:end] + ';'
+    work = pathlib.Path(tempfile.mkdtemp(prefix='syntax-'))
+    try:
+        target = work / 'table.js'
+        target.write_text(source, encoding='utf-8')
+        script = 'checkSyntax(' + json.dumps(str(target)) + ');'
+        try:
+            run(jsc, '-e', script)
+        except subprocess.CalledProcessError as error:
+            # jsc 把 SyntaxError 写到 stdout，把崩溃类信息写到 stderr，两处都看。
+            detail = ((error.stdout or b'') + (error.stderr or b'')).decode(
+                'utf-8', 'replace').strip()
+            # 只回显解析器报错的第一行（形如 `Exception: SyntaxError: …`），
+            # 不带源码内容。
+            first = detail.splitlines()[0][:160] if detail else '未知语法错误'
+            raise SyntaxCheckFailed('改动后的功能表语法不成立；停止写入：' + first)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def check_js(text):
+    """有 node 时再对整份 JS 做一次语法检查；没有 node 不视为通过。
+
+    主检查是 check_table_syntax（系统 JavaScriptCore，必须通过）。这里
+    只是额外一层：装了 node 就用它复核整份文件，能发现表以外的损坏。
     """
     node = shutil.which('node')
     if not node:
@@ -658,9 +797,111 @@ def remove_path(path):
 
 
 def signing_paths():
-    """本地签名身份的存放位置；随 WORK 一起落在用户数据目录。"""
+    """本地签名身份的存放位置；随 WORK 一起落在用户数据目录。
+
+    密码**不**再落盘：存在登录钥匙串的通用密码条目里，读取时由系统
+    向用户确认（Touch ID 或登录密码）。原来的 `password` 文件只在迁移时
+    读一次，迁移成功后删除。
+    """
     root = WORK / 'signing'
     return root, root / 'identity.keychain', root / 'password', root / 'identity.txt'
+
+
+# 登录钥匙串里保存签名钥匙串密码的条目。由助手后端自己写入，系统默认
+# 的 ACL 只信任创建它的那个可执行文件，别的程序读取会弹系统确认。
+SIGNING_SERVICE = 'Claude 原生助手 签名钥匙串'
+SIGNING_ACCOUNT = 'local-signing'
+
+
+def _keychain_password():
+    """从登录钥匙串读签名钥匙串密码；取不到返回 None。
+
+    已实测：走 `/usr/bin/security` 读不到——ACL 认的是调用进程，
+    而 `security` 不是受信任的那个程序，只会弹确认框然后卡住。所以这里
+    直接用 Security 框架，由后端自己读，命中创建者身份时不需要确认。
+    """
+    try:
+        return keychain.read(SIGNING_SERVICE, SIGNING_ACCOUNT) or None
+    except Exception:
+        return None
+
+
+def keychain_writer_is_trustworthy():
+    """只有固定身份签名的助手后端可以写密码条目；返回 (是否可以, 原因)。
+
+    这是本文件里最重要的一道闸。钥匙串 ACL 认的是**写入进程**的签名，
+    所以如果从开发用的解释器（`.venv/bin/python`、`/usr/bin/python3`）
+    执行迁移，条目就会信任那个解释器——等于任何 Python 脚本都能读到签名
+    密码，比原来的明文文件还糟。实测确认了 ACL 就是按调用进程判定的。
+
+    判定看**签名**而不是路径：ACL 本身也只认签名，按路径判断既会误伤
+    （换个安装位置就写不了）也会漏判（同路径换成别的程序）。所以要求
+    当前可执行文件的指定要求是 `certificate root = H"<本地身份>"`，
+    而不是 ad-hoc 的 cdhash——后者重建即失效，用户会被反复要求确认。
+    """
+    executable = pathlib.Path(sys.executable).resolve()
+    requirement = app_signing_identity(executable)
+    if not requirement:
+        return False, '当前进程是 ad-hoc 签名，重建后条目会失效'
+    identity = local_identity()
+    if not identity:
+        return False, '本机还没有固定签名身份'
+    if requirement != identity:
+        return False, ('当前进程的签名身份与本地身份不一致（' + requirement[:12] +
+                       '…），写入会把密码交给另一个程序')
+    return True, ''
+
+
+def store_keychain_password(password):
+    """把签名钥匙串密码写进登录钥匙串，并删掉原来的明文文件。
+
+    条目必须由本进程写：`security add-generic-password -T …` 只能把信任
+    指向某个路径下的程序，而调用者始终是 `security` 自己——实测把
+    `/usr/bin/security` 写进信任列表后，任何程序都能直接读到密码。
+    """
+    allowed, reason = keychain_writer_is_trustworthy()
+    if not allowed:
+        raise ValueError('拒绝把签名密码写入钥匙串：' + reason)
+    _, _, password_file, _ = signing_paths()
+    if keychain.store(SIGNING_SERVICE, SIGNING_ACCOUNT, password) != keychain.ERR_SEC_SUCCESS:
+        raise ValueError('登录钥匙串拒绝保存签名密码')
+    password_file.unlink(missing_ok=True)
+
+
+def migrate_keychain_password():
+    """把旧版留下的明文密码搬进钥匙串；返回是否发生过迁移。
+
+    读不到旧文件就当作已经迁移过；写入失败时保留旧文件，让签名照常可用，
+    并返回 False——宁可暂时保留旧行为，也不能让用户签不了名。
+    """
+    _, _, password_file, _ = signing_paths()
+    if not password_file.exists():
+        return False
+    password = password_file.read_text().strip()
+    if not password:
+        return False
+    try:
+        store_keychain_password(password)
+    except Exception:
+        return False
+    return True
+
+
+def signing_password_location():
+    """报告签名密码现在存在哪，不读密码本身。
+
+    只做只读判断，可以在状态检测里调用：钥匙串条目的存在与否由系统
+    回答，不触发任何确认框。
+    """
+    _, _, password_file, _ = signing_paths()
+    if password_file.exists():
+        return 'plaintext'
+    try:
+        if keychain.exists(SIGNING_SERVICE, SIGNING_ACCOUNT):
+            return 'keychain'
+    except Exception:
+        pass
+    return 'missing'
 
 
 def local_identity():
@@ -668,8 +909,8 @@ def local_identity():
 
     只读一个小标记文件，不访问钥匙串，所以可以在每次状态检测里调用。
     """
-    _, keychain, _, marker = signing_paths()
-    if not keychain.exists() or not marker.exists() or marker.is_symlink():
+    _, keychain_path, _, marker = signing_paths()
+    if not keychain_path.exists() or not marker.exists() or marker.is_symlink():
         return None
     value = marker.read_text().strip()
     return value or None
@@ -684,13 +925,13 @@ def create_local_identity():
     existing = local_identity()
     if existing:
         return existing
-    root, keychain, password_file, marker = signing_paths()
+    root, keychain_path, password_file, marker = signing_paths()
     if not pathlib.Path('/usr/bin/openssl').exists():
         return None
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     # 标记文件丢失但钥匙串还在（上次中断）时先清干净，否则 create-keychain 会失败。
-    if keychain.exists():
-        remove_path(keychain)
+    if keychain_path.exists():
+        remove_path(keychain_path)
     password = secrets.token_urlsafe(24)
     work = pathlib.Path(tempfile.mkdtemp(prefix='identity-'))
     try:
@@ -705,16 +946,16 @@ def create_local_identity():
         # 直接导入 PEM，省掉 PKCS#12 的加密格式兼容问题。
         combined.write_bytes((work / 'key.pem').read_bytes()
                              + (work / 'cert.pem').read_bytes())
-        run('/usr/bin/security', 'create-keychain', '-p', password, str(keychain))
-        run('/usr/bin/security', 'set-keychain-settings', '-l', '-u', str(keychain))
-        run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain))
-        run('/usr/bin/security', 'import', str(combined), '-k', str(keychain),
+        run('/usr/bin/security', 'create-keychain', '-p', password, str(keychain_path))
+        run('/usr/bin/security', 'set-keychain-settings', '-l', '-u', str(keychain_path))
+        run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain_path))
+        run('/usr/bin/security', 'import', str(combined), '-k', str(keychain_path),
             '-f', 'pemseq', '-T', '/usr/bin/codesign')
         # 允许 codesign 无提示使用私钥；否则每次签名都会弹权限对话框。
         run('/usr/bin/security', 'set-key-partition-list',
-            '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain))
+            '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain_path))
         listing = run('/usr/bin/security', 'find-identity', '-p', 'codesigning',
-                      str(keychain)).stdout.decode()
+                      str(keychain_path)).stdout.decode()
         digest = next((line.split()[1] for line in listing.splitlines()
                        if IDENTITY_COMMON_NAME in line), None)
         if not digest:
@@ -722,17 +963,26 @@ def create_local_identity():
         # security 输出大写、codesign 的指定要求用小写；统一成小写，
         # 否则“身份是否变化”会永远判成变了，界面就会一直提示更新。
         digest = digest.lower()
-        password_file.write_text(password + '\n')
-        os.chmod(password_file, 0o600)
+        # 密码只进登录钥匙串，不落盘；钥匙串本身用 -l 在闲置后自动锁上。
+        try:
+            store_keychain_password(password)
+        except Exception:
+            # 存不进钥匙串时退回旧行为（0600 文件），否则这把身份以后就签不了名。
+            password_file.write_text(password + '\n')
+            os.chmod(password_file, 0o600)
         marker.write_text(digest + '\n')
         os.chmod(marker, 0o600)
         return digest
     except Exception:
         # 建不出来就退回 ad-hoc：功能不受影响，只是更新后要重新授权。
-        for path in (keychain, pathlib.Path(str(keychain) + '-db')):
+        for path in (keychain_path, pathlib.Path(str(keychain_path) + '-db')):
             remove_path(path)
         password_file.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)
+        try:
+            keychain.delete(SIGNING_SERVICE, SIGNING_ACCOUNT)
+        except Exception:
+            pass
         return None
     finally:
         remove_path(work)
@@ -755,19 +1005,45 @@ def app_signing_identity(app):
     return match.group(1).lower() if match else None
 
 
+def signing_password():
+    """取签名钥匙串的密码：优先登录钥匙串，旧版的明文文件只作迁移期兜底。"""
+    value = _keychain_password()
+    if value:
+        return value
+    _, _, password_file, _ = signing_paths()
+    if password_file.exists() and not password_file.is_symlink():
+        return password_file.read_text().strip() or None
+    return None
+
+
 def sign_app(app, entitlements_path):
-    """用固定的本地身份签名；没有身份时退回 ad-hoc，并返回实际用到的身份。"""
+    """用固定的本地身份签名；没有身份时退回 ad-hoc，并返回实际用到的身份。
+
+    解锁只发生在签名这一刻，签完立刻重新锁上：密码在内存里停留的时间
+    就是一次 codesign 的时长，平时钥匙串是锁着的。
+    """
     identity = local_identity()
     if identity:
+        keychain_path = signing_paths()[1]
+        unlocked = False
         try:
-            _, keychain, password_file, _ = signing_paths()
-            run('/usr/bin/security', 'unlock-keychain', '-p',
-                password_file.read_text().strip(), str(keychain))
+            password = signing_password()
+            if not password:
+                raise ValueError('取不到签名钥匙串密码')
+            run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain_path))
+            unlocked = True
             run('/usr/bin/codesign', '--force', '--sign', identity,
-                '--keychain', str(keychain), '--options', 'runtime',
+                '--keychain', str(keychain_path), '--options', 'runtime',
                 '--entitlements', str(entitlements_path), str(app))
         except Exception:
             identity = None
+        finally:
+            if unlocked:
+                # 锁失败不影响已完成的签名；这里只是尽量缩短暴露时间。
+                try:
+                    run('/usr/bin/security', 'lock-keychain', str(keychain_path))
+                except Exception:
+                    pass
     if not identity:
         run('/usr/bin/codesign', '--force', '--sign', '-', '--options', 'runtime',
             '--entitlements', str(entitlements_path), str(app))

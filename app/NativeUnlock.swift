@@ -1,6 +1,12 @@
 import AppKit
 import CoreText
 
+/// 界面与后端之间的协议版本。后端新增字段不需要改这里；
+/// 只有后端改了字段含义或删字段时才加 1，界面据此提示更新助手。
+enum BackendProtocol {
+    static let version = 1
+}
+
 // 一个窗口 + 菜单栏入口的小工具。
 // 所有真正的补丁操作都在内置 Python 后端里完成；这里只负责显示状态、
 // 收集用户意图，并把后端返回的 JSON 转成中文提示。
@@ -1044,6 +1050,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 滚动日志：后端出错时写入一行，供“导出诊断”使用。
+    ///
+    /// 只写命令、耗时、退出码和 stderr 末尾，不写配置内容、密钥或 API 地址。
+    /// 单文件超过 512 KB 时轮换到 operations.log.1，最多保留两份。
+    func appendLog(_ line: String) {
+        let file = storageURL.appendingPathComponent("logs/operations.log")
+        let manager = FileManager.default
+        try? manager.createDirectory(at: file.deletingLastPathComponent(),
+                                     withIntermediateDirectories: true)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let text = "\(stamp) \(line)\n"
+        if let size = try? manager.attributesOfItem(atPath: file.path)[.size] as? Int,
+           size > 512 * 1024 {
+            let rotated = file.deletingLastPathComponent().appendingPathComponent("operations.log.1")
+            try? manager.removeItem(at: rotated)
+            try? manager.moveItem(at: file, to: rotated)
+        }
+        if let handle = try? FileHandle(forWritingTo: file) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: file)
+        }
+    }
+
+    /// 后端崩溃时 stderr 是唯一的线索；截断到最后的 4 KB 并去掉换行。
+    func stderrTail(_ data: Data) -> String {
+        let slice = data.suffix(4096)
+        let text = String(decoding: slice, as: UTF8.self)
+            .replacingOccurrences(of: "\n", with: " ⏎ ")
+            .trimmingCharacters(in: .whitespaces)
+        return text
+    }
+
     func recordQuit(_ stage: String, _ detail: String = "") {
         let record: [String: Any] = [
             "date": ISO8601DateFormatter().string(from: Date()),
@@ -1515,8 +1556,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             process.currentDirectoryURL = self.storageURL
             let output = Pipe()
+            let errors = Pipe()
             process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
+            // 后端的 Python traceback、PyInstaller 启动错误只会走 stderr；
+            // 丢掉它等于把唯一的排查线索也丢掉。
+            process.standardError = errors
 
             // 只读检测最多等 30 秒；安装、恢复和诊断不设这个期限。
             let timeoutLock = NSLock()
@@ -1531,25 +1575,66 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             var result: [String: Any] = ["error": "无法运行本地补丁工具。"]
+            var failure: String?
+            let started = Date()
             do {
                 try process.run()
                 if command == "status" || command == "status-all" {
                     DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30, execute: deadline)
                 }
                 try output.fileHandleForWriting.close()
+                try errors.fileHandleForWriting.close()
+                // 两个管道要并行读：只读 stdout 时，stderr 写满缓冲区会互相卡住。
+                var errorData = Data()
+                let errorGroup = DispatchGroup()
+                errorGroup.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    errorData = errors.fileHandleForReading.readDataToEndOfFile()
+                    errorGroup.leave()
+                }
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                if let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                errorGroup.wait()
+                if let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     result = value
+                } else if !data.isEmpty {
+                    failure = "后端返回的内容无法解析。"
+                    self.appendLog("decode-failed \(backend) \(command) bytes=\(data.count) "
+                                   + "stderr=\(self.stderrTail(errorData))")
                 }
-            } catch { }
+                let status = process.terminationStatus
+                if result["error"] == nil {
+                    self.appendLog("ok \(backend) \(command) exit=\(status) "
+                                   + "ms=\(Int(Date().timeIntervalSince(started) * 1000))")
+                } else {
+                    self.appendLog("error \(backend) \(command) exit=\(status) "
+                                   + "message=\(result["error"] as? String ?? "") "
+                                   + "stderr=\(self.stderrTail(errorData))")
+                }
+                if let failure { result = ["error": failure] }
+            } catch {
+                self.appendLog("launch-failed \(backend) \(command) \(error.localizedDescription)")
+                result = ["error": "无法运行本地补丁工具。"]
+            }
 
             deadline.cancel()
             timeoutLock.lock()
             let timedOut = detectionTimedOut
             timeoutLock.unlock()
             if timedOut {
-                result = ["error": "文件读取等待超时，已取消只读检测。可处理系统提示后重新检测，或在终端运行检测命令。"]
+                self.appendLog("timeout \(backend) \(command) after=30s")
+                result = ["error": "检测超时（30 秒），已取消这次只读检测；请重新检测。"]
+            }
+
+            // 协议版本：后端新增字段时界面照常工作；界面比后端新时明确提示，
+            // 而不是把“不认识”显示成错误状态。
+            if let version = result["protocol"] as? Int {
+                if version > BackendProtocol.version {
+                    result = ["error": "内置补丁组件版本比界面新；请更新助手后再操作。"]
+                }
+            } else if result["error"] == nil {
+                // 老后端不带协议号：照常使用，但记一笔，方便排查。
+                self.appendLog("no-protocol \(backend) \(command)")
             }
 
             let finished = result

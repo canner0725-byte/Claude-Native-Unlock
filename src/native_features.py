@@ -524,13 +524,13 @@ def main():
             if args.command != 'status' and not args.feature:
                 raise ValueError('请指定要操作的功能。')
             result = report() if args.command == 'status' else change(args.feature, args.command == 'restore')
-        print(json.dumps(result, ensure_ascii=False))
+        official.core.emit(result)
     except Exception as error:
         message = str(error) if isinstance(error, ValueError) else '操作未完成；保留配置和恢复记录，请重新检测。'
         # JSON errors and subprocess output may contain credentials: never echo them.
         if isinstance(error, json.JSONDecodeError):
             message = '配置或恢复记录格式异常；停止操作。'
-        print(json.dumps({'error': message}, ensure_ascii=False))
+        official.core.emit({'error': message})
         sys.exit(1)
 
 

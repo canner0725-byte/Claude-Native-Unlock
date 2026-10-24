@@ -68,6 +68,16 @@ def running():
     return any(prefix in line for line in core.run('ps', '-axo', 'comm=').stdout.decode().splitlines())
 
 
+def host_machine():
+    """本机架构；单独成函数，测试可以换成确定值，不受宿主机影响。"""
+    return platform.machine()
+
+
+def host_mac_version():
+    """本机 macOS 版本；同上。"""
+    return platform.mac_ver()[0]
+
+
 def manifest():
     """读取本工具自己的安装记录；没有就返回 None。"""
     path = STATE / 'manifest.json'
@@ -126,21 +136,67 @@ def config_keys():
     return keys
 
 
+def original_build(app):
+    """记录恢复所需的全部官方指纹；写入安装记录，恢复时以它为准。
+
+    恢复不能依赖内置登记表：只要这份记录还在，任何已安装过的构建都能
+    还原成官方原版，即使那个版本后来从登记表里删掉了。
+    """
+    b, header, base = core.read_asar(app / ASAR)
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    files = {}
+    for path, child in core.packed_js(header):
+        if int(child.get('size', 0)) <= core.PACKED_LIMIT:
+            files[path] = core.sha(core.content(b, header, base, path))
+    source = {}
+    for path in ('Contents/Info.plist', 'Contents/MacOS/Claude', *[
+            item for item in DIAGNOSTIC_SOURCE_FILES if item not in
+            ('Contents/Info.plist', 'Contents/MacOS/Claude')]):
+        target = app / path
+        if target.is_file():
+            source[path] = core.sha(target.read_bytes())
+    return {
+        'version': info.get('CFBundleShortVersionString'),
+        'asarHash': core.sha(b),
+        'files': files,
+        'sourceFiles': source,
+    }
+
+
 def verify_backup(data, version=None):
-    """备份必须在本工具目录内、版本和构建一致、通过官方签名与指纹校验。"""
+    """备份必须在本工具目录内、通过官方签名，并与安装记录的原始指纹一致。
+
+    判断基准是安装记录里保存的 `original`（启用时读到的官方构建指纹），
+    不是内置登记表：登记表会随版本淘汰，记录不会。签名仍然必须来自官方
+    （TeamIdentifier），所以被替换过的备份依旧会被拒绝。
+    """
     backup = pathlib.Path(data['backup'])
     if (backup.parent != STATE or not backup.name.startswith('official-backup-')
             or backup.resolve() != backup.absolute()):
         raise ValueError('备份路径异常；停止操作。')
-    core.verify_source(backup)
-    adapter = core.registered_adapter(backup)
+    core.verify_official_signature(backup)
     expected = data.get('version', core.VERSION)
-    if adapter['version'] != expected or (version is not None and adapter['version'] != version):
+    info = plistlib.loads((backup / 'Contents/Info.plist').read_bytes())
+    if info.get('CFBundleShortVersionString') != expected or (
+            version is not None and expected != version):
         raise ValueError('备份版本与安装记录或当前 Claude 不一致；停止操作。')
-    # 同一版本号可能有两种官方构建；不能拿另一种构建的备份覆盖当前安装。
-    original = core.installed_build(data)
-    if original is not None and adapter['asarHash'] != original['asarHash']:
-        raise ValueError('备份与当前安装的官方构建不一致；停止操作。')
+    original = data.get('original')
+    if not original:
+        # 旧记录没有保存原始指纹：用可信备份本身补一份并写回记录，
+        # 之后恢复就不再依赖内置登记表，也不会因为版本被淘汰而失效。
+        original = original_build(backup)
+        data['original'] = original
+        try:
+            if STATE.is_dir() and not STATE.is_symlink():
+                save(data)
+        except OSError:
+            pass
+    if core.sha((backup / ASAR).read_bytes()) != original['asarHash']:
+        raise ValueError('备份与安装记录的官方构建不一致；停止操作。')
+    for path, digest in (original.get('sourceFiles') or {}).items():
+        target = backup / path
+        if not target.is_file() or core.sha(target.read_bytes()) != digest:
+            raise ValueError('备份的官方组件与安装记录不一致；停止操作：' + path)
     return backup
 
 
@@ -202,6 +258,9 @@ def status():
             # 否则旧安装会一直停在 ad-hoc 签名上，每次更新都得重新授权。
             result['signingUpdateAvailable'] = (
                 data.get('signingIdentity') != core.local_identity())
+            # 密码该在登录钥匙串里。迁移没成功时仍会退回 0600 明文文件，
+            # 这是旧行为，必须让用户看得见，而不是悄悄继续。
+            result['signingPasswordLocation'] = core.signing_password_location()
             # 补丁签名和本地身份一致时，重打补丁不会改变系统授权；
             # 否则（官方升级后重签）这次需要重新授权一次。
             result['permissionReGrantLikely'] = bool(
@@ -225,10 +284,21 @@ def status():
             adapter = core.source_adapter(TARGET)
             core.verify_source(TARGET, adapter)
             result.update(supported=True, message='未开启 · 官方原版校验通过')
-            if adapter.get('discovered'):
-                # 未登记的新版本：官方身份和功能表结构都对得上，可以解锁。
-                result['structuralAdaptation'] = True
-                result['message'] = '未登记版本 · 结构匹配，可以解锁'
+    except core.UnregisteredBuild:
+        # 未知构建只诊断、不写入：给出可交给维护侧的只读报告入口。
+        result['diagnoseAvailable'] = bool(detected_version)
+        result['unregisteredBuild'] = True
+        if detected_version is not None and not result['enabled']:
+            result['message'] = (
+                f'检测到 Claude {detected_version}，这个构建尚未登记规则；'
+                '只做只读诊断，不会修改 Claude。'
+            )
+        else:
+            result['message'] = '版本尚未登记；只做只读诊断，不会修改 Claude。'
+    except core.FingerprintMismatch:
+        result['buildMismatch'] = True
+        result['diagnoseAvailable'] = bool(detected_version)
+        result['message'] = '构建与登记不一致；已停止修改。请重新安装官方 Claude 或交给维护侧核对。'
     except Exception:
         if detected_version is not None and not result['enabled']:
             result['message'] = (
@@ -270,12 +340,12 @@ def build(app):
     original, header, base = core.verify_source(app, adapter)
     data = bytearray(original[base:])
 
-    # Computer Use 基础开关、后台模式、macOS 上限，以及各版本自己的可用性条件。
-    # 官方已强制成同样形状的跳过；形状不同就追加到表尾覆盖（后定义获胜），
-    # 这样官方改了自己的取值时，我们的解锁依然生效。
+    # Computer Use 基础开关、系统版本上限（按登记范围计算），以及各版本自己
+    # 的可用性条件。两张表都只做“不存在才插入”：官方已有相同定义时跳过，
+    # 有不同定义时停止——覆盖官方取值等于改官方行为。
     entries = core.split_entries(
         '1291166712:{rule:"forced",value:{enabled:!0,appScopedEnabled:!0}},'
-        '1346958739:{rule:"forced",value:{major:27,minor:0}},'
+        '1346958739:{rule:"forced",value:' + core.system_ceiling(adapter) + '},'
         + core.main_availability(adapter)
     )
     gates = {}
@@ -289,13 +359,19 @@ def build(app):
             # 定时任务开关”）。同形状跳过，形状不同一律拒绝，绝不覆盖。
             changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
                                           web_entries, gates, conflict='reject')
-            verify_gates(changed, adapter['webFeatureAnchor'], web_entries)
-        # 改完先过一遍语法检查，避免把 Claude 写成打不开的应用。
-        core.check_js(changed)
+        # 改完先用系统自带的 JavaScriptCore 只解析被改动的两张表：语法不成立
+        # 就绝不安装（找不到检查器同样拒绝）。
+        core.check_table_syntax(changed, adapter['featureAnchor'])
+        if web_entries:
+            core.check_table_syntax(changed, adapter['webFeatureAnchor'])
         # 语法通过还不够：再读回表里**实际生效**的那一份定义，确认每个目标
         # 开关真的解析成我们写的值。官方改了形状或换了取值时，这里会先失败，
         # 而不是装完才发现“入口在、开关没开”。
         verify_gates(changed, adapter['featureAnchor'], entries)
+        if web_entries:
+            verify_gates(changed, adapter['webFeatureAnchor'], web_entries)
+        # 装了 node 时再把整份文件复核一遍，能发现表以外的损坏；没有 node 不影响。
+        core.check_js(changed)
         new = changed.encode()
         node = core.node(header, path)
         node['offset'], node['size'] = str(len(data)), len(new)
@@ -339,10 +415,38 @@ def prepare_identity():
     """第一次打补丁时建立固定的本地签名身份；建不出来就退回 ad-hoc。
 
     只影响“更新后要不要重新授权系统权限”，不影响补丁能否使用，
-    所以这里失败不报错，交给签名环节自动降级。
+    所以这里失败不报错，交给签名环节自动降级。旧版把密码明文放在签名
+    目录里，这里顺手搬进登录钥匙串；搬不进去就保留原文件继续用。
     """
     if core.local_identity() is None:
         core.create_local_identity()
+    core.migrate_keychain_password()
+
+
+def migrate_password():
+    """把签名密码从明文文件搬进登录钥匙串；已迁移时什么也不做。
+
+    单独做成命令，是因为“已是最新 revision 且签名没变”时 update() 会直接
+    返回，不会走到 prepare_identity()，用户就没有任何入口触发迁移。这条
+    命令只动密码存放位置，不碰 /Applications、不改补丁、不重新签名。
+    """
+    before = core.signing_password_location()
+    if before == 'keychain':
+        return {'migrated': False, 'location': 'keychain',
+                'message': '签名密码已在登录钥匙串里，无需迁移。'}
+    if before == 'missing':
+        return {'migrated': False, 'location': 'missing',
+                'message': '没有找到签名密码；下次签名会退回 ad-hoc。'}
+    allowed, reason = core.keychain_writer_is_trustworthy()
+    if not allowed:
+        # 闸门挡住时保留明文文件，签名照常可用；说清楚为什么不做。
+        return {'migrated': False, 'location': before, 'blocked': True,
+                'message': '暂时不能迁移：' + reason + '。明文文件已保留，签名仍可用。'}
+    if not core.migrate_keychain_password():
+        return {'migrated': False, 'location': before, 'blocked': True,
+                'message': '登录钥匙串拒绝保存；明文文件已保留，签名仍可用。'}
+    return {'migrated': True, 'location': core.signing_password_location(),
+            'message': '签名密码已搬进登录钥匙串，明文文件已删除。'}
 
 
 def clone(source, destination):
@@ -389,9 +493,9 @@ def enable():
 
     check_idle()
     prepare_identity()
-    if platform.machine() != 'arm64' or platform.mac_ver()[0] != '27.0.1':
-        raise ValueError('当前适配仅验证 arm64 / macOS 27.0.1；停止修改。')
-    core.verify_source(TARGET)
+    adapter = core.source_adapter(TARGET)
+    core.check_system(adapter, host_machine(), host_mac_version())
+    core.verify_source(TARGET, adapter)
     if STATE.stat().st_dev != TARGET.parent.stat().st_dev:
         raise ValueError('备份与应用不在同一卷；无法执行可恢复替换。')
     if shutil.disk_usage(STATE).free < 2_000_000_000:
@@ -400,12 +504,15 @@ def enable():
     stamp = str(time.time_ns())
     stage = STATE / ('prepared-' + stamp + '.app')
     backup = STATE / ('official-backup-' + stamp + '.app')
+    # 先记下官方原版的完整指纹：恢复以记录为准，不依赖内置登记表。
+    original = original_build(TARGET)
     clone(TARGET, stage)
     installed, gates = build(stage)
     record = {
-        'version': core.source_adapter(TARGET)['version'],
+        'version': adapter['version'],
         'patchRevision': PATCH_REVISION,
         'backup': str(backup),
+        'original': original,
         'installedFiles': installed,
         'backgroundExperimental': True,
         'phase': 'prepared',
@@ -420,7 +527,7 @@ def enable():
             json.dumps(previous, indent=2) + '\n')
     save(record)
 
-    core.verify_source(TARGET)
+    core.verify_source(TARGET, adapter)
     check_idle()
     TARGET.rename(backup)
     try:
@@ -449,8 +556,11 @@ def update():
     previous = manifest()
     if previous is None:
         raise ValueError('缺少安装记录；请先恢复官方原版并重新安装。')
-    if platform.machine() != 'arm64' or platform.mac_ver()[0] != '27.0.1':
-        raise ValueError('当前适配仅验证 arm64 / macOS 27.0.1；停止修改。')
+    # 目标已经是补丁版，ASAR 与官方指纹必然不同，不能拿它去认适配器；
+    # 系统范围按安装记录里的版本查。版本没登记就拒绝更新。
+    core.check_platform(
+        core.VERIFIED_SYSTEM.get(previous.get('version') or current.get('version')),
+        host_machine(), host_mac_version())
 
     backup = verify_backup(previous, current['version'])
     verify_patched(TARGET, previous)
@@ -460,11 +570,14 @@ def update():
     stamp = str(time.time_ns())
     stage = STATE / ('upgrade-prepared-' + stamp + '.app')
     retired = STATE / ('retired-patched-' + stamp + '.app')
+    # 旧记录没有 `original` 时，从可信备份补上；恢复从此不再依赖登记表。
+    original = previous.get('original') or original_build(backup)
     clone(backup, stage)
     installed, gates = build(stage)
     old = effective_record(TARGET, previous)
     record = dict(
         previous,
+        original=original,
         installedFiles=installed,
         patchRevision=PATCH_REVISION,
         signingIdentity=core.app_signing_identity(stage),
@@ -558,7 +671,11 @@ def disable():
     check_idle()
     record = manifest()
     if not record:
-        core.verify_source(TARGET)
+        try:
+            core.verify_source(TARGET)
+        except core.UnregisteredBuild:
+            # 没有安装记录 = 从没打过补丁：无需恢复，只做只读说明。
+            return status()
         return status()
 
     # 恢复也覆盖“改名前中断”的情况，不需要打开用户数据。
@@ -567,11 +684,14 @@ def disable():
         target_version = plistlib.loads((TARGET / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString')
         if target_version != record.get('version', core.VERSION):
             raise ValueError('Claude 已升级；不会用旧版本备份覆盖新版。请重新检测。')
-        # 用“已验证的官方备份”的 ASAR 指纹判断目标是否已经是官方原版。
-        # 备份必须是已登记的官方构建，所以这里用不做结构识别的取法。
-        official_asar_hash = core.registered_adapter(backup)['asarHash']
+        # 判断目标是否已经是官方原版：拿安装记录里的原始 ASAR 指纹比，
+        # 不再查内置登记表（那个版本可能已经从登记表里淘汰）。
+        original = record.get('original')
+        official_asar_hash = (original or {}).get('asarHash')
+        if official_asar_hash is None:
+            official_asar_hash = core.registered_adapter(backup)['asarHash']
         if core.sha((TARGET / ASAR).read_bytes()) == official_asar_hash:
-            core.verify_source(TARGET)
+            core.verify_official_signature(TARGET)
             # 恢复在改名后中断时，目标已经是官方原版；补记完成状态。
             if record.get('phase') != 'disabled':
                 record['phase'] = 'disabled'
@@ -582,7 +702,7 @@ def disable():
     stamp = str(time.time_ns())
     stage = STATE / ('restore-prepared-' + stamp + '.app')
     clone(backup, stage)
-    core.verify_source(stage)
+    core.verify_official_signature(stage)
     check_idle()
     retired = STATE / ('retired-patched-' + stamp + '.app')
     if TARGET.exists():
@@ -595,7 +715,7 @@ def disable():
         raise
     record.update(phase='disabled', retired=str(retired))
     save(record)
-    core.verify_source(TARGET)
+    core.verify_official_signature(TARGET)
     return status()
 
 
@@ -610,7 +730,11 @@ def prepare_update():
 
     current = status()
     if current.get('recoveryRequired'):
-        raise ValueError('安装中断；请先关闭开关恢复官方备份，再准备更新。')
+        # 目标缺失但记录仍在：这正是中断恢复要的场景，交给 disable() 处理。
+        result = disable()
+        result['preparedForUpdate'] = True
+        result['message'] = '安装中断已恢复为完整官方原版，可以继续安装官方更新。'
+        return result
     if current['running']:
         raise ValueError('请先正常退出 Claude，再为官方更新做准备。不会强制结束正在运行的会话。')
 
@@ -748,11 +872,11 @@ def main():
     parser.add_argument(
         'command',
         choices=['status', 'enable', 'update', 'rollback-update', 'disable',
-                 'launch', 'prepare-update', 'diagnose'],
+                 'launch', 'prepare-update', 'diagnose', 'migrate-password'],
     )
     args = parser.parse_args()
     if STATE.is_symlink():
-        print(json.dumps({'error': '安装记录目录是符号链接；停止操作。'}, ensure_ascii=False))
+        core.emit({'error': '安装记录目录是符号链接；停止操作。'})
         sys.exit(1)
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -772,9 +896,11 @@ def main():
                 result = prepare_update()
             elif args.command == 'diagnose':
                 result = diagnose()
+            elif args.command == 'migrate-password':
+                result = migrate_password()
             elif args.command == 'launch':
                 result = launch()
-            print(json.dumps(result, ensure_ascii=False))
+            core.emit(result)
     except Exception as error:
         # 不输出子进程内容、配置或凭据；只给用户可操作的中文提示。
         message = str(error) if isinstance(error, ValueError) else (
@@ -782,7 +908,7 @@ def main():
             if isinstance(error, BlockingIOError)
             else '操作未完成；已保留备份和现场。请检查应用是否退出、目录权限和磁盘空间。'
         )
-        print(json.dumps({'error': message}, ensure_ascii=False))
+        core.emit({'error': message})
         sys.exit(1)
 
 
