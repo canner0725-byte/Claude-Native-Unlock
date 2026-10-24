@@ -639,7 +639,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         configureDynamicLabel(backupStateLabel)
 
         let stateRow = settingsRow(title: "补丁状态", descriptionView: patchStateLabel)
-        let versionRow = settingsRow(title: "Claude 版本", descriptionView: patchMetaLabel)
+        // 与概览页同一份内容（metaLabel 的镜像），标题也保持一致，
+        // 否则同一个值在两页叫两个名字。
+        let versionRow = settingsRow(title: "已安装版本", descriptionView: patchMetaLabel)
         let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel)
 
         updateButton.target = self
