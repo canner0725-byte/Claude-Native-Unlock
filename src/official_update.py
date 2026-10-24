@@ -40,7 +40,7 @@ CHANNELS = {
 # 官方源码 BQr：只有这三种架构会被承认。
 ARCHITECTURES = ('universal', 'arm64', 'x64')
 
-CHANNEL = 'stable'
+CHANNEL = 'latest'
 # 固定探针标识：不读取官方设备标识，也不带任何用户信息。
 DEVICE_ID = 'probe-0000'
 USER_AGENT = 'Claude-Native-Unlock/update-channel'
@@ -60,7 +60,7 @@ class NetworkError(ChannelError):
     """联网失败。和「结构不认识」分开，提示文案不同。"""
 
 
-def update_url(base, version, channel='stable', arch='universal',
+def update_url(base, version, channel=CHANNEL, arch='universal',
                platform_name='darwin', os_version=None, device_id=DEVICE_ID):
     """按官方公式拼出更新地址。参数名和顺序都跟官方一致。"""
     if channel not in CHANNELS:
@@ -209,14 +209,18 @@ def cache_path():
 
 
 def read_cache():
-    """读上次成功的检查结果；没有或损坏都当作没有，不抛异常。"""
+    """读上次成功的检查结果；没有、损坏或渠道变了都当作没有，不抛异常。
+
+    换渠道（例如从 stable 改成 latest）后，旧结论属于另一条渠道，不能拿来
+    判断当前有没有新版；这里直接作废，等下一次检查重新写。
+    """
     try:
         data = json.loads(cache_path().read_text())
     except Exception:
         return None
     if not isinstance(data, dict) or not isinstance(data.get('latest'), str):
         return None
-    if not data['latest']:
+    if not data['latest'] or data.get('channel') != CHANNEL:
         return None
     return data
 

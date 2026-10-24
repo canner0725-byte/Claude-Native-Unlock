@@ -13,6 +13,7 @@
 """
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,12 +43,19 @@ OFFICIAL_RESPONSE = {
 class ChannelRequest(unittest.TestCase):
     def test_url_matches_the_official_formula(self):
         url = update.update_url('https://api.anthropic.com', '3.6556.2',
-                                os_version='15.0')
+                                'stable', os_version='15.0')
         self.assertEqual(
             url,
             'https://api.anthropic.com/api/desktop/darwin/universal/squirrel/update'
             '?device_id=probe-0000&version=3.6556.2&os_version=15.0')
         self.assertNotIn('channelUuid', url)
+
+    def test_reminder_uses_the_latest_channel(self):
+        # 助手提醒走 latest 渠道：比 stable 先看到新版本，用户能更早准备。
+        self.assertEqual(update.CHANNEL, 'latest')
+        url = update.update_url('https://api.anthropic.com', '3.6556.2',
+                                os_version='15.0')
+        self.assertIn('&channelUuid=' + update.CHANNELS['latest'], url)
 
     def test_probe_identity_is_fixed_and_carries_no_account(self):
         # 助手不能带用户账号、设备标识或第三方 API 地址去查官方渠道。
@@ -106,7 +114,7 @@ class Fetch(unittest.TestCase):
 
 class Summarise(unittest.TestCase):
     def cache(self, latest, checked_at=None, epoch=None):
-        return {'latest': latest,
+        return {'latest': latest, 'channel': update.CHANNEL,
                 'checkedAt': update.stamp(checked_at or 0),
                 'checkedAtEpoch': checked_at if epoch is None else epoch}
 
@@ -213,6 +221,35 @@ class Check(unittest.TestCase):
         (self.state / update.CACHE_NAME).write_text('{not json')
         self.assertIsNone(update.read_cache())
 
+    def test_cache_from_another_channel_is_ignored(self):
+        """从 stable 换成 latest 后，旧结论不能拿来当 latest 的结论。
+
+        旧缓存写着 stable 的 3.6556.2（= 本机版本），如果照用就会显示
+        「已是最新」，把 latest 渠道上真实存在的新版藏起来。
+        """
+        (self.state / update.CACHE_NAME).write_text(json.dumps({
+            'latest': '3.6556.2', 'channel': 'stable',
+            'checkedAt': update.stamp(0), 'checkedAtEpoch': 0}))
+        self.assertIsNone(update.read_cache())
+        result = update.cached_status({'version': '3.6556.2'})
+        self.assertEqual(result['state'], 'unchecked')
+        self.assertNotEqual(result['state'], 'current')
+
+    def test_cache_without_a_channel_is_ignored(self):
+        # 0.3.40 写的缓存没有 channel 字段，同样属于“来路不明”。
+        (self.state / update.CACHE_NAME).write_text(json.dumps({
+            'latest': '3.6556.2', 'checkedAt': update.stamp(0), 'checkedAtEpoch': 0}))
+        self.assertIsNone(update.read_cache())
+
+    def test_check_writes_the_active_channel(self):
+        with patch.object(update, 'installed_version', return_value='3.6556.2'), \
+             patch.object(update, 'query', return_value={
+                 'currentRelease': '3.9683.0', 'base': 'x', 'url': 'x', 'builds': []}):
+            update.check()
+        saved = json.loads((self.state / update.CACHE_NAME).read_text())
+        self.assertEqual(saved['channel'], update.CHANNEL)
+        self.assertEqual(update.read_cache()['latest'], '3.9683.0')
+
 
 class CachedStatus(unittest.TestCase):
     """合并检测只读缓存：不联网，也不碰 /Applications。"""
@@ -226,8 +263,8 @@ class CachedStatus(unittest.TestCase):
 
     def test_reads_the_cache_without_network(self):
         (self.state / update.CACHE_NAME).write_text(json.dumps({
-            'latest': '3.9683.0', 'checkedAt': update.stamp(0),
-            'checkedAtEpoch': 0}))
+            'latest': '3.9683.0', 'channel': update.CHANNEL,
+            'checkedAt': update.stamp(0), 'checkedAtEpoch': 0}))
         with patch.object(update, 'query',
                           side_effect=AssertionError('不应联网')):
             result = update.cached_status({'version': '3.6556.2'})
@@ -236,6 +273,61 @@ class CachedStatus(unittest.TestCase):
     def test_uninstalled_marker_is_not_used_as_a_version(self):
         result = update.cached_status({'version': '未安装'})
         self.assertEqual(result['state'], 'unknown')
+
+
+class InterfaceWiring(unittest.TestCase):
+    """界面接线：提醒那一行怎么显示、点了做什么，都在 Swift 源码里核对。
+
+    这些是纯界面行为，跑不了单元测试；用源码断言守住三件事，避免下次改版
+    又把入口拆开：那一栏叫「检查更新」、有新版时整行可点直接准备更新、
+    「官方备份」那一栏有恢复按钮。
+    """
+
+    def setUp(self):
+        self.source = (ROOT / 'app/NativeUnlock.swift').read_text()
+
+    def row(self, title):
+        match = re.search(r'let \w+ = settingsRow\(\s*title: "' + re.escape(title) + r'"(.*?)\)\n',
+                          self.source, re.S)
+        self.assertIsNotNone(match, title)
+        return match.group(1)
+
+    def test_prepare_row_is_now_called_check_for_updates(self):
+        self.assertIn('title: "检查更新"', self.source)
+        # 旧名字只允许留在菜单项和确认框里，设置行不能再叫这个。
+        self.assertNotIn('title: "为官方更新做准备"', self.source)
+
+    def test_reminder_line_is_the_entry_to_prepare_update(self):
+        row = self.row('检查更新')
+        self.assertIn('extraViews: [officialUpdateLabel]', row)
+        self.assertIn('control: checkUpdateButton', row)
+        body = re.search(r'officialUpdateLabel\.onClick = \{(.*?)\}', self.source, re.S)
+        self.assertIsNotNone(body)
+        self.assertIn('prepareUpdate()', body.group(1))
+
+    def test_backup_row_has_a_one_click_restore(self):
+        row = self.row('官方备份')
+        self.assertIn('control: restoreButton', row)
+        action = re.search(r'restoreButton\.action = #selector\((\w+)\)', self.source)
+        self.assertIsNotNone(action)
+        handler = re.search(r'func ' + action.group(1) + r'\(\) \{(.*?)\n    \}',
+                            self.source, re.S)
+        self.assertIsNotNone(handler)
+        # 走和关闭总开关同一条恢复路径，不另写一套恢复逻辑。
+        self.assertIn('"restore-all"', handler.group(1))
+
+    def test_link_label_keeps_the_cds_line_height(self):
+        # 可点的那行字仍然是 CDSLabel 的子类：行高和别的说明行一致。
+        self.assertIn('final class ClaudeLinkLabel: CDSLabel', self.source)
+        self.assertIn('officialUpdateLabel: ClaudeLinkLabel', self.source)
+
+    def test_spin_animation_does_not_wobble(self):
+        """每圈 4 段关键帧时旋转中心偏离图标中心 10.8pt，实测就是“乱晃”。"""
+        body = re.search(r'private func applySpin\(\) \{(.*?)\n    \}', self.source, re.S)
+        self.assertIsNotNone(body)
+        steps = re.search(r'let steps = (\d+)', body.group(1))
+        self.assertIsNotNone(steps)
+        self.assertGreaterEqual(int(steps.group(1)), 36)
 
 
 class BackendWiring(unittest.TestCase):

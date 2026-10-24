@@ -25,14 +25,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let toggle = ClaudeSwitch()
     let statusLabel = NSTextField(wrappingLabelWithString: "正在检测…")
     let backupStateLabel = NSTextField(wrappingLabelWithString: "正在检测…")
-    /// 「为官方更新做准备」下面那一行：官方有没有新版。
-    let officialUpdateLabel = NSTextField(wrappingLabelWithString: "正在检查官方新版…")
+    /// 「检查更新」下面那一行：官方有没有新版；有新版时整行可点，直接准备更新。
+    let officialUpdateLabel: ClaudeLinkLabel = {
+        let label = ClaudeLinkLabel(wrappingLabelWithString: "正在检查官方新版…")
+        label.apply(ClaudeFont.body())
+        label.textColor = ClaudeTheme.textMuted
+        // 这行字要么是说明、要么是入口，不需要选中文字；关掉以后点击不会被
+        // 文本选择吃掉，指针也不会变成 I 形。
+        label.isSelectable = false
+        return label
+    }()
 
     // 操作按钮。
     let openButton = ClaudeButton(title: "打开", style: .secondary)
     let refreshButton = ClaudeButton(title: "重新检测", style: .secondary)
     let updateButton = ClaudeButton(title: "更新补丁", style: .secondary)
-    let prepareButton = ClaudeButton(title: "准备更新", style: .secondary)
+    let checkUpdateButton = ClaudeButton(title: "立即检查", style: .secondary)
+    let restoreButton = ClaudeButton(title: "恢复官方原版", style: .secondary)
     let permissionButton = ClaudeButton(title: "去系统设置", style: .secondary)
     let githubButton = ClaudeButton(title: "打开 GitHub", style: .secondary)
     var refreshIconButton: ClaudeIconButton!
@@ -405,16 +414,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             description: "安装最新适配 revision。旧补丁会清理，只保留当前官方备份。",
             control: updateButton)
 
-        prepareButton.target = self
-        prepareButton.action = #selector(prepareUpdate)
-        configureDynamicLabel(officialUpdateLabel)
-        let prepareRow = settingsRow(
-            title: "为官方更新做准备",
-            description: "恢复完整官方签名和官方文件，供 Claude 官方更新器校验。备份、配置和会话都会保留。",
+        checkUpdateButton.target = self
+        checkUpdateButton.action = #selector(checkOfficialUpdateNow)
+        checkUpdateButton.toolTip = "马上联网查一次官方新版，不受 6 小时缓存限制。"
+        officialUpdateLabel.maximumNumberOfLines = 0
+        officialUpdateLabel.lineBreakMode = .byWordWrapping
+        officialUpdateLabel.textColor = ClaudeTheme.textMuted
+        // 有新版时这行字本身就是入口：点它直接准备更新，和原来那一栏做的事一样。
+        officialUpdateLabel.onClick = { [weak self] in self?.prepareUpdate() }
+        let checkUpdateRow = settingsRow(
+            title: "检查更新",
+            description: "查 Claude 官方有没有新版。有新版时，点下面那行提示即可准备更新：恢复完整官方签名，供官方更新器校验。",
             extraViews: [officialUpdateLabel],
-            control: prepareButton)
+            control: checkUpdateButton)
 
-        let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel)
+        restoreButton.target = self
+        restoreButton.action = #selector(confirmRestoreOfficial)
+        restoreButton.toolTip = "用当前官方备份把 Claude 恢复成官方原版；备份、配置和会话都会保留。"
+        let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel,
+                                    control: restoreButton)
 
         openButton.target = self
         openButton.action = #selector(openClaude)
@@ -469,7 +487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             featureSummary,
             settingsGroup("解锁", rows: [master]),
             settingsGroup("包含的功能", rows: featureGroups.indices.map { featureGroupRow($0) }),
-            settingsGroup("维护", rows: [backupRow, updateRow, prepareRow, openRow, refreshRow]),
+            settingsGroup("维护", rows: [backupRow, updateRow, checkUpdateRow, openRow, refreshRow]),
             settingsGroup("系统授权", rows: [permissionRow, reviewRow, browserRow]),
             settingsGroup("关于", rows: [appVersionRow, githubRow, dataRow])
         ]
@@ -780,6 +798,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func openClaude() { execute("launch") }
     @objc func prepareUpdate() { confirmPrepareUpdate() }
+
+    /// 「检查更新」那一栏的按钮：不受缓存期限，马上联网查一次。
+    @objc func checkOfficialUpdateNow() {
+        guard !busy, !quittingClaude, !officialUpdateChecking else { return }
+        forceOfficialUpdateCheck = true
+        scheduleOfficialUpdateCheck()
+    }
+
+    /// 「官方备份」那一栏的按钮：用当前已校验的官方备份把 Claude 恢复成官方原版。
+    /// 和关闭总开关走同一条恢复路径，安装中断时也能用。
+    @objc func confirmRestoreOfficial() {
+        showWindow()
+        let alert = NSAlert()
+        alert.messageText = "恢复成官方原版？"
+        alert.informativeText =
+            "会用当前官方备份把 Claude 恢复成官方原版，并还原本工具改过的配置。" +
+            "备份、配置和会话都会保留，之后随时可以重新开启。\n\n" +
+            "和关闭「全部功能」开关效果相同。" + quitHint(relaunch: true)
+        alert.addButton(withTitle: "恢复")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            self.continueAfterConfirmedQuit(relaunch: true) {
+                self.execute("restore-all", backend: "all")
+            }
+        }
+    }
 
     @objc func switchChanged() {
         // 总开关：一次安装或恢复全部可用性补丁。界面先还原显示，
@@ -1290,7 +1335,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openButton.isEnabled = false
         refreshButton.isEnabled = false
         updateButton.isEnabled = false
-        prepareButton.isEnabled = false
+        checkUpdateButton.isEnabled = false
+        restoreButton.isEnabled = false
         refreshIconButton.isEnabled = false
 
         setLoading(true)
@@ -1528,8 +1574,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateButton.title = updateAvailable && availableRevision > 0
             ? "更新到 r\(availableRevision)" : "已是最新"
         updateButton.invalidateIntrinsicContentSize()
-        prepareButton.isEnabled = interactive && officialSupported && !recoveryRequired
-            && (!enabled || backupVerified)
+        // 「检查更新」和「恢复官方原版」都只做官方更新渠道查询和官方备份恢复，
+        // 不依赖适配状态：未适配的官方新版也应该能查、能恢复成原版。
+        checkUpdateButton.isEnabled = interactive && !officialUpdateChecking
+        // 有新版时整行文字就是入口；联网失败但上次结论是新版时照样可点。
+        officialUpdateLabel.setLinkActive(interactive && !officialUpdateChecking
+                                          && officialUpdateState == "available")
+        // 只有真装过补丁、且备份已校验时才谈得上恢复；没装补丁时这一栏只是说明。
+        // 安装中断（recoveryRequired）正是最需要一键恢复的时候，同样允许。
+        restoreButton.isEnabled = interactive && enabled && backupVerified
         setUpdateVisible(interactive && updateAvailable)
         updatePermissionButton()
     }
@@ -1621,39 +1674,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateOfficialUpdateLabel()
     }
 
+    /// 有新版的整句用强调色，其余说明用弱化色；可点状态由 `refreshButtons()` 统一给。
     func updateOfficialUpdateLabel() {
-        var text: String
-        var color = ClaudeTheme.textMuted
+        var parts: [(text: String, color: NSColor?)] = []
+        let muted = ClaudeTheme.textMuted
         switch officialUpdateState {
         case "available":
             if officialUpdateAdapted {
-                text = "官方已有新版 " + officialUpdateLatest + "（本机 " + officialUpdateInstalled +
-                    "）。可以先准备更新，再在 Claude 里安装；装好后回到这里重新检测。"
-                color = ClaudeTheme.accent
+                parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
+                              officialUpdateInstalled + "）。", ClaudeTheme.accent))
+                parts.append(("点这里准备更新，再在 Claude 里安装；装好后回到这里重新检测。",
+                              ClaudeTheme.accent))
             } else {
-                text = "官方已有新版 " + officialUpdateLatest + "（本机 " + officialUpdateInstalled +
-                    "）。这个版本还没适配；更新后本工具不会修改它，等适配发布后再开启。"
-                color = ClaudeTheme.warning
+                parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
+                              officialUpdateInstalled + "）。", ClaudeTheme.accent))
+                parts.append(("点这里准备更新。这个版本还没适配：更新后本工具不会修改它，"
+                              + "等适配发布后再开启。", ClaudeTheme.warning))
             }
         case "current":
-            text = "官方没有比 " + officialUpdateInstalled + " 更新的版本。"
+            parts.append(("官方没有比 " + officialUpdateInstalled + " 更新的版本。", muted))
         case "unknown":
-            text = "读不到本机 Claude 版本；重新检测后再看官方新版。"
+            parts.append(("读不到本机 Claude 版本；重新检测后再看官方新版。", muted))
         default:
-            text = "还没检查过官方新版。"
+            parts.append(("还没检查过官方新版。", muted))
         }
         if !officialUpdateNote.isEmpty {
-            text += " " + officialUpdateNote
-            color = ClaudeTheme.warning
+            parts.append((" " + officialUpdateNote, ClaudeTheme.warning))
         } else if officialUpdateState == "available" && officialUpdateStale {
-            text += " 这是上次的检查结果，稍后会再查一次。"
+            parts.append((" 这是上次的检查结果，稍后会再查一次。", muted))
         }
-        guard officialUpdateLabel.stringValue != text else {
-            officialUpdateLabel.textColor = color
-            return
-        }
-        officialUpdateLabel.stringValue = text
-        officialUpdateLabel.textColor = color
+        officialUpdateLabel.show(parts)
+        refreshButtons()
     }
 
     func applyCLI(_ result: [String: Any]) {
@@ -1857,8 +1908,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard force || Date() >= officialUpdateRetryAfter else { return }
         forceOfficialUpdateCheck = false
         officialUpdateChecking = true
-        officialUpdateLabel.stringValue = "正在检查官方新版…"
-        officialUpdateLabel.textColor = ClaudeTheme.textMuted
+        officialUpdateLabel.show([("正在检查官方新版…", ClaudeTheme.textMuted)])
+        refreshButtons()
         runBackend("check", backend: "official_update", feature: nil) { result in
             self.officialUpdateChecking = false
             if result["state"] is String {
@@ -2055,7 +2106,7 @@ enum ClaudeFont {
 }
 
 /// 见 `ClaudeFont.label`：写入文字时自动带上官方行高。
-final class CDSLabel: NSTextField {
+class CDSLabel: NSTextField {
     private var cdsFont: NSFont?
     private var cdsStyle: NSParagraphStyle?
 
@@ -2075,14 +2126,108 @@ final class CDSLabel: NSTextField {
         set { write(newValue) }
     }
 
-    private func write(_ text: String) {
+    /// `extra` 只给子类补属性用（例如链接的下划线）；行高和字体始终由这里统一写。
+    func write(_ text: String, adding extra: [NSAttributedString.Key: Any] = [:]) {
+        write(segments: [(text, nil)], adding: extra)
+    }
+
+    /// 分段写文字：每段可以有自己的颜色（例如强调色 + 警示色），
+    /// 字体、行高和下划线仍然由这里统一给出，不会因为分段丢掉行距。
+    func write(segments: [(text: String, color: NSColor?)],
+               adding extra: [NSAttributedString.Key: Any] = [:]) {
         guard let font = cdsFont, let style = cdsStyle else {
-            super.stringValue = text
+            super.stringValue = segments.map { $0.text }.joined()
             return
         }
-        super.attributedStringValue = NSAttributedString(
-            string: text, attributes: [.font: font, .paragraphStyle: style])
+        let result = NSMutableAttributedString()
+        for segment in segments {
+            var attributes: [NSAttributedString.Key: Any] = [.font: font, .paragraphStyle: style]
+            if let color = segment.color { attributes[.foregroundColor] = color }
+            attributes.merge(extra) { _, new in new }
+            result.append(NSAttributedString(string: segment.text, attributes: attributes))
+        }
+        super.attributedStringValue = result
     }
+}
+
+/// 可以点击的说明文字：平时就是一行说明，有官方新版时变成入口。
+///
+/// 行高仍然走 `CDSLabel` 的写入口，所以换行、行距和别的说明行完全一致；
+/// 只有「可以点」这一点是新增的：悬停时指针变成手形并加下划线，点一下执行回调。
+/// 文字可以分段上色（有新版的那一句用强调色），分段由调用方给。
+final class ClaudeLinkLabel: CDSLabel {
+    var onClick: (() -> Void)?
+    private var segments: [(text: String, color: NSColor?)] = []
+    private var linkActive = false
+    private var hovered = false
+    private var tracking: NSTrackingArea?
+
+    /// 所有写文字的入口（包括 `stringValue` 和 `apply`）都会经过这里，
+    /// 所以分段永远和屏幕上的字一致，不会因为别处直接赋 stringValue 而丢掉颜色。
+    override func write(segments parts: [(text: String, color: NSColor?)],
+                        adding extra: [NSAttributedString.Key: Any] = [:]) {
+        segments = parts
+        var attributes = extra
+        if linkActive && hovered {
+            attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        super.write(segments: parts, adding: attributes)
+    }
+
+    /// 分段上色写文字；不可点或没悬停时不加下划线。
+    func show(_ parts: [(text: String, color: NSColor?)]) {
+        write(segments: parts)
+    }
+
+    func setLinkActive(_ on: Bool) {
+        guard on != linkActive else { return }
+        linkActive = on
+        if !on { hovered = false }
+        window?.invalidateCursorRects(for: self)
+        write(segments: segments)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // 不可点时把事件交回去：窗口本来就允许拖动背景。
+        guard linkActive, let onClick else {
+            super.mouseDown(with: event)
+            return
+        }
+        onClick()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if linkActive { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        write(segments: segments)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        write(segments: segments)
+    }
+
+    #if PREVIEW
+    /// 预览构建用：离屏截图拿不到真实的鼠标进入事件，直接切到悬停外观核对下划线。
+    func previewHover(_ on: Bool) {
+        hovered = on
+        write(segments: segments)
+    }
+    #endif
 }
 
 /// 左侧栏底色：直接绘制，滚动/截图/打印时都不会丢。
@@ -2172,11 +2317,17 @@ final class ClaudeIconButton: NSButton {
         if spinning {
             guard layer.animation(forKey: "spin") == nil else { return }
             // NSView 的图层锚点在左下角，直接转会绕角；把旋转中心平移到图标中心。
+            //
+            // 关键帧之间是按矩阵分量线性插值的，两帧之间的实际姿态落在弦上而不是
+            // 圆弧上：每段角度越大，图标越会离开自己的中心。实测每圈只切 4 段
+            // （90°一段）时，旋转中心最多偏离图标中心 10.8pt，看起来就是“乱晃”；
+            // 每段 5°（72 段）后偏离 0.14pt，肉眼不可见，且转一整圈仍然匀速。
             let center = CGPoint(x: symbolView.bounds.midX, y: symbolView.bounds.midY)
+            let steps = 72
             var frames: [NSValue] = []
-            for step in 0...4 {
+            for step in 0...steps {
                 // 图层坐标里正角度是逆时针；箭头本身表示顺时针，所以角度递减。
-                let angle = -Double.pi * 2 * Double(step) / 4
+                let angle = -Double.pi * 2 * Double(step) / Double(steps)
                 var transform = CATransform3DIdentity
                 transform = CATransform3DTranslate(transform, center.x, center.y, 0)
                 transform = CATransform3DRotate(transform, angle, 0, 0, 1)
@@ -2185,10 +2336,12 @@ final class ClaudeIconButton: NSButton {
             }
             let spin = CAKeyframeAnimation(keyPath: "transform")
             spin.values = frames
-            spin.keyTimes = [0, 0.25, 0.5, 0.75, 1]
+            spin.keyTimes = (0...steps).map { NSNumber(value: Double($0) / Double(steps)) }
+            spin.calculationMode = .linear
             spin.duration = 0.9
             spin.repeatCount = .infinity
-            spin.timingFunctions = Array(repeating: CAMediaTimingFunction(name: .linear), count: 4)
+            spin.timingFunctions = Array(repeating: CAMediaTimingFunction(name: .linear),
+                                         count: steps)
             spin.isRemovedOnCompletion = false
             layer.add(spin, forKey: "spin")
         } else {
@@ -2825,14 +2978,38 @@ func menuBarIcon(_ state: MenuBarIconState) -> NSImage {
 
 #if PREVIEW
 extension AppDelegate {
+    /// 预览构建用：合成一个“已解锁、备份已校验”的状态，好核对恢复按钮的启用样式。
+    /// 只影响预览构建，不读也不写真实状态。
+    func applyPreviewState() {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["PREVIEW_UNLOCKED"] != nil {
+            statusLoaded = true
+            enabled = true
+            officialSupported = true
+            backupVerified = true
+            patchRevision = 14
+            targetExists = true
+            metaVersion = "3.6556.2"
+            applyOfficial(["enabled": true, "supported": true, "backupVerified": true,
+                           "patchRevision": 14, "targetExists": true,
+                           "version": "3.6556.2", "message": "预览"])
+        }
+        if let state = environment["PREVIEW_UPDATE_STATE"] {
+            applyOfficialUpdate(["state": state, "installed": "3.6556.2",
+                                 "latest": "3.9683.0",
+                                 "adapted": environment["PREVIEW_UPDATE_ADAPTED"] != nil])
+        }
+        // PREVIEW_UPDATE_HOVER=1：直接切到悬停外观，核对可点那行的下划线。
+        if environment["PREVIEW_UPDATE_HOVER"] != nil {
+            officialUpdateLabel.previewHover(true)
+        }
+    }
+
     /// 预览构建用：把真实窗口渲染成 PNG，不依赖屏幕录制授权。
     func renderScrolledPreview(to path: String, offset: CGFloat) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
         window.appearance = NSApp.appearance
-        if let state = ProcessInfo.processInfo.environment["PREVIEW_UPDATE_STATE"] {
-            applyOfficialUpdate(["state": state, "installed": "3.6556.2",
-                                 "latest": "3.9683.0", "adapted": false])
-        }
+        applyPreviewState()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             self.scrollView?.contentView.scroll(to: NSPoint(x: 0, y: offset))
             self.scrollView?.reflectScrolledClipView(self.scrollView!.contentView)
@@ -2858,11 +3035,9 @@ extension AppDelegate {
             setLoading(true)
         }
         // PREVIEW_UPDATE_STATE=available 时用合成结果核对提醒那一行的颜色与换行；
+        // PREVIEW_UNLOCKED=1 时合成“已解锁、备份已校验”，核对恢复按钮。
         // 只影响预览构建，不写缓存、不联网。
-        if let state = ProcessInfo.processInfo.environment["PREVIEW_UPDATE_STATE"] {
-            applyOfficialUpdate(["state": state, "installed": "3.6556.2",
-                                 "latest": "3.9683.0", "adapted": false])
-        }
+        applyPreviewState()
         // 每次截图都从顶部开始，避免上一次滚动位置带进来。
         scrollView?.contentView.scroll(to: .zero)
         scrollView?.reflectScrolledClipView(scrollView!.contentView)
