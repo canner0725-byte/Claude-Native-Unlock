@@ -543,8 +543,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.setAccessibilityLabel("Computer Use 解锁开关")
         toggle.isEnabled = false
 
+        // 标题原来只写「Claude」，和内容开头的「Claude 3.6556.2…」重复，
+        // 也没说明这一行是什么。改成说明行本身（版本/补丁/运行状态）。
         let versionRow = settingsRow(
-            title: "Claude",
+            title: "已安装版本",
             descriptionView: metaLabel)
 
         let openRow = settingsRow(
