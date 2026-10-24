@@ -1950,8 +1950,11 @@ enum ClaudeTheme {
         static let headerGap: CGFloat = 16          // --cds-gap-md
         static let contentInsetX: CGFloat = 24      // px-xl
         static let contentInsetTop: CGFloat = 28
-        static let switchWidth: CGFloat = 36        // 1.8 × --cds-switch-h
-        static let switchHeight: CGFloat = 20
+        // 官方 `--cds-switch-h: calc(1.25rem * --cds-rem-scale)`，桌面端
+        // rem-scale = 16/17 → 1.25 × 16 × 16/17 ≈ 18.8pt；宽度取 1.8 倍。
+        // 组件宽度由官方组件库在 JS 里算，CSS 查不到，这一比值沿用真机截图。
+        static let switchHeight: CGFloat = 19
+        static let switchWidth: CGFloat = 34
     }
 
     // surface-1 侧栏 / surface-2 内容面板；深色下内容比侧栏略亮。
@@ -2075,6 +2078,17 @@ final class ContentBackgroundView: NSView {
 /// （右侧面板曾整块发灰，原因不在这个容器，而是 HairlineView 用 dirtyRect
 /// 填充，图层化后 dirtyRect 可能是整块图层，十几条分隔线叠成了灰雾。）
 final class PlainScrollView: NSView {
+    /// 官方 `--cds-scroll-fade-size: 28px`；桌面端 rem-scale 16/17，取 26pt。
+    private static let fadeHeight: CGFloat = 26
+    /// 单条四档渐变当遮罩：`layer.mask` 的透明度会乘到内容上。
+    /// 不能用「一张空遮罩 + 两条边缘渐变」——遮罩没画到的区域 alpha 为 0，
+    /// 整片内容会一起消失（预览实测：中间全黑）。
+    private let fadeMask = CAGradientLayer()
+
+    var documentHeight: CGFloat { document?.frame.height ?? 0 }
+    var currentOffset: CGFloat { min(max(0, offset), maximumOffset) }
+    var canScroll: Bool { maximumOffset > 1 }
+
     /// 裁剪层：普通 NSView + clipsToBounds，只负责裁掉视口外的内容。
     private let clip = FlippedView()
     private var offset: CGFloat = 0
@@ -2118,6 +2132,44 @@ final class PlainScrollView: NSView {
         ])
     }
 
+    /// 边缘渐隐：整块遮罩铺满视口，按需在上下边缘各压一段透明。
+    /// 用遮罩而不是盖一层底色——底色会随面板主题变，遮罩不会。
+    private func installFadesIfNeeded() {
+        guard fadeMask.superlayer == nil else { return }
+        wantsLayer = true
+        guard let host = layer else { return }
+        fadeMask.startPoint = CGPoint(x: 0.5, y: 0)   // 左下
+        fadeMask.endPoint = CGPoint(x: 0.5, y: 1)     // 左上为 y 增大的方向
+        fadeMask.masksToBounds = true
+        host.mask = fadeMask
+    }
+
+    private func updateFades() {
+        installFadesIfNeeded()
+        let clamped = min(max(0, offset), maximumOffset)
+        let showsTop = canScroll && clamped > 0.5
+        let showsBottom = canScroll && clamped < maximumOffset - 0.5
+        #if PREVIEW
+        print("[fade] offset=\(clamped) max=\(maximumOffset) top=\(showsTop) bottom=\(showsBottom)")
+        #endif
+        let height = max(bounds.height, 1)
+        let fade = min(Self.fadeHeight, height / 2)
+        // 视口顶部对应渐变终点（y=1），底部对应起点（y=0）。
+        let bottomStop = showsBottom ? fade / height : 0
+        let topStop = showsTop ? 1 - fade / height : 1
+        let clear = NSColor.clear.cgColor
+        let solid = NSColor.white.cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fadeMask.frame = bounds
+        fadeMask.colors = [clear, solid, solid, clear]
+        // locations 必须严格递增；把边缘停靠点夹在 0...1 内并留出最小步长。
+        let stops = [0, max(bottomStop, 0.0001),
+                     min(max(topStop, 0.0002), 0.9999), 1].sorted()
+        fadeMask.locations = stops.map { NSNumber(value: Double($0)) }
+        CATransaction.commit()
+    }
+
     required init?(coder: NSCoder) { fatalError("not used") }
 
     private var maximumOffset: CGFloat {
@@ -2133,6 +2185,7 @@ final class PlainScrollView: NSView {
         if documentTop?.constant != -clamped {
             documentTop?.constant = -clamped
         }
+        updateFades()
     }
 
     override func layout() {
@@ -2151,6 +2204,13 @@ final class PlainScrollView: NSView {
         offset = 0
         applyOffset()
     }
+
+    #if PREVIEW
+    func setOffsetForPreview(_ value: CGFloat) {
+        offset = value
+        applyOffset()
+    }
+    #endif
 
     /// 把文档坐标里的一段滚进视口，顶部留 8pt 呼吸。
     /// 目标位置存在 `offset` 里，布局完成、文档高度更新后由 `layout()` 再应用一次。
@@ -2461,7 +2521,9 @@ final class HairlineView: NSView {
     }
 }
 
-/// Claude 设置页开关：38×22 胶囊轨道 + 白色圆钮，开启为系统蓝。
+/// Claude 设置页开关：胶囊轨道 + 白色圆钮，开启为系统蓝。
+/// 尺寸取自 `ClaudeTheme.Metric.switchWidth/switchHeight`（注释里写过 38×22，
+/// 与实际值不符——以常量那一处为准，这里不再重复写数字）。
 /// 直接绘制而不是用 CALayer：滚动区域里刚显示的分组也能可靠地画出来。
 final class ClaudeSwitch: NSControl {
     var state: NSControl.StateValue = .off {
@@ -3041,6 +3103,26 @@ func menuBarIcon(_ state: MenuBarIconState) -> NSImage {
 #if PREVIEW
 extension AppDelegate {
     /// 预览构建用：把真实窗口渲染成 PNG，不依赖屏幕录制授权。
+    func renderScrolledPreview(to path: String, offset: CGFloat) {
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+        window.appearance = NSApp.appearance
+        selectSection("general")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            self.scrollView?.setOffsetForPreview(offset)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                guard let view = self.window.contentView else { return }
+                // cacheDisplay 走图层合成，能看到 layer.mask 的渐隐效果。
+                guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                if let data = rep.representation(using: .png, properties: [:]) {
+                    try? data.write(to: URL(fileURLWithPath: path))
+                    print("captured \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)")
+                }
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
     func renderPreview(to path: String, dark: Bool) {
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.appearance = NSApp.appearance
@@ -3138,7 +3220,10 @@ func previewStep(_ index: Int) {
     }
 }
 DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-    if ProcessInfo.processInfo.environment["DEBUG_CAPTURE"] != nil {
+    if let raw = ProcessInfo.processInfo.environment["PREVIEW_SCROLL"], let value = Double(raw) {
+        previewDelegate.renderScrolledPreview(to: previewBase + "-scrolled.png",
+                                              offset: CGFloat(value))
+    } else if ProcessInfo.processInfo.environment["DEBUG_CAPTURE"] != nil {
         NSApp.appearance = NSAppearance(named: .darkAqua)
         previewDelegate.window.appearance = NSApp.appearance
         previewDelegate.selectSection("general")
