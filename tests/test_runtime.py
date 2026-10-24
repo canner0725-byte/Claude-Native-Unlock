@@ -33,6 +33,29 @@ class PortableRuntime(unittest.TestCase):
             self.assertTrue(core.WORK.is_dir())
             self.assertFalse(str(core.WORK).startswith(str(ROOT)))
 
+    def test_standalone_module_shares_state_with_backend(self):
+        """单模块命令行运行时，`__main__` 和被 import 的模块必须是同一份。
+
+        不是同一个对象时，configure() 改的是 import 拿到的那份副本，
+        真正执行 main() 的这份还指向仓库里的 work/：读不到安装记录，
+        已打补丁的应用会被误报成「尚未适配」，仓库里还会多出空目录。
+        """
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as stack:
+            root = Path(temp).resolve()/'Application Support/Claude Native Unlock'
+            for module, name in [(core,'ROOT'), (core,'WORK'), (official,'STATE'), (features,'STATE')]:
+                stack.enter_context(patch.object(module, name, getattr(module,name)))
+            # 模拟 `python3 src/official_unlock.py`：模块以 __main__ 身份运行，
+            # 此时 sys.modules 里还没有 'official_unlock' 这一项。
+            fake_main = type(sys)('__main__')
+            fake_main.__dict__.update(official.__dict__)
+            stack.enter_context(patch.dict(sys.modules, {'__main__': fake_main}))
+            stack.enter_context(patch.dict(sys.modules))
+            del sys.modules['official_unlock']
+            resolved = backend.configure_module('official_unlock', root)
+            self.assertIs(resolved, fake_main)
+            # 真正会跑 main() 的那一份也拿到了新的状态目录
+            self.assertEqual(fake_main.STATE, root/'work/official-install')
+
     def test_redirected_state_is_refused(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

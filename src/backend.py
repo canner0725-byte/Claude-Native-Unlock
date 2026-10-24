@@ -100,6 +100,20 @@ def configure(root=None):
     return core
 
 
+def configure_module(name, root=None):
+    """单模块命令行入口用：让 `__main__` 和 backend 眼里的模块是同一份。
+
+    `python3 src/official_unlock.py status` 时本模块以 `__main__` 身份运行；
+    configure() 再 `import official_unlock` 拿到的是另一份副本，STATE 设在
+    副本上，真正执行 main() 的这份仍指向仓库里的 work/——读不到安装记录，
+    于是把已打补丁的应用误报成「尚未适配」，还在仓库里留下空目录。
+    先按模块名把 `__main__` 登记回 sys.modules，两边才是同一个对象。
+    """
+    sys.modules.setdefault(name, sys.modules['__main__'])
+    configure(root)
+    return sys.modules[name]
+
+
 def status_all():
     """一次进程内完成三项只读检测，减少启动等待和界面闪烁。
 

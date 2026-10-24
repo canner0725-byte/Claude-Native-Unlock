@@ -787,4 +787,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # 直接命令行运行也要走真实的用户数据目录，否则会读不到安装记录、
+    # 把已打补丁的应用误报成未适配。backend 在同一个包里，导入即可。
+    import backend
+    backend.configure_module('official_unlock')
     main()

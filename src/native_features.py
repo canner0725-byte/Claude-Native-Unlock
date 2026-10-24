@@ -535,4 +535,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # 同 official_unlock：直接运行时也要指向真实用户数据目录。
+    import backend
+    backend.configure_module('native_features')
     main()
