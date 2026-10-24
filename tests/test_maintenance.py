@@ -238,6 +238,86 @@ class ProbeHonesty(unittest.TestCase):
         self.assertIn('这不等于通过', source)
         self.assertIn('未执行', source)
 
+    def test_the_dynamic_layer_never_reads_a_real_secret(self):
+        """验证动作不能变成泄漏动作。
+
+        规则要是没生效，让代理去读真密钥就等于把密钥送进模型上下文。
+        所以动态层只能用诱饵文件。这里不看源码注释，直接**截下真正发给
+        模型的提示词**来断言——源码里出现密钥路径是正常的（静态层清单要
+        列它们），但发出去的提示词里不能有。
+        """
+        import tempfile
+        sent = []
+        original_run = probe.run_agent
+        original_dir, original_file = probe.CANARY_DIR, probe.CANARY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                probe.CANARY_DIR = pathlib.Path(work) / 'canary'
+                probe.CANARY_FILE = probe.CANARY_DIR / 'token'
+
+                def fake_run(prompt, timeout=180):
+                    sent.append(prompt)
+                    return '', 0
+
+                probe.run_agent = fake_run
+                probe.dynamic_checks()
+        finally:
+            probe.run_agent = original_run
+            probe.CANARY_DIR, probe.CANARY_FILE = original_dir, original_file
+        self.assertTrue(sent, '动态层没有发出任何提示词')
+        for prompt in sent:
+            for secret in ('signing/password', 'Claude Safe Storage', '.ssh/id_'):
+                self.assertNotIn(secret, prompt,
+                                 f'发给模型的提示词里有真实密钥路径：{secret}')
+
+    def test_the_canary_is_removed_even_when_a_check_raises(self):
+        """诱饵是临时文件，异常路径上也要删掉，不能留在配置目录里。"""
+        import tempfile
+        original_run = probe.run_agent
+        original_dir, original_file = probe.CANARY_DIR, probe.CANARY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                probe.CANARY_DIR = pathlib.Path(work) / 'canary'
+                probe.CANARY_FILE = probe.CANARY_DIR / 'token'
+
+                def boom(prompt, timeout=180):
+                    raise RuntimeError('模拟中断')
+
+                probe.run_agent = boom
+                with self.assertRaises(RuntimeError):
+                    probe.dynamic_checks()
+                self.assertFalse(probe.CANARY_FILE.exists(), '诱饵文件没有删掉')
+        finally:
+            probe.run_agent = original_run
+            probe.CANARY_DIR, probe.CANARY_FILE = original_dir, original_file
+
+    def test_canary_is_denied_by_the_rules_it_tests(self):
+        """诱饵必须真的被拒绝规则覆盖，否则这一层永远“通过”。"""
+        rule = probe.rule_matches(
+            setup.DENY_TOOLS, 'Read', str(probe.CANARY_FILE))
+        self.assertIsNotNone(rule, '诱饵路径没有被任何拒绝规则覆盖')
+
+
+class Gate(unittest.TestCase):
+    """闸门文件是后台作业唯一的开关，不能有第二条创建它的路径。"""
+
+    def test_only_the_probe_creates_the_gate(self):
+        import subprocess
+        writers = []
+        for path in (ROOT / 'scripts').glob('*.py'):
+            text = path.read_text()
+            if "'verified'" in text or '"verified"' in text:
+                writers.append(path.name)
+        # probe 写它，run.sh 读它——run.sh 不是 .py，所以这里只该有 probe。
+        self.assertEqual(writers, ['maintenance_probe.py'],
+                         f'不止一处写闸门文件：{writers}')
+
+    def test_the_runner_reads_the_same_path(self):
+        runner = (ROOT / 'scripts/maintenance_run.sh').read_text()
+        self.assertIn('/verified', runner)
+        probe_source = (ROOT / 'scripts/maintenance_probe.py').read_text()
+        self.assertIn("/ 'verified'", probe_source)
+
 
 if __name__ == '__main__':
     unittest.main()
