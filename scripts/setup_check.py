@@ -66,7 +66,13 @@ def designated_requirement(path):
 
 
 def screen_locked():
-    """屏幕锁定时钥匙串读不到也不会弹框，这决定了哪些步骤必须在你面前做。"""
+    """屏幕锁定时钥匙串读不到也不会弹框，这决定了哪些步骤必须在你面前做。
+
+    必须读 `IOConsoleLocked` **这一项的值**，不能只判断输出里有没有 `<true/>`：
+    同一份 ioreg 输出里还有别的布尔项，只搜 `<true/>` 会让屏幕解锁时也报“已锁定”。
+    这个 bug 真的发生过——解锁状态下体检仍报锁定，把“该你做的步骤”全部挡住。
+    """
+    import re
     try:
         # ioreg 在 /usr/sbin，不在 /usr/bin。
         done = subprocess.run(['/usr/sbin/ioreg', '-n', 'Root', '-d1', '-a'],
@@ -75,7 +81,10 @@ def screen_locked():
         return None
     if done.returncode != 0:
         return None
-    return b'IOConsoleLocked' in done.stdout and b'<true/>' in done.stdout
+    match = re.search(rb'<key>IOConsoleLocked</key>\s*<(true|false)\s*/>', done.stdout)
+    if not match:
+        return None
+    return match.group(1) == b'true'
 
 
 def check_project_location():

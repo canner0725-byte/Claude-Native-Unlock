@@ -102,6 +102,37 @@ class SetupCheck(unittest.TestCase):
         self.assertIn('/usr/sbin/ioreg', source)
         self.assertNotIn("'/usr/bin/ioreg'", source)
 
+    def test_screen_lock_reads_the_value_not_just_the_presence_of_true(self):
+        """必须读 IOConsoleLocked 的值。
+
+        上一版写的是「输出里有 IOConsoleLocked 且有 <true/> 就算锁定」。
+        同一份 ioreg 输出里还有别的布尔项，屏幕解锁时也能搜到 <true/>，
+        于是永远报「已锁定」，把需要人在场的步骤全挡住。这个 bug 真的发生过。
+        """
+        source = (ROOT / 'scripts/setup_check.py').read_text()
+        self.assertIn('IOConsoleLocked', source)
+        # 源码必须按 IOConsoleLocked 的值分支，而不是单独搜 <true/>。
+        self.assertRegex(source, r'IOConsoleLocked</key>.{0,20}\(true\|false\)',
+                         '没有按 IOConsoleLocked 的值解析')
+        self.assertNotIn("and b'<true/>' in", source,
+                         '又在单独搜 <true/> 了：解锁时会误报锁定')
+
+    def test_screen_lock_parses_a_real_ioreg_sample(self):
+        """拿一段真实的 ioreg 输出跑一遍解析，锁与不锁都要判对。"""
+        import re
+
+        def locked_from(text):
+            match = re.search(rb'<key>IOConsoleLocked</key>\s*<(true|false)\s*/>', text)
+            return None if not match else match.group(1) == b'true'
+
+        unlocked = (b'<key>IOConsoleLocked</key>\n\t<false/>\n'
+                    b'<key>Other</key>\n\t<true/>')
+        locked = (b'<key>IOConsoleLocked</key>\n\t<true/>\n'
+                  b'<key>Other</key>\n\t<true/>')
+        self.assertFalse(locked_from(unlocked), '解锁时误报锁定')
+        self.assertTrue(locked_from(locked), '锁定时没报锁定')
+        self.assertIsNone(locked_from(b'<key>Other</key><true/>'), '缺键时应返回 None')
+
     def test_a_registered_job_is_checked_against_the_definition(self):
         """“文件存在”不等于“作业合格”：手改坏的 plist 会静默不按计划跑。"""
         import plistlib
