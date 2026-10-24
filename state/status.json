@@ -1,7 +1,7 @@
 {
   "assistant": {
-    "version": "0.3.42",
-    "build": "55"
+    "version": "0.3.43",
+    "build": "56"
   },
   "protocol": 1,
   "patchRevision": 14,

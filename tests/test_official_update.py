@@ -337,6 +337,20 @@ class InterfaceWiring(unittest.TestCase):
         self.assertNotIn('ClaudeTheme.warning', available)
         self.assertNotIn('还没适配', available)
 
+    def test_available_reminder_is_only_the_version_line(self):
+        """有新版那一行只留版本本身，后面不跟操作说明。
+
+        用户 2026-10-25 明确要求去掉「点这里准备更新，再在 Claude 里安装；
+        装好后回到这里重新检测。」这串话：这行字本身就是入口，点下去会弹
+        确认框说明下一步，不必再写在行里。
+        """
+        body = re.search(r'func updateOfficialUpdateLabel\(\) \{(.*?)\n    \}',
+                         self.source, re.S).group(1)
+        available = body[body.index('case "available"'):body.index('case "current"')]
+        for phrase in ('点这里准备更新', '在 Claude 里安装', '装好后回到这里'):
+            self.assertNotIn(phrase, available)
+        self.assertIn('官方已有新版', available)
+
     def test_spin_animation_does_not_wobble(self):
         """每圈 4 段关键帧时旋转中心偏离图标中心 10.8pt，实测就是“乱晃”。"""
         body = re.search(r'private func applySpin\(\) \{(.*?)\n    \}', self.source, re.S)

@@ -1674,9 +1674,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 有新版的整句用强调色，其余说明用弱化色；可点状态由 `refreshButtons()` 统一给。
     ///
-    /// 「有没有适配」不在这一行里区分：更新是官方的事，适配是本工具的事，
-    /// 混在一句里会让用户以为必须等适配才能更新。装好新版后回到这里重新检测，
-    /// 能不能继续开启由检测结果如实说明（未登记的构建只诊断、不写入）。
+    /// 有新版时只说版本本身，后面不再跟操作说明：这行字本身就是入口，
+    /// 悬停有下划线、指针变手形，点下去会弹确认框说明下一步做什么。
+    /// 「有没有适配」也不在这一行里区分——更新是官方的事、适配是本工具的事，
+    /// 混在一句里会让人以为必须等适配才能更新；能不能继续开启以重新检测为准。
     func updateOfficialUpdateLabel() {
         var parts: [(text: String, color: NSColor?)] = []
         let muted = ClaudeTheme.textMuted
@@ -1684,8 +1685,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "available":
             parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
                           officialUpdateInstalled + "）。", ClaudeTheme.accent))
-            parts.append(("点这里准备更新，再在 Claude 里安装；装好后回到这里重新检测。",
-                          ClaudeTheme.accent))
         case "current":
             parts.append(("官方没有比 " + officialUpdateInstalled + " 更新的版本。", muted))
         case "unknown":
