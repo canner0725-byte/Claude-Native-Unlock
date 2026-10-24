@@ -83,7 +83,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var officialUpdateState = ""
     var officialUpdateInstalled = ""
     var officialUpdateLatest = ""
-    var officialUpdateAdapted = false
     var officialUpdateCheckedAt = ""
     var officialUpdateStale = false
     var officialUpdateNote = ""
@@ -1667,7 +1666,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         officialUpdateState = result["state"] as? String ?? "unknown"
         officialUpdateInstalled = result["installed"] as? String ?? ""
         officialUpdateLatest = result["latest"] as? String ?? ""
-        officialUpdateAdapted = result["adapted"] as? Bool ?? false
         officialUpdateCheckedAt = result["checkedAt"] as? String ?? ""
         officialUpdateStale = result["stale"] as? Bool ?? false
         officialUpdateNote = result["error"] as? String ?? ""
@@ -1675,22 +1673,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 有新版的整句用强调色，其余说明用弱化色；可点状态由 `refreshButtons()` 统一给。
+    ///
+    /// 「有没有适配」不在这一行里区分：更新是官方的事，适配是本工具的事，
+    /// 混在一句里会让用户以为必须等适配才能更新。装好新版后回到这里重新检测，
+    /// 能不能继续开启由检测结果如实说明（未登记的构建只诊断、不写入）。
     func updateOfficialUpdateLabel() {
         var parts: [(text: String, color: NSColor?)] = []
         let muted = ClaudeTheme.textMuted
         switch officialUpdateState {
         case "available":
-            if officialUpdateAdapted {
-                parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
-                              officialUpdateInstalled + "）。", ClaudeTheme.accent))
-                parts.append(("点这里准备更新，再在 Claude 里安装；装好后回到这里重新检测。",
-                              ClaudeTheme.accent))
-            } else {
-                parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
-                              officialUpdateInstalled + "）。", ClaudeTheme.accent))
-                parts.append(("点这里准备更新。这个版本还没适配：更新后本工具不会修改它，"
-                              + "等适配发布后再开启。", ClaudeTheme.warning))
-            }
+            parts.append(("官方已有新版 " + officialUpdateLatest + "（本机 " +
+                          officialUpdateInstalled + "）。", ClaudeTheme.accent))
+            parts.append(("点这里准备更新，再在 Claude 里安装；装好后回到这里重新检测。",
+                          ClaudeTheme.accent))
         case "current":
             parts.append(("官方没有比 " + officialUpdateInstalled + " 更新的版本。", muted))
         case "unknown":
@@ -2194,6 +2189,23 @@ final class ClaudeLinkLabel: CDSLabel {
             return
         }
         onClick()
+    }
+
+    /// 窗口在后台时，系统默认把第一次点击只用来激活窗口，视图收不到 mouseDown。
+    /// 链接的惯例是点一下就生效，所以这里主动接收这次点击。
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        linkActive
+    }
+
+    /// 辅助功能与键盘也能触发：VoiceOver 的“按下”走这条路径。
+    override func accessibilityPerformPress() -> Bool {
+        guard linkActive, let onClick else { return super.accessibilityPerformPress() }
+        onClick()
+        return true
+    }
+
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        linkActive ? .button : super.accessibilityRole()
     }
 
     override func resetCursorRects() {
@@ -2996,8 +3008,7 @@ extension AppDelegate {
         }
         if let state = environment["PREVIEW_UPDATE_STATE"] {
             applyOfficialUpdate(["state": state, "installed": "3.6556.2",
-                                 "latest": "3.9683.0",
-                                 "adapted": environment["PREVIEW_UPDATE_ADAPTED"] != nil])
+                                 "latest": "3.9683.0"])
         }
         // PREVIEW_UPDATE_HOVER=1：直接切到悬停外观，核对可点那行的下划线。
         if environment["PREVIEW_UPDATE_HOVER"] != nil {
@@ -3076,7 +3087,19 @@ func previewStep(_ index: Int) {
     }
 }
 DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-    if let raw = ProcessInfo.processInfo.environment["PREVIEW_SCROLL"], let value = Double(raw) {
+    let environment = ProcessInfo.processInfo.environment
+    if environment["PREVIEW_INTERACTIVE"] != nil {
+        // 留在屏幕上让人（或电脑操作）真的点一下：不截图、不退出。
+        NSApp.activate(ignoringOtherApps: true)
+        previewDelegate.showWindow()
+        if let raw = environment["PREVIEW_SCROLL"], let value = Double(raw) {
+            previewDelegate.scrollView?.contentView.scroll(to: NSPoint(x: 0, y: value))
+            previewDelegate.scrollView?.reflectScrolledClipView(
+                previewDelegate.scrollView!.contentView)
+        }
+        return
+    }
+    if let raw = environment["PREVIEW_SCROLL"], let value = Double(raw) {
         previewDelegate.renderScrolledPreview(to: previewBase + "-scrolled.png",
                                               offset: CGFloat(value))
     } else {

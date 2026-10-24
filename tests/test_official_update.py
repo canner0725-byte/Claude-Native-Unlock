@@ -321,6 +321,22 @@ class InterfaceWiring(unittest.TestCase):
         self.assertIn('final class ClaudeLinkLabel: CDSLabel', self.source)
         self.assertIn('officialUpdateLabel: ClaudeLinkLabel', self.source)
 
+    def test_available_reminder_uses_one_accent_color(self):
+        """有新版那一行不按「适配/未适配」改色，也不再写「还没适配」。
+
+        用户 2026-10-25 明确：更新是官方的事，适配是本工具的事；旧补丁
+        能配上新桌面端时，重新检测通过就可以继续用。界面不该用警示色暗示
+        「必须等适配」，否则用户会以为不能更新。
+        """
+        body = re.search(r'func updateOfficialUpdateLabel\(\) \{(.*?)\n    \}',
+                         self.source, re.S)
+        self.assertIsNotNone(body)
+        body = body.group(1)
+        available = body[body.index('case "available"'):body.index('case "current"')]
+        self.assertIn('ClaudeTheme.accent', available)
+        self.assertNotIn('ClaudeTheme.warning', available)
+        self.assertNotIn('还没适配', available)
+
     def test_spin_animation_does_not_wobble(self):
         """每圈 4 段关键帧时旋转中心偏离图标中心 10.8pt，实测就是“乱晃”。"""
         body = re.search(r'private func applySpin\(\) \{(.*?)\n    \}', self.source, re.S)
