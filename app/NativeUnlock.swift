@@ -11,28 +11,22 @@ enum BackendProtocol {
 // 所有真正的补丁操作都在内置 Python 后端里完成；这里只负责显示状态、
 // 收集用户意图，并把后端返回的 JSON 转成中文提示。
 //
-// 窗口按 Claude 设置页的布局重做：左侧搜索/分区导航，右侧分组设置行。
+// 单页窗口：顶部是身份与状态，下面是可滚动的设置列。
+// 这个助手只有「全部开启」和「全部关闭」两种状态，所以不再逐项放开关，
+// 只在首屏放一个总开关，下面如实列出它包含的每一项及其当前状态。
 // 配色、开关、按钮和间距对齐 Claude 桌面端（深色近黑、蓝色开关、灰色按钮）。
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
-    var scrollView: PlainScrollView!
-    var contentTitleLabel: NSTextField!
-    var sectionViews: [String: NSView] = [:]
-    var sidebarRows: [String: SidebarRowView] = [:]
-    var sidebarHeaders: [(view: NSView, ids: [String])] = []
-    var selectedSection = "general"
-    var searchBox: SearchBoxView!
+    var scrollView: NSScrollView!
+    var scrollFade: ScrollFadeOverlay!
+    var headerIdentity: IdentityStatusView!
 
-    // 主开关：安装 / 恢复正式版可用性补丁。
+    // 主开关：一次安装 / 恢复全部可用性补丁。
     let toggle = ClaudeSwitch()
     let statusLabel = NSTextField(wrappingLabelWithString: "正在检测…")
-    let metaLabel = NSTextField(wrappingLabelWithString: "正在检测…")
-    let sidebarAccount = SidebarAccountView()
-
-    // 右侧设置行里的动态状态。
-    let patchStateLabel = NSTextField(wrappingLabelWithString: "正在检测…")
-    let patchMetaLabel = NSTextField(wrappingLabelWithString: "正在检测…")
     let backupStateLabel = NSTextField(wrappingLabelWithString: "正在检测…")
+    /// 「为官方更新做准备」下面那一行：官方有没有新版。
+    let officialUpdateLabel = NSTextField(wrappingLabelWithString: "正在检查官方新版…")
 
     // 操作按钮。
     let openButton = ClaudeButton(title: "打开", style: .secondary)
@@ -40,12 +34,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let updateButton = ClaudeButton(title: "更新补丁", style: .secondary)
     let prepareButton = ClaudeButton(title: "准备更新", style: .secondary)
     let permissionButton = ClaudeButton(title: "去系统设置", style: .secondary)
-    let guideButton = ClaudeButton(title: "打开说明", style: .secondary)
     let githubButton = ClaudeButton(title: "打开 GitHub", style: .secondary)
     var refreshIconButton: ClaudeIconButton!
-    var closeButton: ClaudeIconButton!
-
-    let progress = NSProgressIndicator()
 
     // 后端最近一次检测结果。
     var enabled = false
@@ -56,7 +46,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var officialMessage = "正在检测…"
     var recoveryRequired = false
     var updateAvailable = false
-    var codeMemorySupported = false
     var patchRevision = 0
     var availableRevision = 0
     var targetExists = false
@@ -81,6 +70,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var justChangedFeature: Bool { Date() < featureHintUntil }
     var permissionReGrantLikely = false
 
+    // 官方新版提醒：只读官方更新渠道，不下载、不登录。
+    var officialUpdateState = ""
+    var officialUpdateInstalled = ""
+    var officialUpdateLatest = ""
+    var officialUpdateAdapted = false
+    var officialUpdateCheckedAt = ""
+    var officialUpdateStale = false
+    var officialUpdateNote = ""
+    var officialUpdateChecking = false
+    /// 联网失败后至少等这么久再自动重试；否则每次窗口激活都会再连一次。
+    var officialUpdateRetryAfter = Date.distantPast
+    /// 用户主动点刷新时，即使缓存没过期也重新联网检查一次。
+    var forceOfficialUpdateCheck = false
+
     // 菜单栏。
     var statusItem: NSStatusItem!
     let trayMenu = NSMenu()
@@ -103,6 +106,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let featureIDs = ["file-analysis", "browser", "auto-approve",
                       "desktop-extensions", "tool-search", "webfetch-preflight",
                       "code-auto-dream"]
+    // 总开关的语义：这些项要么一起开，要么一起关。每一项仍由后端单独校验、
+    // 单独写恢复记录；界面只负责如实显示哪些生效、哪些被跳过。
     let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器",
                          "Cowork 自动审批选项", "插件里的桌面扩展", "MCP 工具按需加载",
                          "WebFetch 免域名预检", "Code 自动整理"]
@@ -122,28 +127,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ("扩展与插件", ["desktop-extensions"]),
         ("Code", ["code-auto-dream"])
     ]
-    /// 每个功能分组对应的侧栏 id，顺序和 featureGroups 一一对应。
+    /// 每个功能分组对应的 id，顺序和 featureGroups 一一对应。
     let featureGroupSections = ["workbench", "network", "extensions", "code"]
-    let featureGroupSymbols = ["square.grid.2x2", "network", "puzzlepiece.extension",
-                               "chevron.left.forwardslash.chevron.right"]
-    /// 概览页里的分组容器：侧栏点分组名就滚到这里，开关本身始终留在概览首屏。
-    var featureGroupViews: [String: NSView] = [:]
-    /// 侧栏行的固定顺序；字典遍历顺序不固定，搜索命中时要靠它挑第一项。
-    var sidebarOrder: [String] = []
-    /// 按 featureIDs 顺序建好每一行：开关数组的下标必须和 featureIDs 对齐，
-    /// 所以不能按分组的顺序去建，只能先全建好再分发到各自分组。
-    lazy var featureRowViews: [NSView] = (0..<featureIDs.count).map { featureRow($0) }
+    /// 每个功能分组右侧的状态文字：总开关统一管理，分组只讲清楚它包含什么、现在是什么状态。
+    var featureGroupStatusLabels: [String: NSTextField] = [:]
+    /// 分组行下面按需出现的说明（出错、此版本没有该设置）。
+    var featureDetailLabels: [String: NSTextField] = [:]
+    var featureHintLabels: [String: NSTextField] = [:]
+    /// 每个分组里各项的出错说明，按功能下标存放，合并后写进上面那一行。
+    var detailLines: [String: [Int: String]] = [:]
     /// Code 自动整理在列表里的位置；它走 CLI 后端，不是 3P 配置项。
     var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
-    var featureSwitches: [ClaudeSwitch] = []
-    var featureLabels: [NSTextField] = []
-    var featureHints: [NSTextField] = []
-    var featureRows: [NSView] = []
     var featureEnabled: [Bool] = Array(repeating: false, count: 7)
-    /// 当前 Claude 版本是否还有这个配置键；没有就禁用而不是装作能点。
+    /// 当前 Claude 版本是否还有这个配置键；没有就在摘要里点名，而不是装作已开启。
     var featureAvailable: [Bool] = Array(repeating: true, count: 7)
     // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
     let featureSummary = NSTextField(wrappingLabelWithString: "")
+    /// 总开关刚做完时那一句“开了几项、跳过几项”，由下一次检测写进 featureSummary。
+    var switchAllSummary = ""
+    /// 总开关刚开启：等重新检测回来，确认需要重新授权时再跳系统设置。
+    var pendingPermissionPrompt = false
 
     // 版本号从 Info.plist 读取，避免以后升级时忘记改界面文案。
     var assistantVersion: String {
@@ -175,7 +178,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "更新解锁补丁", action: #selector(confirmUpdate), keyEquivalent: "u").target = self
         appMenu.addItem(withTitle: "为官方更新做准备", action: #selector(prepareUpdate), keyEquivalent: "p").target = self
         appMenu.addItem(withTitle: "系统授权说明", action: #selector(showPermissionGuide), keyEquivalent: "").target = self
-        appMenu.addItem(withTitle: "使用说明", action: #selector(openFeatureReport), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 Claude 原生助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = appMenu
@@ -192,8 +194,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         workspaceCenter.addObserver(self, selector: #selector(systemDidWake(_:)),
                                     name: NSWorkspace.didWakeNotification, object: nil)
 
-        // 主窗口：透明标题栏、全尺寸内容，左侧栏直接延伸到交通灯下面。
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 820),
+        // 主窗口：透明标题栏、全尺寸内容，单页设置列直接延伸到交通灯下面。
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 820),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "Claude 原生助手"
@@ -202,55 +204,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 会在完成启动之前弹出，把这个只有一扇窗的工具挡在外面。
         window.isRestorable = false
         window.restorationClass = nil
-        window.minSize = NSSize(width: 880, height: 600)
+        window.minSize = NSSize(width: 620, height: 560)
         window.backgroundColor = ClaudeTheme.pane
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
         window.styleMask.insert(.fullSizeContentView)
-        let savedFrameAtLaunch = UserDefaults.standard.string(
-            forKey: "NSWindow Frame ClaudeNativeUnlockSettingsWindowV2")
-        window.setFrameAutosaveName("ClaudeNativeUnlockSettingsWindowV2")
-        // 早期版本可能留下过被 Auto Layout 压窄的窗口尺寸；小于最小宽度就重置。
-        let savedKey = "NSWindow Frame ClaudeNativeUnlockSettingsWindowV2"
-        if let saved = UserDefaults.standard.string(forKey: savedKey) {
-            let parts = saved.split(separator: " ")
-            if parts.count >= 4, let width = Double(parts[2]), width < 880 {
-                UserDefaults.standard.removeObject(forKey: savedKey)
-                window.setContentSize(NSSize(width: 1000, height: 820))
-                window.center()
-            }
-        } else {
-            window.setContentSize(NSSize(width: 1000, height: 820))
+        // 侧栏去掉后窗口变窄，旧的窗口尺寸记录不再适用，换一个新的键。
+        let savedKey = "NSWindow Frame ClaudeNativeUnlockSinglePageWindow"
+        let savedFrameAtLaunch = UserDefaults.standard.string(forKey: savedKey)
+        window.setFrameAutosaveName("ClaudeNativeUnlockSinglePageWindow")
+        if savedFrameAtLaunch == nil {
+            window.setContentSize(NSSize(width: 760, height: 820))
             window.center()
         }
 
         let root = FocusRootView()
         root.wantsLayer = true
         window.contentView = root
-        let sidebar = buildSidebar()
         let pane = buildContentPane()
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
         pane.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(sidebar)
         root.addSubview(pane)
         NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: ClaudeTheme.Metric.navWidth),
-            pane.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            pane.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             pane.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             pane.topAnchor.constraint(equalTo: root.topAnchor),
-            pane.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            pane.widthAnchor.constraint(greaterThanOrEqualToConstant: 600)
+            pane.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ])
-        window.contentMinSize = NSSize(width: 880, height: 600)
+        window.contentMinSize = NSSize(width: 620, height: 560)
 
         if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(window.frame) }) {
             window.center()
         }
-        selectSection("general")
+        refreshHeader()
         updateStatusPill()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -261,7 +247,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if savedFrameAtLaunch == nil {
             // Auto Layout 会把窗口压到最小宽度；首次启动时在布局完成后恢复到目标尺寸。
             DispatchQueue.main.async {
-                self.window.setContentSize(NSSize(width: 1000, height: 820))
+                self.window.setContentSize(NSSize(width: 760, height: 820))
                 self.window.center()
             }
         }
@@ -275,378 +261,141 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
     }
 
-    // MARK: - 左侧栏
+    // MARK: - 主界面
 
-    func buildSidebar() -> NSView {
-        let sidebar = SidebarBackgroundView()
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.distribution = .fill
-        stack.spacing = 0
-        stack.wantsLayer = true
-        // 官方设置页侧栏：p-2 外边距，搜索框与导航行左右再收 8pt。
-        stack.edgeInsets = NSEdgeInsets(top: 44, left: 16, bottom: 12, right: 16)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: sidebar.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor)
-        ])
+    /// 顶部身份栏：星芒头像、名称和实时状态，右侧只有一个刷新图标。
+    /// 原来在侧栏左下角的那一块整体搬到这里；窗口里不再有侧栏。
+    /// 右上角不再放关闭按钮，也不再另放一个转圈指示器：加载时由刷新图标自己旋转。
+    func buildHeader() -> NSView {
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
 
-        // 与 Claude 设置页一致：搜索框直接放在交通灯下面，不在侧栏顶部加品牌行。
-        searchBox = SearchBoxView()
-        searchBox.onChange = { [weak self] in self?.filterSidebar() }
-        searchBox.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(searchBox)
-        // `-16` 是本文件里侧栏子视图的统一写法：内容区从左边距 16 开始、宽 = 侧栏宽 - 16，
-        // 与下面的导航行完全对齐。改成 `stack.width` 会让搜索框比导航行宽出 16pt 并左边越界
-        // （预览像素实测：左边界从 22pt 跑到 5pt）。搜索框内部四周另有 6pt 绘制留白，属设计。
-        searchBox.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
-        searchBox.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        stack.setCustomSpacing(18, after: searchBox)
-
-        addSidebarHeader("设置", ids: ["general", "patch"], to: stack)
-        addSidebarRow("general", title: "概览", symbol: "slider.horizontal.3", to: stack)
-        addSidebarRow("patch", title: "补丁与更新", symbol: "arrow.triangle.2.circlepath", to: stack)
-
-        // 功能分组在侧栏各有入口：点一下回到概览并滚到该组。
-        // 开关本身始终留在概览首屏，侧栏这里是目录，不是另一个页面。
-        addSidebarHeader("功能", ids: featureGroupSections, to: stack)
-        for (index, entry) in featureGroups.enumerated() {
-            let id = featureGroupSections[index]
-            addSidebarRow(id, title: entry.0, symbol: featureGroupSymbols[index], to: stack) {
-                [weak self] in self?.jumpToFeatureGroup(id)
-            }
-        }
-
-        addSidebarHeader("本机", ids: ["system", "about"], to: stack)
-        addSidebarRow("system", title: "系统授权", symbol: "lock.shield", to: stack)
-        addSidebarRow("about", title: "关于", symbol: "info.circle", to: stack)
-
-        addSidebarHeader("更多", ids: ["shortcuts", "guide", "github"], to: stack)
-        addSidebarRow("shortcuts", title: "快捷键", symbol: "command", to: stack)
-        addSidebarRow("guide", title: "使用说明", symbol: "book", to: stack) { [weak self] in
-            self?.openFeatureReport()
-        }
-        addSidebarRow("github", title: "源码仓库", symbol: "link", to: stack) { [weak self] in
-            self?.openGitHub()
-        }
-
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.init(1), for: .vertical)
-        stack.addArrangedSubview(spacer)
-
-        let accountLine = HairlineView()
-        accountLine.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(accountLine)
-        accountLine.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
-        accountLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        stack.setCustomSpacing(8, after: accountLine)
-
-        sidebarAccount.translatesAutoresizingMaskIntoConstraints = false
-        sidebarAccount.onAbout = { [weak self] in self?.selectSection("about") }
-        stack.addArrangedSubview(sidebarAccount)
-        sidebarAccount.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
-        sidebarAccount.heightAnchor.constraint(equalToConstant: 48).isActive = true
-
-        return sidebar
-    }
-
-    func addSidebarHeader(_ title: String, ids: [String], to stack: NSStackView) {
-        let label = NSTextField(labelWithString: title)
-        label.font = ClaudeFont.caption(.medium)
-        label.textColor = ClaudeTheme.textMuted
-        let wrap = NSView()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        wrap.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 8),
-            label.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 16),
-            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -6)
-        ])
-        stack.addArrangedSubview(wrap)
-        wrap.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
-        sidebarHeaders.append((wrap, ids))
-    }
-
-    func addSidebarRow(_ id: String, title: String, symbol: String, to stack: NSStackView,
-                       action: (() -> Void)? = nil) {
-        let row = SidebarRowView(id: id, title: title, symbol: symbol) { [weak self] selected in
-            if let action = action {
-                action()
-            } else {
-                self?.selectSection(selected)
-            }
-        }
-        row.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
-        row.heightAnchor.constraint(equalToConstant: ClaudeTheme.Metric.controlHeight).isActive = true
-        sidebarRows[id] = row
-        sidebarOrder.append(id)
-    }
-
-    /// 侧栏的分组名是概览页里的锚点：回到概览并滚到该组，高亮留在分组名上。
-    func jumpToFeatureGroup(_ id: String) {
-        guard let group = featureGroupViews[id] else { return }
-        selectSection("general", highlight: id)
-        // 切页后要等布局完成，分组才有正确的 frame。
-        DispatchQueue.main.async {
-            guard let document = self.scrollView?.documentView else { return }
-            self.scrollView?.scrollToRect(group.convert(group.bounds, to: document))
-        }
-    }
-
-    func selectSection(_ id: String, highlight: String? = nil) {
-        guard sectionViews[id] != nil else { return }
-        selectedSection = id
-        let highlighted = highlight ?? id
-        for (rowID, row) in sidebarRows {
-            row.isSelected = rowID == highlighted
-        }
-        for (sectionID, view) in sectionViews {
-            view.isHidden = sectionID != id
-        }
-        var titles = [
-            "general": "概览",
-            "patch": "补丁与更新",
-            "system": "系统授权",
-            "shortcuts": "快捷键",
-            "about": "关于"
-        ]
-        for (index, groupTitle) in featureGroups.map({ $0.0 }).enumerated() {
-            titles[featureGroupSections[index]] = groupTitle
-        }
-        contentTitleLabel?.stringValue = titles[id] ?? ""
-        // 等这次布局完成后再回到顶部；滚动容器高度刚变化时立即 scroll 会停在旧位置。
-        // 锚点跳转要滚到分组，不能在这里再回顶部，否则会把目标位置覆盖掉。
-        if highlight == nil {
-            DispatchQueue.main.async {
-                self.scrollView?.scrollToTop()
-            }
-        }
-    }
-
-    // MARK: - 右侧内容
-
-    func buildContentPane() -> NSView {
-        let pane = ContentBackgroundView()
-        let topBar = NSView()
-        topBar.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(topBar)
-
-        contentTitleLabel = NSTextField(labelWithString: "概览")
-        contentTitleLabel.font = ClaudeFont.title()
-        contentTitleLabel.textColor = ClaudeTheme.textPrimary
-        contentTitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        // 与官方设置页一致：内容顶部是 22pt semibold 的页面标题，右侧放关闭按钮。
-        topBar.addSubview(contentTitleLabel)
-
-        progress.style = .spinning
-        progress.controlSize = .small
-        progress.isDisplayedWhenStopped = false
-        progress.translatesAutoresizingMaskIntoConstraints = false
-        topBar.addSubview(progress)
+        headerIdentity = IdentityStatusView()
+        headerIdentity.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(headerIdentity)
 
         refreshIconButton = ClaudeIconButton(symbol: "arrow.clockwise",
                                              accessibility: "重新检测") { [weak self] in
             self?.refresh()
         }
-        closeButton = ClaudeIconButton(symbol: "xmark", accessibility: "关闭窗口") { [weak self] in
-            self?.window.performClose(nil)
-        }
         refreshIconButton.translatesAutoresizingMaskIntoConstraints = false
-        closeButton.translatesAutoresizingMaskIntoConstraints = false
-        topBar.addSubview(refreshIconButton)
-        topBar.addSubview(closeButton)
+        header.addSubview(refreshIconButton)
 
-        let scroller = PlainScrollView()
-        scrollView = scroller
-        scroller.translatesAutoresizingMaskIntoConstraints = false
-        pane.addSubview(scroller)
+        let line = HairlineView()
+        line.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(line)
 
         NSLayoutConstraint.activate([
-            topBar.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
-            topBar.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
-            topBar.topAnchor.constraint(equalTo: pane.topAnchor),
-            topBar.heightAnchor.constraint(equalToConstant: 60),
-            contentTitleLabel.leadingAnchor.constraint(equalTo: topBar.leadingAnchor,
-                                                       constant: ClaudeTheme.Metric.contentInsetX),
-            contentTitleLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
-            progress.trailingAnchor.constraint(equalTo: refreshIconButton.leadingAnchor, constant: -12),
-            progress.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
-            closeButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -16),
-            closeButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
-            closeButton.widthAnchor.constraint(equalToConstant: 28),
-            closeButton.heightAnchor.constraint(equalToConstant: 28),
-            refreshIconButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -4),
-            refreshIconButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor, constant: 8),
+            // 42pt 是给交通灯留的高度；身份块本身 40pt 高，与右侧图标同一条基线。
+            headerIdentity.leadingAnchor.constraint(equalTo: header.leadingAnchor,
+                                                    constant: ClaudeTheme.Metric.contentInsetX),
+            headerIdentity.topAnchor.constraint(equalTo: header.topAnchor, constant: 42),
+            headerIdentity.heightAnchor.constraint(equalToConstant: 40),
+            headerIdentity.trailingAnchor.constraint(lessThanOrEqualTo: refreshIconButton.leadingAnchor,
+                                                     constant: -12),
+            refreshIconButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+            refreshIconButton.centerYAnchor.constraint(equalTo: headerIdentity.centerYAnchor),
             refreshIconButton.widthAnchor.constraint(equalToConstant: 28),
             refreshIconButton.heightAnchor.constraint(equalToConstant: 28),
-            scrollView.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: pane.bottomAnchor)
+            line.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            line.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            line.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            line.heightAnchor.constraint(equalToConstant: 1)
+        ])
+        return header
+    }
+
+    func buildContentPane() -> NSView {
+        let pane = ContentBackgroundView()
+        let header = buildHeader()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(header)
+
+        // 用系统 NSScrollView，而不是自己解释滚轮事件：方向、惯性、橡皮筋回弹
+        // 和触控板手势都交给 AppKit，滚动只移动裁剪层，不再每帧触发布局。
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.horizontalScrollElasticity = .none
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 20, right: 0)
+        scrollView = scroll
+        pane.addSubview(scroll)
+
+        let fade = ScrollFadeOverlay()
+        fade.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(fade)
+        scrollFade = fade
+
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            header.topAnchor.constraint(equalTo: pane.topAnchor),
+            header.heightAnchor.constraint(equalToConstant: 94),
+            scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: header.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+            fade.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            fade.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            fade.topAnchor.constraint(equalTo: scroll.topAnchor),
+            fade.bottomAnchor.constraint(equalTo: scroll.bottomAnchor)
         ])
 
         let doc = FlippedView()
         doc.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = doc
-        let sections = NSStackView()
-        sections.orientation = .vertical
-        sections.alignment = .leading
-        sections.distribution = .fill
-        sections.spacing = 0
-        // 内容短的分区不能被拉到视口高度：外层 .fill 会把多余高度摊给可见的分区，
-        // 「系统授权」这类只有两组的页面行距就会被撑成两倍。
-        sections.setContentHuggingPriority(.required, for: .vertical)
-        sections.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(sections)
+        scroll.documentView = doc
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(scrollBoundsChanged(_:)),
+            name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.distribution = .fill
+        content.spacing = 0
+        // 内容短的时候不能被拉满视口，否则分组之间的行距会被撑开。
+        content.setContentHuggingPriority(.required, for: .vertical)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(content)
         NSLayoutConstraint.activate([
-            doc.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            doc.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            doc.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            doc.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            doc.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
-            sections.leadingAnchor.constraint(equalTo: doc.leadingAnchor,
-                                              constant: ClaudeTheme.Metric.contentInsetX),
-            sections.trailingAnchor.constraint(equalTo: doc.trailingAnchor,
-                                               constant: -ClaudeTheme.Metric.contentInsetX),
-            sections.topAnchor.constraint(equalTo: doc.topAnchor, constant: 4),
-            // 用「不超过」而不是「等于」：等于会把文档高度反推给分区，逼着它撑满视口。
-            sections.bottomAnchor.constraint(lessThanOrEqualTo: doc.bottomAnchor, constant: -40),
-            doc.heightAnchor.constraint(greaterThanOrEqualTo: sections.heightAnchor, constant: 44)
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            content.leadingAnchor.constraint(equalTo: doc.leadingAnchor,
+                                             constant: ClaudeTheme.Metric.contentInsetX),
+            content.trailingAnchor.constraint(equalTo: doc.trailingAnchor,
+                                              constant: -ClaudeTheme.Metric.contentInsetX),
+            content.topAnchor.constraint(equalTo: doc.topAnchor, constant: 20),
+            content.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -32)
         ])
 
-        let builders: [(String, NSView)] = [
-            ("general", buildGeneralSection()),
-            ("patch", buildPatchSection()),
-            ("system", buildSystemSection()),
-            ("shortcuts", buildShortcutsSection()),
-            ("about", buildAboutSection())
-        ]
-        for (id, view) in builders {
-            sections.addArrangedSubview(view)
-            view.widthAnchor.constraint(equalTo: sections.widthAnchor).isActive = true
-            sectionViews[id] = view
-        }
+        let page = buildSettingsPage()
+        content.addArrangedSubview(page)
+        page.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         return pane
     }
 
-    func buildGeneralSection() -> NSView {
+    /// 单页设置：总开关、它包含的功能、维护、系统授权和关于。
+    /// 每一项都只有一个事实，没有逐项开关——这个助手只有全开和全关两种状态。
+    func buildSettingsPage() -> NSView {
         configureDynamicLabel(statusLabel)
-        configureDynamicLabel(metaLabel)
+        configureDynamicLabel(backupStateLabel)
 
-        let computerUse = settingsRow(
-            title: "Computer Use",
+        let master = settingsRow(
+            title: "全部功能",
             descriptionView: statusLabel,
             control: toggle)
         toggle.target = self
         toggle.action = #selector(switchChanged)
-        toggle.setAccessibilityLabel("Computer Use 解锁开关")
+        toggle.setAccessibilityLabel("全部功能解锁开关")
         toggle.isEnabled = false
 
-        // 标题原来只写「Claude」，和内容开头的「Claude 3.6556.2…」重复，
-        // 也没说明这一行是什么。改成说明行本身（版本/补丁/运行状态）。
-        let versionRow = settingsRow(
-            title: "已安装版本",
-            descriptionView: metaLabel)
-
-        let openRow = settingsRow(
-            title: "打开 Claude",
-            description: "启动已安装的 Claude 应用。",
-            control: openButton)
-        openButton.target = self
-        openButton.action = #selector(openClaude)
-
-        let refreshRow = settingsRow(
-            title: "重新检测",
-            description: "重新核对补丁、官方备份与配置状态。",
-            control: refreshButton)
-        refreshButton.target = self
-        refreshButton.action = #selector(refresh)
-
-        featureSummary.font = ClaudeFont.caption()
-        featureSummary.textColor = ClaudeTheme.warning
-        featureSummary.isHidden = true
-        featureSummary.maximumNumberOfLines = 3
-        featureSummary.lineBreakMode = .byWordWrapping
-
-        // 概览首屏保留全部功能开关（用户明确要求），按官方设置页的方式分组：
-        // 每组一个 15pt 标题、带 1px 分隔线的行；侧栏的分组名是这些组的锚点。
-        var groups: [NSView] = [featureSummary,
-                                settingsGroup("解锁", rows: [computerUse, versionRow])]
-        for (index, entry) in featureGroups.enumerated() {
-            let rows = entry.1.compactMap { id in
-                featureIDs.firstIndex(of: id).map { featureRowViews[$0] }
-            }
-            guard !rows.isEmpty else { continue }
-            let group = settingsGroup(entry.0, rows: rows)
-            featureGroupViews[featureGroupSections[index]] = group
-            groups.append(group)
-        }
-        groups.append(settingsGroup("操作", rows: [openRow, refreshRow]))
-
-        return section(groups,
-                       intro: "Computer Use、原生配置与 Code 自动整理的可用性开关。动作授权、拒绝与中断仍由 Claude 处理。")
-    }
-
-    func featureRow(_ index: Int) -> NSView {
-        let title = ClaudeFont.label(featureTitles[index], font: ClaudeFont.body())
-        title.textColor = ClaudeTheme.textPrimary
-        title.toolTip = featureDescriptions[index]
-
-        let desc = ClaudeFont.label(featureDescriptions[index], font: ClaudeFont.body())
-        desc.textColor = ClaudeTheme.textMuted
-        desc.maximumNumberOfLines = 0
-        desc.lineBreakMode = .byWordWrapping
-        desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let detail = NSTextField(wrappingLabelWithString: "")
-        detail.font = ClaudeFont.caption()
-        detail.textColor = ClaudeTheme.warning
-        detail.maximumNumberOfLines = 2
-        detail.lineBreakMode = .byWordWrapping
-        detail.isHidden = true
-
-        let hint = NSTextField(wrappingLabelWithString: "")
-        hint.font = ClaudeFont.caption()
-        hint.textColor = ClaudeTheme.textMuted
-        hint.maximumNumberOfLines = 2
-        hint.lineBreakMode = .byWordWrapping
-        hint.isHidden = true
-
-        let control = ClaudeSwitch()
-        control.tag = index
-        control.target = self
-        control.action = #selector(featureChanged(_:))
-        control.setAccessibilityLabel(featureTitles[index] + " 配置开关")
-        control.isEnabled = false
-        control.setContentHuggingPriority(.required, for: .horizontal)
-        control.setContentCompressionResistancePriority(.required, for: .horizontal)
-        featureSwitches.append(control)
-        featureLabels.append(detail)
-        featureHints.append(hint)
-
-        let row = settingsRow(titleView: title, descriptionView: desc,
-                              extraViews: [detail, hint], control: control)
-        featureRows.append(row)
-        return row
-    }
-
-    func buildPatchSection() -> NSView {
-        configureDynamicLabel(patchStateLabel)
-        configureDynamicLabel(patchMetaLabel)
-        configureDynamicLabel(backupStateLabel)
-
-        let stateRow = settingsRow(title: "补丁状态", descriptionView: patchStateLabel)
-        // 与概览页同一份内容（metaLabel 的镜像），标题也保持一致，
-        // 否则同一个值在两页叫两个名字。
-        let versionRow = settingsRow(title: "已安装版本", descriptionView: patchMetaLabel)
-        let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel)
 
         updateButton.target = self
         updateButton.action = #selector(confirmUpdate)
@@ -658,22 +407,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         prepareButton.target = self
         prepareButton.action = #selector(prepareUpdate)
+        configureDynamicLabel(officialUpdateLabel)
         let prepareRow = settingsRow(
             title: "为官方更新做准备",
             description: "恢复完整官方签名和官方文件，供 Claude 官方更新器校验。备份、配置和会话都会保留。",
+            extraViews: [officialUpdateLabel],
             control: prepareButton)
 
-        return section([
-            settingsGroup("状态", rows: [stateRow, versionRow, backupRow]),
-            settingsGroup("维护", rows: [updateRow, prepareRow])
-        ], intro: "补丁只在已适配的 Claude 版本上安装；更新或恢复都会先校验当前文件和官方备份。")
-    }
+        let backupRow = settingsRow(title: "官方备份", descriptionView: backupStateLabel)
 
-    func buildSystemSection() -> NSView {
+        openButton.target = self
+        openButton.action = #selector(openClaude)
+        let openRow = settingsRow(
+            title: "打开 Claude",
+            description: "启动已安装的 Claude 应用。",
+            control: openButton)
+
+        refreshButton.target = self
+        refreshButton.action = #selector(refresh)
+        let refreshRow = settingsRow(
+            title: "重新检测",
+            description: "重新核对补丁、官方备份与配置状态。",
+            control: refreshButton)
+
         permissionButton.target = self
         permissionButton.action = #selector(openPrivacySettings)
         permissionButton.toolTip = "打开系统设置的隐私页面，给 Claude 勾选辅助功能与屏幕录制。"
-
         let permissionRow = settingsRow(
             title: "辅助功能与屏幕录制",
             description: "在系统设置里给 Claude 勾选这两项，然后在 Claude 设置 → This computer → System 确认显示 Granted。",
@@ -687,58 +446,138 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             title: "外部浏览器",
             description: "Dia、Chrome 等外部浏览器受官方只读授权限制，Computer Use 不能点击或输入。网页操作请用 Claude 官方内置浏览器或 Claude in Chrome。")
 
-        return section([
-            settingsGroup("权限", rows: [permissionRow]),
-            settingsGroup("边界", rows: [reviewRow, browserRow])
-        ], intro: "系统授权由 macOS 管理，只有你本人在系统设置里才能勾选；本工具只能把你带到对应页面。")
-    }
-
-    func buildShortcutsSection() -> NSView {
-        func keycap(_ text: String) -> NSTextField {
-            let label = NSTextField(labelWithString: text)
-            label.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-            label.textColor = ClaudeTheme.textSecondary
-            return label
-        }
-        let rows = [
-            settingsRow(title: "重新检测", description: "重新核对补丁、官方备份与配置状态。", control: keycap("⌘R")),
-            settingsRow(title: "打开 Claude", description: "启动已安装的 Claude 应用。", control: keycap("⌘O")),
-            settingsRow(title: "显示主窗口", description: "从菜单栏回到这个窗口。", control: keycap("⌘0")),
-            settingsRow(title: "快捷操作菜单", description: "在窗口右上角弹出菜单栏菜单。", control: keycap("⌘M")),
-            settingsRow(title: "更新解锁补丁", description: "安装最新适配 revision。", control: keycap("⌘U")),
-            settingsRow(title: "为官方更新做准备", description: "恢复官方签名和文件，供官方更新器校验。", control: keycap("⌘P")),
-            settingsRow(title: "退出助手", description: "菜单栏图标也会一起退出。", control: keycap("⌘Q"))
-        ]
-        return section([
-            settingsGroup("键盘", rows: rows)
-        ], intro: "这些快捷键在助手窗口激活时可用；菜单栏菜单里也有同样的入口。")
-    }
-
-    func buildAboutSection() -> NSView {
-        guideButton.target = self
-        guideButton.action = #selector(openFeatureReport)
         githubButton.target = self
         githubButton.action = #selector(openGitHub)
-
-        let versionRow = settingsRow(
-            title: "版本",
-            description: "Claude 原生助手 " + assistantVersion + " (" + assistantBuild + ")。")
-        let guideRow = settingsRow(
-            title: "使用说明",
-            description: "打开随包的中文说明，包含开关含义、官方更新顺序和恢复步骤。",
-            control: guideButton)
         let githubRow = settingsRow(
             title: "源码与发布",
             description: "独立开源项目，与 Anthropic 无隶属关系；只分发自有的工具代码，不含 Claude 程序或用户数据。",
             control: githubButton)
+        let appVersionRow = settingsRow(
+            title: "助手版本",
+            description: "Claude 原生助手 " + assistantVersion + " (" + assistantBuild + ")。")
         let dataRow = settingsRow(
             title: "数据位置",
             description: "备份与恢复记录保存在 ~/Library/Application Support/Claude 原生助手/，请勿手动删除。")
 
-        return section([
-            settingsGroup("应用", rows: [versionRow, guideRow, githubRow]),
-            settingsGroup("数据", rows: [dataRow])
-        ], intro: "只解除已适配版本的原生功能可用性条件，不修改官方功能行为。")
+        featureSummary.font = ClaudeFont.caption()
+        featureSummary.textColor = ClaudeTheme.warning
+        featureSummary.isHidden = true
+        featureSummary.maximumNumberOfLines = 3
+        featureSummary.lineBreakMode = .byWordWrapping
+
+        let groups: [NSView] = [
+            featureSummary,
+            settingsGroup("解锁", rows: [master]),
+            settingsGroup("包含的功能", rows: featureGroups.indices.map { featureGroupRow($0) }),
+            settingsGroup("维护", rows: [backupRow, updateRow, prepareRow, openRow, refreshRow]),
+            settingsGroup("系统授权", rows: [permissionRow, reviewRow, browserRow]),
+            settingsGroup("关于", rows: [appVersionRow, githubRow, dataRow])
+        ]
+        return section(groups,
+                       intro: "总开关一次处理 Computer Use、原生配置与 Code 自动整理。动作授权、拒绝与中断仍由 Claude 处理。")
+    }
+
+    /// 一个功能分组的一行：组名 + 它包含的功能 + 当前状态。
+    /// 总开关统一管理，所以这里没有开关，只有事实；出错时才多一行说明。
+    func featureGroupRow(_ index: Int) -> NSView {
+        let entry = featureGroups[index]
+        let names = entry.1.compactMap { id in
+            featureIDs.firstIndex(of: id).map { featureTitles[$0] }
+        }.joined(separator: "、")
+        let status = ClaudeFont.label("检测中", font: ClaudeFont.footnote())
+        status.textColor = ClaudeTheme.textMuted
+        status.alignment = .right
+        status.setContentHuggingPriority(.required, for: .horizontal)
+        status.setContentCompressionResistancePriority(.required, for: .horizontal)
+        featureGroupStatusLabels[entry.0] = status
+
+        let detail = NSTextField(wrappingLabelWithString: "")
+        detail.font = ClaudeFont.caption()
+        detail.textColor = ClaudeTheme.warning
+        detail.maximumNumberOfLines = 4
+        detail.lineBreakMode = .byWordWrapping
+        detail.isHidden = true
+        featureDetailLabels[entry.0] = detail
+
+        let hint = NSTextField(wrappingLabelWithString: "")
+        hint.font = ClaudeFont.caption()
+        hint.textColor = ClaudeTheme.textMuted
+        hint.maximumNumberOfLines = 3
+        hint.lineBreakMode = .byWordWrapping
+        hint.isHidden = true
+        featureHintLabels[entry.0] = hint
+
+        let title = ClaudeFont.label(entry.0, font: ClaudeFont.body())
+        title.textColor = ClaudeTheme.textPrimary
+        let desc = ClaudeFont.label(names, font: ClaudeFont.body())
+        desc.textColor = ClaudeTheme.textMuted
+        desc.maximumNumberOfLines = 0
+        desc.lineBreakMode = .byWordWrapping
+        desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return settingsRow(titleView: title, descriptionView: desc,
+                           extraViews: [detail, hint], control: status)
+    }
+
+    /// 某个功能属于哪个分组；说明文字挂在该分组那一行下面。
+    func groupTitle(forFeature index: Int) -> String? {
+        guard featureIDs.indices.contains(index) else { return nil }
+        return featureGroups.first(where: { $0.1.contains(featureIDs[index]) })?.0
+    }
+
+    /// 把每个分组里各项的状态汇总成一句话，不再逐项放开关。
+    func updateFeatureGroupStatus() {
+        for entry in featureGroups {
+            guard let label = featureGroupStatusLabels[entry.0] else { continue }
+            let indexes = entry.1.compactMap { featureIDs.firstIndex(of: $0) }
+            let total = indexes.count
+            let on = indexes.filter { featureEnabled[$0] && featureAvailable[$0] }.count
+            let missing = indexes.filter { !featureAvailable[$0] }.count
+            let text: String
+            let color: NSColor
+            if total == 0 {
+                text = ""
+                color = ClaudeTheme.textMuted
+            } else if missing == total {
+                text = "此版本没有"
+                color = ClaudeTheme.warning
+            } else if on == total {
+                text = "已开启"
+                color = ClaudeTheme.textSecondary
+            } else if on == 0 {
+                text = missing > 0 ? "未开启 · \(missing) 项不可用" : "未开启"
+                color = missing > 0 ? ClaudeTheme.warning : ClaudeTheme.textMuted
+            } else {
+                text = "部分开启 · \(on)/\(total)"
+                color = ClaudeTheme.warning
+            }
+            label.stringValue = text
+            label.textColor = color
+            // 悬停能看到逐项事实：开着的是不是本工具改的、关掉时会不会还原。
+            // 逐项状态仍然保留，只是不再各占一个开关。
+            label.toolTip = indexes.map { index -> String in
+                let state: String
+                if !featureAvailable[index] {
+                    state = "此版本没有这个设置"
+                } else if featureEnabled[index] {
+                    state = featureRestorable[index] ? "已开启（关闭时还原为官方原值）" : "已开启（不是本工具改的，关闭时不还原）"
+                } else {
+                    state = "未开启"
+                }
+                return featureTitles[index] + "：" + state
+            }.joined(separator: "\n")
+        }
+    }
+
+    @objc func scrollBoundsChanged(_ notification: Notification) {
+        updateScrollFade()
+    }
+
+    func updateScrollFade() {
+        guard let scroll = scrollView, let fade = scrollFade else { return }
+        let offset = scroll.contentView.bounds.origin.y
+        let maximum = max(0, (scroll.documentView?.frame.height ?? 0)
+                             - scroll.contentView.bounds.height)
+        fade.update(offset: offset, maximum: maximum)
     }
 
     // MARK: - 设置行与分组
@@ -749,8 +588,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stack.alignment = .leading
         stack.distribution = .fill
         stack.spacing = 0
-        // 内容短的分区不能被拉高：外层 .fill 会把多余高度分给视图，
-        // 结果「系统授权」这种只有两组的页面行距被撑成两倍。
         stack.setContentHuggingPriority(.required, for: .vertical)
 
         // 官方设置页的分组说明：13pt 次级文字，位于页面标题下方。
@@ -770,7 +607,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             stack.addArrangedSubview(group)
             group.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             if index < groups.count - 1 {
-                // 官方分组之间是 40pt 空白加 1px 分隔线。
+                // 官方分组之间是 40pt 空白。
                 stack.setCustomSpacing(ClaudeTheme.Metric.groupGap, after: group)
             }
         }
@@ -805,6 +642,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func settingsRow(title: String, description: String, control: NSView? = nil) -> NSView {
+        settingsRow(title: title, description: description, extraViews: [], control: control)
+    }
+
+    func settingsRow(title: String, description: String, extraViews: [NSView],
+                     control: NSView? = nil) -> NSView {
         let titleLabel = ClaudeFont.label(title, font: ClaudeFont.body())
         titleLabel.textColor = ClaudeTheme.textPrimary
         let desc = ClaudeFont.label(description, font: ClaudeFont.body())
@@ -813,7 +655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         desc.lineBreakMode = .byWordWrapping
         desc.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return settingsRow(titleView: titleLabel, descriptionView: desc,
-                           extraViews: [], control: control)
+                           extraViews: extraViews, control: control)
     }
 
     func settingsRow(title: String, descriptionView: NSView, control: NSView? = nil) -> NSView {
@@ -867,53 +709,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         label.textColor = ClaudeTheme.textMuted
         label.maximumNumberOfLines = 0
         label.lineBreakMode = .byWordWrapping
-    }
-
-    // MARK: - 搜索
-
-    func filterSidebar() {
-        let query = searchBox.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // 命中某个开关时，它所在的分组页也要留下来，否则搜索完点进去是空的。
-        let hitIndex = query.isEmpty ? nil : featureTitles.firstIndex { title in
-            title.lowercased().contains(query)
-                || featureDescriptions[featureTitles.firstIndex(of: title) ?? 0].lowercased().contains(query)
-        }
-        let hitSection = hitIndex.flatMap { featureGroupSection(for: featureIDs[$0]) }
-        var firstVisible: String?
-        for id in sidebarOrder {
-            guard let row = sidebarRows[id] else { continue }
-            let matches = query.isEmpty || row.titleText.lowercased().contains(query) || id == hitSection
-            row.isHidden = !matches
-            if matches, firstVisible == nil { firstVisible = id }
-        }
-        for (view, ids) in sidebarHeaders {
-            view.isHidden = !ids.contains { sidebarRows[$0]?.isHidden == false }
-        }
-        if let current = sidebarRows[selectedSection], current.isHidden, let id = firstVisible {
-            selectSection(id)
-        }
-        if let index = hitIndex {
-            selectSection("general", highlight: featureGroupSection(for: featureIDs[index]))
-            scrollToFeature(index)
-        }
-    }
-
-    /// 某个开关属于哪个侧栏分区。
-    func featureGroupSection(for id: String) -> String? {
-        guard let group = featureGroups.firstIndex(where: { $0.1.contains(id) }),
-              featureGroupSections.indices.contains(group) else { return nil }
-        return featureGroupSections[group]
-    }
-
-    /// 搜索命中某个原生配置时，滚到那一行，而不是只换页面。
-    func scrollToFeature(_ index: Int) {
-        guard featureRows.indices.contains(index) else { return }
-        // 切页后要等布局完成，行才有正确的 frame。
-        DispatchQueue.main.async {
-            guard let document = self.scrollView?.documentView else { return }
-            let row = self.featureRows[index]
-            self.scrollView?.scrollToRect(row.convert(row.bounds, to: document))
-        }
     }
 
     // MARK: - 生命周期
@@ -977,44 +772,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         execute("status-all", backend: "all")
     }
 
-    @objc func refresh() { execute("status-all", backend: "all") }
+    @objc func refresh() {
+        // 用户主动刷新时，官方新版提醒也重新联网查一次，不受缓存期限限制。
+        guard !busy, !quittingClaude else { return }
+        forceOfficialUpdateCheck = true
+        execute("status-all", backend: "all")
+    }
     @objc func openClaude() { execute("launch") }
     @objc func prepareUpdate() { confirmPrepareUpdate() }
 
     @objc func switchChanged() {
-        let command = toggle.state == .on ? "enable" : "disable"
+        // 总开关：一次安装或恢复全部可用性补丁。界面先还原显示，
+        // 真正的状态以后端返回的检测结果为准，不靠本地猜测。
+        let enabling = toggle.state == .on
         toggle.state = enabled ? .on : .off
-        withClaudeQuitIfNeeded(command == "enable" ? "开启原生补丁" : "关闭原生补丁",
+        withClaudeQuitIfNeeded(enabling ? "开启全部功能" : "恢复官方原版",
                                relaunch: true) {
-            self.execute(command)
-        }
-    }
-
-    @objc func openFeatureReport() {
-        if let url = Bundle.main.url(forResource: "使用说明", withExtension: "html") {
-            NSWorkspace.shared.open(url)
+            self.execute(enabling ? "enable-all" : "restore-all", backend: "all")
         }
     }
 
     @objc func openGitHub() {
         if let url = URL(string: "https://github.com/canner0725-byte/Claude-Native-Unlock") {
             NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc func featureChanged(_ sender: ClaudeSwitch) {
-        let index = sender.tag
-        let enabling = sender.state == .on
-        sender.state = featureEnabled[index] ? .on : .off
-        featureHintUntil = Date().addingTimeInterval(120)
-        let name = featureTitles[index]
-        withClaudeQuitIfNeeded((enabling ? "开启「" : "关闭「") + name + "」", relaunch: true) {
-            if self.featureIDs[index] == "code-auto-dream" {
-                self.execute(enabling ? "enable" : "restore", backend: "native_cli_unlock")
-            } else {
-                self.execute(enabling ? "enable" : "restore",
-                             backend: "native_features", feature: self.featureIDs[index])
-            }
         }
     }
 
@@ -1182,7 +962,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         relaunchAfterAction = relaunch
         statusLabel.stringValue = "正在等待 Claude 退出…"
         statusLabel.textColor = ClaudeTheme.textSecondary
-        progress.startAnimation(nil)
+        setLoading(true)
         refreshButtons()
         updateStatusItem()
 
@@ -1245,7 +1025,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         quittingClaude = false
         quitFinalizeDeadline = .distantPast
         recordQuit("action-start")
-        progress.stopAnimation(nil)
+        setLoading(false)
         action()
         refreshButtons()
         updateStatusItem()
@@ -1258,7 +1038,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         quitFinalizeDeadline = .distantPast
         pendingAfterQuit = nil
         relaunchAfterAction = false
-        progress.stopAnimation(nil)
+        setLoading(false)
         refreshButtons()
         updateStatusItem()
         let alert = NSAlert()
@@ -1291,7 +1071,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         trayUpdate.target = self
         trayPrepare = trayMenu.addItem(withTitle: "为官方更新做准备", action: #selector(prepareUpdate), keyEquivalent: "")
         trayPrepare.target = self
-        trayMenu.addItem(withTitle: "使用说明", action: #selector(openFeatureReport), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "去系统设置授权", action: #selector(openPrivacySettings), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "系统授权说明", action: #selector(showPermissionGuide), keyEquivalent: "").target = self
         trayMenu.addItem(withTitle: "关于", action: #selector(showAbout), keyEquivalent: "").target = self
@@ -1335,9 +1114,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusPill()
     }
 
-    /// 左侧栏底部的状态胶囊。
+    /// 顶部身份栏右侧的实时状态；原来在侧栏左下角，现在并入主界面。
     func updateStatusPill() {
-        guard sidebarAccount.superview != nil else { return }
+        guard headerIdentity != nil else { return }
         let blocked = busy || quittingClaude
         let text: String
         let tint: NSColor
@@ -1358,7 +1137,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             text = "未开启"; tint = ClaudeTheme.textMuted
         }
-        sidebarAccount.update(text: text, tint: tint, pulsing: pulsing)
+        headerIdentity.update(text: text, tint: tint, pulsing: pulsing)
+    }
+
+    /// 身份栏的版本摘要：Claude 版本、补丁 revision 和运行状态。
+    func refreshHeader() {
+        guard headerIdentity != nil else { return }
+        headerIdentity.updateDetail(versionSummary)
     }
 
     @objc func showStatusMenu() {
@@ -1507,11 +1292,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateButton.isEnabled = false
         prepareButton.isEnabled = false
         refreshIconButton.isEnabled = false
-        for control in featureSwitches { control.isEnabled = false }
 
-        progress.startAnimation(nil)
+        setLoading(true)
         statusLabel.textColor = ClaudeTheme.textSecondary
-        if backend == "all" {
+        if command == "enable-all" {
+            statusLabel.stringValue = "正在校验、备份并开启全部功能…"
+        } else if command == "restore-all" {
+            statusLabel.stringValue = "正在逐项恢复官方原版…"
+        } else if backend == "all" {
             statusLabel.stringValue = "正在检测…"
         } else if backend == "native_features" {
             statusLabel.stringValue = command == "status" ? "正在检测原生配置…" : "正在保存可恢复的官方配置…"
@@ -1530,7 +1318,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             statusLabel.stringValue = "正在检测正式版…"
         }
-        mirrorPatchStatus()
+        updateBackupState()
         updateStatusItem()
     }
 
@@ -1549,8 +1337,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = helper
-            if backend == "all" && command == "status-all" {
-                process.arguments = ["status-all"]
+            // 这三条是后端的顶层命令，不带后端名前缀。
+            if ["status-all", "enable-all", "restore-all"].contains(command) {
+                process.arguments = [command]
             } else {
                 process.arguments = [backend, command] + (feature.map { [$0] } ?? [])
             }
@@ -1644,7 +1433,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func route(_ result: [String: Any], command: String, backend: String) {
         recordOperation(command, backend: backend, result: result)
-        if backend == "all" {
+        if command == "enable-all" || command == "restore-all" {
+            completeSwitchAll(result, enabling: command == "enable-all")
+        } else if backend == "all" {
             completeAll(result)
         } else if backend == "native_features" {
             applyFeatures(result)
@@ -1673,10 +1464,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func finishInteraction() {
         busy = false
-        progress.stopAnimation(nil)
+        setLoading(false)
         refreshButton.isEnabled = true
         refreshButtons()
         updateStatusItem()
+    }
+
+    /// 加载状态只体现在右上角那一个图标上：处理中让箭头转圈，结束后停下。
+    /// 右上角没有单独的转圈指示器，也没有关闭按钮。
+    func setLoading(_ loading: Bool) {
+        refreshIconButton?.setSpinning(loading)
+        refreshIconButton?.toolTip = loading ? "正在检测…" : "重新检测"
+        refreshIconButton?.setAccessibilityLabel(loading ? "正在检测" : "重新检测")
     }
 
     func maybeLaunchClaude() {
@@ -1717,7 +1516,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// 所有控件是否可用只在这里决定，避免多处状态不一致。
     func refreshButtons() {
         let interactive = !busy && !quittingClaude
-        let configReady = officialSupported && !recoveryRequired && (!enabled || backupVerified)
+        // 总开关只要求正式版可用：个别功能在当前版本不存在时由后端跳过并如实回报，
+        // 不会因为一项不可用就把整个开关锁死。
         // Claude 正在运行时也允许操作；确认后由助手先正常退出。
         toggle.isEnabled = interactive && officialSupported && (!enabled || backupVerified)
         // 打开 Claude 不依赖适配状态：官方更新后仍应能正常使用。
@@ -1731,15 +1531,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         prepareButton.isEnabled = interactive && officialSupported && !recoveryRequired
             && (!enabled || backupVerified)
         setUpdateVisible(interactive && updateAvailable)
-        for (index, control) in featureSwitches.enumerated() {
-            if featureIDs[index] == "code-auto-dream" {
-                control.isEnabled = interactive && codeMemorySupported
-            } else {
-                control.isEnabled = interactive && featureConfigWritable && configReady
-                    && featureAvailable[index]
-                    && (!featureEnabled[index] || featureRestorable[index])
-            }
-        }
         updatePermissionButton()
     }
 
@@ -1752,7 +1543,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setStatus(error, color: ClaudeTheme.warning)
             refreshButtons()
             toggle.isEnabled = false
-            mirrorPatchStatus()
+            updateBackupState()
             updateStatusPill()
             return
         }
@@ -1790,30 +1581,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setStatus("已解锁 · 文件校验通过", color: ClaudeTheme.textSecondary)
         }
         metaVersion = result["version"] as? String ?? metaVersion
-        refreshMeta()
-        mirrorPatchStatus()
+        refreshHeader()
+        updateBackupState()
         updateStatusPill()
     }
 
     var metaVersion = ""
 
-    func refreshMeta() {
+    /// 版本摘要只在顶部身份栏显示一处，不在下面重复。
+    var versionSummary: String {
         let patch = enabled && patchRevision > 0 ? " · 补丁 r\(patchRevision)" : ""
         let running = officialRunning ? " · 运行中" : ""
-        let text = "Claude " + (metaVersion.isEmpty ? "未知" : metaVersion) + patch + running
-        metaLabel.stringValue = text
-        patchMetaLabel.stringValue = text
+        return "Claude " + (metaVersion.isEmpty ? "未知" : metaVersion) + patch + running
     }
 
-    /// 补丁页和概览页共享同一份状态文案。
-    func mirrorPatchStatus() {
-        patchStateLabel.stringValue = statusLabel.stringValue
-        patchStateLabel.textColor = statusLabel.textColor
-        patchMetaLabel.stringValue = metaLabel.stringValue
+    func updateBackupState() {
         if !statusLoaded {
             backupStateLabel.stringValue = "正在检测…"
         } else if !enabled {
-            backupStateLabel.stringValue = "补丁未安装；安装后会自动保存完整官方备份。"
+            backupStateLabel.stringValue = "补丁未安装；开启全部功能时会自动保存完整官方备份。"
         } else if backupVerified {
             backupStateLabel.stringValue = "当前官方备份已校验，可用于恢复官方原版。"
         } else {
@@ -1821,12 +1607,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 官方新版提醒：只读官方更新渠道，不下载、不登录、不带账号。
+    /// 文案分四种：有新版、已是最新、还没查到、读不到本机版本；
+    /// 联网失败时保留上次结论并说明原因，不把「没查到」说成「已是最新」。
+    func applyOfficialUpdate(_ result: [String: Any]) {
+        officialUpdateState = result["state"] as? String ?? "unknown"
+        officialUpdateInstalled = result["installed"] as? String ?? ""
+        officialUpdateLatest = result["latest"] as? String ?? ""
+        officialUpdateAdapted = result["adapted"] as? Bool ?? false
+        officialUpdateCheckedAt = result["checkedAt"] as? String ?? ""
+        officialUpdateStale = result["stale"] as? Bool ?? false
+        officialUpdateNote = result["error"] as? String ?? ""
+        updateOfficialUpdateLabel()
+    }
+
+    func updateOfficialUpdateLabel() {
+        var text: String
+        var color = ClaudeTheme.textMuted
+        switch officialUpdateState {
+        case "available":
+            if officialUpdateAdapted {
+                text = "官方已有新版 " + officialUpdateLatest + "（本机 " + officialUpdateInstalled +
+                    "）。可以先准备更新，再在 Claude 里安装；装好后回到这里重新检测。"
+                color = ClaudeTheme.accent
+            } else {
+                text = "官方已有新版 " + officialUpdateLatest + "（本机 " + officialUpdateInstalled +
+                    "）。这个版本还没适配；更新后本工具不会修改它，等适配发布后再开启。"
+                color = ClaudeTheme.warning
+            }
+        case "current":
+            text = "官方没有比 " + officialUpdateInstalled + " 更新的版本。"
+        case "unknown":
+            text = "读不到本机 Claude 版本；重新检测后再看官方新版。"
+        default:
+            text = "还没检查过官方新版。"
+        }
+        if !officialUpdateNote.isEmpty {
+            text += " " + officialUpdateNote
+            color = ClaudeTheme.warning
+        } else if officialUpdateState == "available" && officialUpdateStale {
+            text += " 这是上次的检查结果，稍后会再查一次。"
+        }
+        guard officialUpdateLabel.stringValue != text else {
+            officialUpdateLabel.textColor = color
+            return
+        }
+        officialUpdateLabel.stringValue = text
+        officialUpdateLabel.textColor = color
+    }
+
     func applyCLI(_ result: [String: Any]) {
         let index = codeAutoDreamIndex
         featureEnabled[index] = result["enabled"] as? Bool ?? false
-        codeMemorySupported = result["supported"] as? Bool ?? false
-        featureSwitches[index].state = featureEnabled[index] ? .on : .off
-        setFeatureDetail(index, text: result["error"] as? String ?? "")
+        setFeatureDetail(index, detail: result["error"] as? String ?? "")
     }
 
     /// 刚改过开关时，用正在运行的 Code 会话核对桌面端是否真的把设置传了下去。
@@ -1847,9 +1680,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return ""
     }
 
-    /// 每行的补充说明只在出错时出现；正常状态保持一行一个开关。
-    func setFeatureDetail(_ index: Int, text: String) {
-        let label = featureLabels[index]
+    /// 分组行下面的补充说明只在出错时出现；正常状态保持一行一个分组。
+    /// 同一分组里多项出错时合成一行，不重复堆叠。
+    func setFeatureDetail(_ index: Int, detail: String) {
+        guard let group = groupTitle(forFeature: index), let label = featureDetailLabels[group] else { return }
+        var lines = detailLines[group] ?? [:]
+        lines[index] = detail
+        detailLines[group] = lines
+        // 同一分组里多项出错时合成一段，带上各自的功能名。
+        let text = featureIDs.indices.compactMap { key -> String? in
+            guard groupTitle(forFeature: key) == group, let value = lines[key], !value.isEmpty else { return nil }
+            return featureTitles[key] + "：" + value
+        }.joined(separator: "\n")
         label.stringValue = text
         label.invalidateIntrinsicContentSize()
         // 当前可见状态已经和文字是否为空一致时不用再动。
@@ -1857,8 +1699,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         animate { label.animator().isHidden = text.isEmpty }
     }
 
-    func setFeatureHint(_ index: Int, text: String) {
-        let label = featureHints[index]
+    func setFeatureHint(_ index: Int, hint text: String) {
+        guard let group = groupTitle(forFeature: index), let label = featureHintLabels[group] else { return }
         label.stringValue = text
         label.invalidateIntrinsicContentSize()
         if label.isHidden == text.isEmpty { return }
@@ -1884,7 +1726,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let error = result["error"] as? String {
             featureConfigWritable = false
             if let index = featureIDs.firstIndex(of: "desktop-extensions") {
-                setFeatureHint(index, text: "")
+                setFeatureHint(index, hint: "")
             }
             setSummary(error + " 请重新检测。")
             if lastError == nil { setStatus(error, color: ClaudeTheme.warning) }
@@ -1902,25 +1744,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             featureEnabled[index] = on
             featureAvailable[index] = available
             featureRestorable[index] = feature["canRestore"] as? Bool ?? false
-            featureSwitches[index].state = on ? .on : .off
-            // 默认开启、又没有本工具恢复记录的项不能从界面关闭；用悬停提示说清楚，
-            // 否则一个“亮着但点不动”的开关看起来像坏了。
-            featureSwitches[index].toolTip = !available
-                ? "此版本没有这个设置。"
-                : (on && !featureRestorable[index] && id != "code-auto-dream"
-                    ? "这一项由 Claude 默认开启；本工具没有它的恢复记录，因此不从这里关闭。"
-                    : featureDescriptions[index])
             var detail = available ? "" : (feature["message"] as? String ?? "此版本没有这个设置")
             if detail.isEmpty, on, justChangedFeature, let sessions = sessions {
                 detail = codeSessionDetail(id: id, sessions: sessions)
             }
-            setFeatureDetail(index, text: detail)
+            setFeatureDetail(index, detail: detail)
         }
+        updateFeatureGroupStatus()
 
         if let index = featureIDs.firstIndex(of: "desktop-extensions") {
             let hint = featureEnabled[index] && featureAvailable[index]
                 ? desktopExtensionHint(result) : ""
-            setFeatureHint(index, text: hint)
+            setFeatureHint(index, hint: hint)
         }
 
         let health = result["configHealth"] as? [String: Any]
@@ -1938,13 +1773,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             setSummary("")
         }
-        refreshMeta()
+        refreshHeader()
     }
 
-    func setSummary(_ text: String) {
-        guard featureSummary.stringValue != text || featureSummary.isHidden != text.isEmpty else { return }
+    /// 总开关刚做完时保留那一句结果：紧随其后的检测会调用这里并传空字符串，
+    /// 正好用它顶上去，显示一次后清空，不会盖住真正的问题也不会一直挂着。
+    func setSummary(_ raw: String) {
+        var text = raw
+        if text.isEmpty, !switchAllSummary.isEmpty { text = switchAllSummary }
+        switchAllSummary = ""
+        guard featureSummary.stringValue != text
+                || featureSummary.isHidden != text.isEmpty else { return }
         featureSummary.stringValue = text
         animate { self.featureSummary.animator().isHidden = text.isEmpty }
+    }
+
+    /// 总开关的结果：如实说明哪些完成、哪些被跳过、哪些失败，然后重新检测。
+    /// 后端是一条命令做完所有项，所以这里只有一次收尾，不会来回闪。
+    func completeSwitchAll(_ result: [String: Any], enabling: Bool) {
+        lastStatusAt = Date()
+        if let error = result["error"] as? String {
+            switchAllSummary = error
+        } else {
+            let steps = result["steps"] as? [[String: Any]] ?? []
+            let done = steps.filter { ($0["state"] as? String) == "done" }.count
+            let skipped = steps.compactMap { step -> String? in
+                guard (step["state"] as? String) == "skipped" else { return nil }
+                return step["title"] as? String
+            }
+            var text = (enabling ? "已开启 " : "已恢复 ") + "\(done) 项"
+            if !skipped.isEmpty {
+                text += "；跳过 " + skipped.joined(separator: "、") + "（" +
+                    (enabling ? "此版本没有该设置" : "没有本工具的恢复记录") + "）"
+            }
+            switchAllSummary = text
+        }
+        if enabling { enabledHintUntil = Date().addingTimeInterval(90) }
+        // 权限只在真正装过补丁后才可能变化；重新检测会带回 permissionReGrantLikely。
+        pendingPermissionPrompt = enabling
+        refreshAllStatus()
     }
 
     func completeAll(_ result: [String: Any]) {
@@ -1962,9 +1829,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         applyOfficial(officialResult)
         applyCLI(result["cli"] as? [String: Any] ?? [:])
         applyFeatures(result["features"] as? [String: Any] ?? [:])
+        // 旧版内置组件不带这一项：保持原有文案，不要误显示成「读不到本机版本」。
+        if let update = result["officialUpdate"] as? [String: Any] {
+            applyOfficialUpdate(update)
+        }
+        if pendingPermissionPrompt {
+            pendingPermissionPrompt = false
+            // 重签后旧授权可能不再适用；只在检测确认可能失效时才把用户送到系统设置。
+            if enabled && permissionReGrantLikely { openPrivacySettings() }
+        }
         finishInteraction()
         handlePendingRefresh()
         maybeLaunchClaude()
+        scheduleOfficialUpdateCheck()
+    }
+
+    /// 官方新版提醒：缓存过期（或用户刚点过刷新）时联网检查一次。
+    /// 检查在独立的后端进程里跑，不占窗口的忙碌状态，也不转右上角的刷新图标。
+    func scheduleOfficialUpdateCheck() {
+        guard !busy, !quittingClaude, !officialUpdateChecking else { return }
+        let force = forceOfficialUpdateCheck
+        guard force || officialUpdateState.isEmpty || officialUpdateState == "unchecked"
+                || officialUpdateStale else { return }
+        // 读不到本机版本时不必联网：检查只会得到同样的结论。
+        guard force || officialUpdateState != "unknown" else { return }
+        // 刚失败过就先等一会，避免窗口每激活一次就重连一次。
+        guard force || Date() >= officialUpdateRetryAfter else { return }
+        forceOfficialUpdateCheck = false
+        officialUpdateChecking = true
+        officialUpdateLabel.stringValue = "正在检查官方新版…"
+        officialUpdateLabel.textColor = ClaudeTheme.textMuted
+        runBackend("check", backend: "official_update", feature: nil) { result in
+            self.officialUpdateChecking = false
+            if result["state"] is String {
+                self.applyOfficialUpdate(result)
+                if result["error"] == nil {
+                    self.officialUpdateRetryAfter = .distantPast
+                } else {
+                    self.officialUpdateRetryAfter = Date().addingTimeInterval(120)
+                }
+            } else {
+                // 后端连启动都没成功：保留上次结论，只补一句原因。
+                self.officialUpdateNote = result["error"] as? String ?? "这次没能检查官方新版。"
+                self.updateOfficialUpdateLabel()
+                self.officialUpdateRetryAfter = Date().addingTimeInterval(120)
+            }
+        }
     }
 
     func complete(_ result: [String: Any], command: String = "status") {
@@ -2022,7 +1932,6 @@ enum ClaudeTheme {
     // 尺寸与间距（pt）。
     enum Metric {
         static let controlHeight: CGFloat = 32      // --cds-h-control
-        static let navWidth: CGFloat = 232
         static let rowPaddingY: CGFloat = 12        // --cds-pad-md
         // CDS 的标题与描述是同一个文本块里的两行，靠行高衔接，没有额外间距；
         // 这里留 0，否则每行多出 4pt，七行下来会把概览页顶出首屏。
@@ -2041,17 +1950,12 @@ enum ClaudeTheme {
         static let switchWidth: CGFloat = 36
     }
 
-    // surface-1 侧栏 / surface-2 内容面板；深色下内容比侧栏略亮。
+    // surface-2 内容面板：单页界面只有这一层底色。
     static let pane = dynamic(rgb(0xFFFFFF), rgb(0x1A1A19))
     // 图层背景用静态色：动态 NSColor 的 cgColor 在 CALayer 上会被解析成系统占位灰。
     static let paneLight = rgb(0xFFFFFF)
     static let paneDark = rgb(0x1A1A19)
-    static let sidebarLight = rgb(0xFCFCFB)
-    static let sidebarDark = rgb(0x151515)
-    static let sidebar = dynamic(rgb(0xFCFCFB), rgb(0x151515))
-    static let sidebarHover = dynamic(rgb(0x0B0B0B, alpha: 0.05), rgb(0xFFFFFF, alpha: 0.05))
-    static let sidebarSelected = dynamic(rgb(0x0B0B0B, alpha: 0.10), rgb(0xFFFFFF, alpha: 0.10))
-    static let searchFill = dynamic(rgb(0xFFFFFF), rgb(0xFFFFFF, alpha: 0.05))
+    static let iconHover = dynamic(rgb(0x0B0B0B, alpha: 0.05), rgb(0xFFFFFF, alpha: 0.05))
 
     static let textPrimary = dynamic(rgb(0x0B0B0B), rgb(0xF0EFEC))
     static let textSecondary = dynamic(rgb(0x5F5E5A), rgb(0xC3C2B7))
@@ -2185,24 +2089,6 @@ final class CDSLabel: NSTextField {
 /// 左侧栏底色：图层化并用 updateLayer 上色。
 /// 窗口里只要有一个子视图带图层，整棵子树就进入图层合成，`draw(_:)` 里的
 /// 底色会在离屏/滚动合成时丢掉；0.3.34 踩过一次，这里必须保持 updateLayer。
-final class SidebarBackgroundView: NSView {
-    override var wantsUpdateLayer: Bool { true }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func updateLayer() {
-        let resolved = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? ClaudeTheme.sidebarDark : ClaudeTheme.sidebarLight
-        layer?.backgroundColor = resolved.cgColor
-    }
-}
-
-/// 右侧面板底色：与侧栏一样走 updateLayer。
 final class ContentBackgroundView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
@@ -2221,362 +2107,21 @@ final class ContentBackgroundView: NSView {
     }
 }
 
-/// 普通滚动容器：一个裁剪层加一个文档视图，自己处理滚轮，不用 NSScrollView。
-/// 需要的是「不透明、无材质、可裁剪」：设置页内容整块跟着滚，不需要系统滚动条。
-/// （右侧面板曾整块发灰，原因不在这个容器，而是 HairlineView 用 dirtyRect
-/// 填充，图层化后 dirtyRect 可能是整块图层，十几条分隔线叠成了灰雾。）
-final class PlainScrollView: NSView {
-    /// 官方 `--cds-scroll-fade-size: 28px`；桌面端 rem-scale 16/17，取 26pt。
-    private static let fadeHeight: CGFloat = 26
-    /// 单条四档渐变当遮罩：`layer.mask` 的透明度会乘到内容上。
-    /// 不能用「一张空遮罩 + 两条边缘渐变」——遮罩没画到的区域 alpha 为 0，
-    /// 整片内容会一起消失（预览实测：中间全黑）。
-    private let fadeMask = CAGradientLayer()
-
-    var documentHeight: CGFloat { document?.frame.height ?? 0 }
-    var currentOffset: CGFloat { min(max(0, offset), maximumOffset) }
-    var canScroll: Bool { maximumOffset > 1 }
-
-    /// 裁剪层：普通 NSView + clipsToBounds，只负责裁掉视口外的内容。
-    private let clip = FlippedView()
-    private var offset: CGFloat = 0
-    private weak var document: NSView?
-    private var documentTop: NSLayoutConstraint?
-
-    var documentView: NSView? {
-        get { document }
-        set {
-            document?.removeFromSuperview()
-            documentTop?.isActive = false
-            document = newValue
-            guard let newValue else { return }
-            newValue.translatesAutoresizingMaskIntoConstraints = false
-            clip.addSubview(newValue)
-            // 文档位置用一条 top 约束的 constant 表示，而不是改 frame：
-            // 文档本身受 Auto Layout 管理，直接改 frame 会被下一次布局还原。
-            let top = newValue.topAnchor.constraint(equalTo: clip.topAnchor)
-            documentTop = top
-            NSLayoutConstraint.activate([
-                newValue.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
-                newValue.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
-                top,
-                newValue.widthAnchor.constraint(equalTo: clip.widthAnchor)
-            ])
-        }
-    }
-
-    var contentView: NSView { clip }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        clipsToBounds = true
-        clip.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(clip)
-        NSLayoutConstraint.activate([
-            clip.leadingAnchor.constraint(equalTo: leadingAnchor),
-            clip.trailingAnchor.constraint(equalTo: trailingAnchor),
-            clip.topAnchor.constraint(equalTo: topAnchor),
-            clip.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
-    }
-
-    /// 边缘渐隐：整块遮罩铺满视口，按需在上下边缘各压一段透明。
-    /// 用遮罩而不是盖一层底色——底色会随面板主题变，遮罩不会。
-    private func installFadesIfNeeded() {
-        guard fadeMask.superlayer == nil else { return }
-        wantsLayer = true
-        guard let host = layer else { return }
-        fadeMask.startPoint = CGPoint(x: 0.5, y: 0)   // 左下
-        fadeMask.endPoint = CGPoint(x: 0.5, y: 1)     // 左上为 y 增大的方向
-        fadeMask.masksToBounds = true
-        host.mask = fadeMask
-    }
-
-    private func updateFades() {
-        installFadesIfNeeded()
-        let clamped = min(max(0, offset), maximumOffset)
-        let showsTop = canScroll && clamped > 0.5
-        let showsBottom = canScroll && clamped < maximumOffset - 0.5
-        #if PREVIEW
-        print("[fade] offset=\(clamped) max=\(maximumOffset) top=\(showsTop) bottom=\(showsBottom)")
-        #endif
-        let height = max(bounds.height, 1)
-        let fade = min(Self.fadeHeight, height / 2)
-        // 视口顶部对应渐变终点（y=1），底部对应起点（y=0）。
-        let bottomStop = showsBottom ? fade / height : 0
-        let topStop = showsTop ? 1 - fade / height : 1
-        let clear = NSColor.clear.cgColor
-        let solid = NSColor.white.cgColor
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        fadeMask.frame = bounds
-        fadeMask.colors = [clear, solid, solid, clear]
-        // locations 必须严格递增；把边缘停靠点夹在 0...1 内并留出最小步长。
-        let stops = [0, max(bottomStop, 0.0001),
-                     min(max(topStop, 0.0002), 0.9999), 1].sorted()
-        fadeMask.locations = stops.map { NSNumber(value: Double($0)) }
-        CATransaction.commit()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    private var maximumOffset: CGFloat {
-        guard let document else { return 0 }
-        return max(0, document.frame.height - bounds.height)
-    }
-
-    private func applyOffset() {
-        guard document != nil else { return }
-        // 只夹住实际画出来的位置，不改写 offset 本身：切页时文档高度会短暂变小，
-        // 若把夹过的值写回去，刚设好的滚动目标就被抹成 0 了。
-        let clamped = min(max(0, offset), maximumOffset)
-        if documentTop?.constant != -clamped {
-            documentTop?.constant = -clamped
-        }
-        updateFades()
-    }
-
-    override func layout() {
-        super.layout()
-        applyOffset()
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY * 10
-        guard delta != 0 else { return }
-        offset += delta
-        applyOffset()
-    }
-
-    func scrollToTop() {
-        offset = 0
-        applyOffset()
-    }
-
-    #if PREVIEW
-    func setOffsetForPreview(_ value: CGFloat) {
-        offset = value
-        applyOffset()
-    }
-    #endif
-
-    /// 把文档坐标里的一段滚进视口，顶部留 8pt 呼吸。
-    /// 目标位置存在 `offset` 里，布局完成、文档高度更新后由 `layout()` 再应用一次。
-    func scrollToRect(_ rect: NSRect) {
-        offset = rect.minY - 8
-        applyOffset()
-        #if PREVIEW
-        print("[scroll] target=\(offset) max=\(maximumOffset) doc=\(document?.frame.height ?? -1) bounds=\(bounds.height)")
-        #endif
-    }
-}
-
 final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
-/// 只用来接收初始焦点，避免搜索框一启动就出现蓝色焦点圈。
+/// 只用来接收初始焦点，避免内容一启动就出现蓝色焦点圈。
 final class FocusRootView: NSView {
     override var acceptsFirstResponder: Bool { true }
 }
 
-/// 自绘搜索框：避免 NSSearchField 在浅色窗口里自动画出蓝色焦点圈。
-final class SearchBoxView: NSView, NSTextFieldDelegate {
-    let field = NSTextField()
-    var onChange: (() -> Void)?
-    private let icon = NSImageView()
-    private var focused = false
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        if let image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil) {
-            icon.image = image
-            icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
-        }
-        icon.contentTintColor = ClaudeTheme.textMuted
-        icon.translatesAutoresizingMaskIntoConstraints = false
-
-        field.isBordered = false
-        field.isBezeled = false
-        field.drawsBackground = false
-        field.focusRingType = .none
-        field.font = ClaudeFont.body()
-        field.textColor = ClaudeTheme.textPrimary
-        field.placeholderAttributedString = NSAttributedString(
-            string: "搜索设置",
-            attributes: [.foregroundColor: ClaudeTheme.textMuted,
-                         .font: ClaudeFont.body()])
-        field.delegate = self
-        field.translatesAutoresizingMaskIntoConstraints = false
-
-        addSubview(icon)
-        addSubview(field)
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-            field.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
-            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            field.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-        applyColors()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(field)
-    }
-
-    func controlTextDidChange(_ obj: Notification) {
-        onChange?()
-    }
-
-    func controlTextDidBeginEditing(_ obj: Notification) {
-        focused = true
-        applyColors()
-    }
-
-    func controlTextDidEndEditing(_ obj: Notification) {
-        focused = false
-        applyColors()
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyColors()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // 官方输入框圆角 --cds-radius-sm，comfortable 密度下 .4375rem = 7pt。
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            ClaudeTheme.searchFill.setFill()
-            path.fill()
-            (focused ? ClaudeTheme.accent : ClaudeTheme.border).setStroke()
-            path.lineWidth = focused ? 1.5 : 1
-            path.stroke()
-        }
-    }
-
-    private func applyColors() {
-        needsDisplay = true
-    }
-}
-
-/// 设置页左侧的一行：图标 + 标题，选中时灰底白字。
-final class SidebarRowView: NSView {
-    let id: String
-    let titleText: String
-    private let iconView = NSImageView()
-    private let label = ClaudeFont.label(font: ClaudeFont.body())
-    private let onSelect: (String) -> Void
-    private var hovered = false
-    private var tracking: NSTrackingArea?
-
-    var isSelected = false {
-        didSet { updateAppearance() }
-    }
-
-    init(id: String, title: String, symbol: String, onSelect: @escaping (String) -> Void) {
-        self.id = id
-        self.titleText = title
-        self.onSelect = onSelect
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.cornerRadius = 7
-
-        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            iconView.image = image
-            iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        }
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.contentTintColor = ClaudeTheme.textSecondary
-        label.stringValue = title
-        label.textColor = ClaudeTheme.textSecondary
-        label.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(iconView)
-        addSubview(label)
-        NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 20),
-            iconView.heightAnchor.constraint(equalToConstant: 20),
-            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
-            label.centerYAnchor.constraint(equalTo: centerYAnchor)
-        ])
-        updateAppearance()
-    }
-
-    required init?(coder: NSCoder) { fatalError("not used") }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking = tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        updateAppearance()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hovered = false
-        updateAppearance()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        onSelect(id)
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        updateAppearance()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // 选中/悬停底色直接绘制：滚动、截图和打印时都不会丢。
-        let background: NSColor
-        if isSelected {
-            background = ClaudeTheme.sidebarSelected
-        } else if hovered {
-            background = ClaudeTheme.sidebarHover
-        } else {
-            background = .clear
-        }
-        guard background.alphaComponent > 0 else { return }
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            background.setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
-        }
-    }
-
-    private func updateAppearance() {
-        // 动态颜色必须在外观上下文里解析，否则选中行可能取到另一种外观的取值，
-        // 深色底上出现近黑文字、看起来像“灰掉了”。
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let color = isSelected ? ClaudeTheme.textPrimary : ClaudeTheme.textSecondary
-            label.textColor = color
-            iconView.contentTintColor = color
-        }
-        label.font = ClaudeFont.body(isSelected ? .medium : .regular)
-        needsDisplay = true
-    }
-}
-
-/// 圆形图标按钮，用于右上角的刷新和关闭。
 final class ClaudeIconButton: NSButton {
     private let symbolView = NSImageView()
     private let actionClosure: () -> Void
     private var hovered = false
     private var tracking: NSTrackingArea?
+    private var spinning = false
 
     init(symbol: String, accessibility: String, action: @escaping () -> Void) {
         self.actionClosure = action
@@ -2606,6 +2151,50 @@ final class ClaudeIconButton: NSButton {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     @objc private func performAction() { actionClosure() }
+
+    /// 加载时让图标自己旋转，代替原来单独放在旁边的转圈指示器。
+    /// 旋转只作用在图标图层上，按钮的点击区域和悬停底色都不受影响。
+    func setSpinning(_ on: Bool) {
+        guard on != spinning else { return }
+        spinning = on
+        symbolView.wantsLayer = true
+        applySpin()
+    }
+
+    override func layout() {
+        super.layout()
+        // 图标尺寸固定，但布局完成后再补一次，保证第一次旋转就绕自己的中心。
+        if spinning { applySpin() }
+    }
+
+    private func applySpin() {
+        guard let layer = symbolView.layer else { return }
+        if spinning {
+            guard layer.animation(forKey: "spin") == nil else { return }
+            // NSView 的图层锚点在左下角，直接转会绕角；把旋转中心平移到图标中心。
+            let center = CGPoint(x: symbolView.bounds.midX, y: symbolView.bounds.midY)
+            var frames: [NSValue] = []
+            for step in 0...4 {
+                // 图层坐标里正角度是逆时针；箭头本身表示顺时针，所以角度递减。
+                let angle = -Double.pi * 2 * Double(step) / 4
+                var transform = CATransform3DIdentity
+                transform = CATransform3DTranslate(transform, center.x, center.y, 0)
+                transform = CATransform3DRotate(transform, angle, 0, 0, 1)
+                transform = CATransform3DTranslate(transform, -center.x, -center.y, 0)
+                frames.append(NSValue(caTransform3D: transform))
+            }
+            let spin = CAKeyframeAnimation(keyPath: "transform")
+            spin.values = frames
+            spin.keyTimes = [0, 0.25, 0.5, 0.75, 1]
+            spin.duration = 0.9
+            spin.repeatCount = .infinity
+            spin.timingFunctions = Array(repeating: CAMediaTimingFunction(name: .linear), count: 4)
+            spin.isRemovedOnCompletion = false
+            layer.add(spin, forKey: "spin")
+        } else {
+            layer.removeAnimation(forKey: "spin")
+        }
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -2639,13 +2228,15 @@ final class ClaudeIconButton: NSButton {
     override func draw(_ dirtyRect: NSRect) {
         guard hovered, isEnabled else { return }
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            ClaudeTheme.sidebarHover.setFill()
+            ClaudeTheme.iconHover.setFill()
             NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
         }
     }
 
     private func updateAppearance() {
-        symbolView.contentTintColor = isEnabled ? ClaudeTheme.textSecondary
+        // 旋转时按钮是禁用的（防止重复触发），但图标本身保持正常颜色，
+        // 否则正在转的箭头会发灰，看起来像卡住了。
+        symbolView.contentTintColor = (isEnabled || spinning) ? ClaudeTheme.textSecondary
             : ClaudeTheme.textMuted.withAlphaComponent(0.5)
         needsDisplay = true
     }
@@ -2936,109 +2527,66 @@ final class ClaudeButton: NSButton {
     override var acceptsFirstResponder: Bool { isEnabled }
 }
 
-/// 账户栏里的小圆点；直接绘制，避免滚动容器/印刷渲染丢图层。
-final class SidebarDotView: NSView {
-    var color: NSColor = .clear {
-        didSet { needsDisplay = true }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            color.setFill()
-            NSBezierPath(ovalIn: bounds).fill()
-        }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
-    }
-}
-
-/// 左侧栏底部的账户式状态栏：头像 + 两行文字 + 关于按钮。
-final class SidebarAccountView: NSView {
-    var onAbout: (() -> Void)?
-    private let avatar = AccountAvatarView()
+/// 顶部身份栏：星芒头像 + 名称 + 状态点 + 版本摘要。
+/// 原来在侧栏左下角，侧栏取消后并入主界面，成为窗口的第一行。
+final class IdentityStatusView: NSView {
+    private let avatar = IdentityAvatarView()
     private let title = NSTextField(labelWithString: "Claude 原生助手")
-    private let statusDot = SidebarDotView()
+    private let detail = NSTextField(labelWithString: "正在检测…")
+    private let statusDot = StatusDotView()
     private let status = NSTextField(labelWithString: "检测中")
-    private let gear: ClaudeIconButton
     private var tint: NSColor = ClaudeTheme.textMuted
-    private var hovered = false
-    private var tracking: NSTrackingArea?
+    private var pulseTimer: Timer?
 
     override init(frame: NSRect) {
-        gear = ClaudeIconButton(symbol: "gearshape", accessibility: "关于") {}
         super.init(frame: frame)
 
         avatar.translatesAutoresizingMaskIntoConstraints = false
-        title.font = ClaudeFont.footnote(.medium)
+        title.font = ClaudeFont.heading(.semibold)
         title.textColor = ClaudeTheme.textPrimary
         title.translatesAutoresizingMaskIntoConstraints = false
-
+        detail.font = ClaudeFont.caption()
+        detail.textColor = ClaudeTheme.textMuted
+        detail.lineBreakMode = .byTruncatingTail
+        detail.translatesAutoresizingMaskIntoConstraints = false
         statusDot.translatesAutoresizingMaskIntoConstraints = false
         status.font = ClaudeFont.caption()
         status.textColor = ClaudeTheme.textSecondary
         status.lineBreakMode = .byTruncatingTail
         status.translatesAutoresizingMaskIntoConstraints = false
 
-        gear.translatesAutoresizingMaskIntoConstraints = false
-        gear.target = self
-        gear.action = #selector(showAbout)
         addSubview(avatar)
         addSubview(title)
+        addSubview(detail)
         addSubview(statusDot)
         addSubview(status)
-        addSubview(gear)
         NSLayoutConstraint.activate([
-            avatar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            avatar.leadingAnchor.constraint(equalTo: leadingAnchor),
             avatar.centerYAnchor.constraint(equalTo: centerYAnchor),
-            avatar.widthAnchor.constraint(equalToConstant: 30),
-            avatar.heightAnchor.constraint(equalToConstant: 30),
-            title.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 9),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: gear.leadingAnchor, constant: -6),
-            statusDot.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            statusDot.centerYAnchor.constraint(equalTo: status.centerYAnchor),
+            avatar.widthAnchor.constraint(equalToConstant: 34),
+            avatar.heightAnchor.constraint(equalToConstant: 34),
+            title.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 11),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+            detail.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            // 状态点跟在名称后面同一行，不再往下堆第三行。
+            statusDot.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 10),
+            statusDot.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             statusDot.widthAnchor.constraint(equalToConstant: 6),
             statusDot.heightAnchor.constraint(equalToConstant: 6),
             status.leadingAnchor.constraint(equalTo: statusDot.trailingAnchor, constant: 5),
-            status.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 3),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: gear.leadingAnchor, constant: -6),
-            gear.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
-            gear.centerYAnchor.constraint(equalTo: centerYAnchor),
-            gear.widthAnchor.constraint(equalToConstant: 24),
-            gear.heightAnchor.constraint(equalToConstant: 24)
+            status.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor)
         ])
         update(text: "检测中", tint: ClaudeTheme.accent, pulsing: true)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    @objc private func showAbout() { onAbout?() }
-
-    override func mouseDown(with event: NSEvent) {
-        onAbout?()
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking = tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        tracking = area
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        applyColors()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hovered = false
-        applyColors()
+    func updateDetail(_ text: String) {
+        guard detail.stringValue != text else { return }
+        detail.stringValue = text
     }
 
     func update(text: String, tint: NSColor, pulsing: Bool) {
@@ -3046,32 +2594,12 @@ final class SidebarAccountView: NSView {
         status.stringValue = text
         status.textColor = ClaudeTheme.textSecondary
         statusDot.color = tint
-        applyColors()
         if pulsing {
             startBreathing()
         } else {
             stopBreathing()
         }
     }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyColors()
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard hovered else { return }
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            ClaudeTheme.sidebarHover.setFill()
-            NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
-        }
-    }
-
-    private func applyColors() {
-        needsDisplay = true
-    }
-
-    private var pulseTimer: Timer?
 
     private func startBreathing() {
         guard pulseTimer == nil else { return }
@@ -3094,8 +2622,8 @@ final class SidebarAccountView: NSView {
     }
 }
 
-/// 账户栏左侧的圆形星芒头像。
-final class AccountAvatarView: NSView {
+/// 身份栏左侧的圆形星芒头像。
+final class IdentityAvatarView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             ClaudeTheme.claySoft.setFill()
@@ -3114,21 +2642,68 @@ final class AccountAvatarView: NSView {
     }
 }
 
-/// 侧栏顶部的 12 光线星芒，用黏土橙填充。
-final class StarburstLogoView: NSView {
+final class StatusDotView: NSView {
+    var color: NSColor = .clear {
+        didSet { needsDisplay = true }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            ClaudeTheme.clay.setFill()
-            let radius = min(bounds.width, bounds.height) / 2 - 0.5
-            starburstPath(center: NSPoint(x: bounds.midX, y: bounds.midY),
-                          radius: radius, rays: 12,
-                          innerWidth: 0.065, outerWidth: 0.195).fill()
+            color.setFill()
+            NSBezierPath(ovalIn: bounds).fill()
         }
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
+    }
+}
+
+/// 滚动区上下边缘的渐隐提示：只有还能继续滚的那一侧才压暗。
+/// 直接盖在滚动视图上绘制，不参与命中测试，滚轮和点击都穿透到下面的内容。
+final class ScrollFadeOverlay: NSView {
+    /// 官方 `--cds-scroll-fade-size: 28px`；桌面端 rem-scale 16/17，取 26pt。
+    private static let fadeHeight: CGFloat = 26
+    private var showsTop = false
+    private var showsBottom = false
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func update(offset: CGFloat, maximum: CGFloat) {
+        let top = maximum > 1 && offset > 0.5
+        let bottom = maximum > 1 && offset < maximum - 0.5
+        guard top != showsTop || bottom != showsBottom else { return }
+        showsTop = top
+        showsBottom = bottom
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard showsTop || showsBottom else { return }
+        let fade = min(Self.fadeHeight, bounds.height / 2)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let pane = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                ? ClaudeTheme.paneDark : ClaudeTheme.paneLight
+            if showsTop {
+                let rect = NSRect(x: 0, y: 0, width: bounds.width, height: fade)
+                NSGradient(starting: pane.withAlphaComponent(0.92), ending: pane.withAlphaComponent(0))?
+                    .draw(in: rect, angle: -90)
+            }
+            if showsBottom {
+                let rect = NSRect(x: 0, y: bounds.height - fade, width: bounds.width, height: fade)
+                NSGradient(starting: pane.withAlphaComponent(0), ending: pane.withAlphaComponent(0.92))?
+                    .draw(in: rect, angle: -90)
+            }
+        }
     }
 }
 
@@ -3254,12 +2829,16 @@ extension AppDelegate {
     func renderScrolledPreview(to path: String, offset: CGFloat) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
         window.appearance = NSApp.appearance
-        selectSection("general")
+        if let state = ProcessInfo.processInfo.environment["PREVIEW_UPDATE_STATE"] {
+            applyOfficialUpdate(["state": state, "installed": "3.6556.2",
+                                 "latest": "3.9683.0", "adapted": false])
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            self.scrollView?.setOffsetForPreview(offset)
+            self.scrollView?.contentView.scroll(to: NSPoint(x: 0, y: offset))
+            self.scrollView?.reflectScrolledClipView(self.scrollView!.contentView)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 guard let view = self.window.contentView else { return }
-                // cacheDisplay 走图层合成，能看到 layer.mask 的渐隐效果。
+                // cacheDisplay 走图层合成，能看到自绘的渐隐提示。
                 guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
                 view.cacheDisplay(in: view.bounds, to: rep)
                 if let data = rep.representation(using: .png, properties: [:]) {
@@ -3274,37 +2853,30 @@ extension AppDelegate {
     func renderPreview(to path: String, dark: Bool) {
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.appearance = NSApp.appearance
-        window.contentView?.layoutSubtreeIfNeeded()
-        #if PREVIEW
-        if let scroll = previewDelegate.scrollView {
-            print("[render] docOrigin=\(scroll.documentView?.frame.origin.y ?? 0) docH=\(scroll.documentView?.frame.height ?? 0) boundsH=\(scroll.bounds.height)")
+        // PREVIEW_LOADING=1 时把右上角图标切成加载态，用来核对转圈的样子。
+        if ProcessInfo.processInfo.environment["PREVIEW_LOADING"] != nil {
+            setLoading(true)
         }
-        #endif
+        // PREVIEW_UPDATE_STATE=available 时用合成结果核对提醒那一行的颜色与换行；
+        // 只影响预览构建，不写缓存、不联网。
+        if let state = ProcessInfo.processInfo.environment["PREVIEW_UPDATE_STATE"] {
+            applyOfficialUpdate(["state": state, "installed": "3.6556.2",
+                                 "latest": "3.9683.0", "adapted": false])
+        }
+        // 每次截图都从顶部开始，避免上一次滚动位置带进来。
+        scrollView?.contentView.scroll(to: .zero)
+        scrollView?.reflectScrolledClipView(scrollView!.contentView)
+        window.contentView?.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         window.contentView?.subviews.forEach { $0.displayIfNeeded() }
         CATransaction.flush()
-        guard let view = window.contentView else { return }
-        // layer.render 会漏掉滚动容器里的自绘内容，PDF 路径是完整的；再从 PDF 光栅化出 PNG。
-        let pdf = view.dataWithPDF(inside: view.bounds)
-        try? pdf.write(to: URL(fileURLWithPath: path + ".pdf"))
-        guard let provider = CGDataProvider(data: pdf as CFData),
-              let document = CGPDFDocument(provider),
-              let page = document.page(at: 1) else { return }
-        let scale: CGFloat = 2
-        let width = Int(view.bounds.width * scale)
-        let height = Int(view.bounds.height * scale)
-        guard let context = CGContext(data: nil, width: width, height: height,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
-        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0))
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.scaleBy(x: scale, y: scale)
-        context.drawPDFPage(page)
-        guard let image = context.makeImage() else { return }
-        let rep = NSBitmapImageRep(cgImage: image)
+        guard let view = window.contentView,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        // 走图层合成：能看到底色和渐隐；PDF 路径会漏掉图层背景，颜色不可信。
+        view.cacheDisplay(in: view.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))
+            print("captured \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)")
         }
     }
 }
@@ -3314,54 +2886,15 @@ let previewApp = NSApplication.shared
 previewApp.delegate = previewDelegate
 let previewBase = ProcessInfo.processInfo.environment["PREVIEW_PATH"] ?? "/tmp/claude-native-preview"
 
-/// 预览构建专用：抓真实窗口的离屏快照。
-/// 注意：PDF 与 cacheDisplay 两条路径都会漏掉图层背景色，layer.render 对
-/// 滚动层也不可靠；这里只用来核对文字排版，颜色一律以真机截图为准。
-func debugCapture(to path: String) {
-    let window = previewDelegate.window!
-    print("NSApp=\(NSApp.effectiveAppearance.name.rawValue) window=\(window.effectiveAppearance.name.rawValue)")
-    guard let view = window.contentView, let layer = view.layer else { return }
-    let scale: CGFloat = 2
-    let width = Int(view.bounds.width * scale)
-    let height = Int(view.bounds.height * scale)
-    guard let context = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
-    context.scaleBy(x: scale, y: scale)
-    layer.render(in: context)
-    guard let image = context.makeImage() else { return }
-    let rep = NSBitmapImageRep(cgImage: image)
-    if let data = rep.representation(using: .png, properties: [:]) {
-        try? data.write(to: URL(fileURLWithPath: path))
-        print("captured \(path) \(rep.pixelsWide)x\(rep.pixelsHigh)")
-    }
-}
-
 func previewStep(_ index: Int) {
-    // 每一页都渲染一张：侧栏分区多了以后，漏掉一页就等于漏掉一整个分组的核对。
-    let sections = ["general", "patch", "system", "shortcuts", "about"]
-    let names = ["dark", "patch", "system", "shortcuts", "about"]
-    // 概览页里的功能分组是锚点，各滚一次，确认侧栏点分组能落到对应位置。
-    let anchors = previewDelegate.featureGroupSections
-    if index < sections.count {
-        previewDelegate.selectSection(sections[index])
+    // 单页界面只有深浅两张：深色一次看全首屏，浅色核对配色。
+    if index == 0 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-            previewDelegate.renderPreview(to: previewBase + "-" + names[index] + ".png",
-                                          dark: true)
-            previewStep(index + 1)
-        }
-    } else if index - sections.count < anchors.count {
-        let anchor = anchors[index - sections.count]
-        previewDelegate.jumpToFeatureGroup(anchor)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-            previewDelegate.renderPreview(to: previewBase + "-anchor-" + anchor + ".png",
-                                          dark: true)
-            previewStep(index + 1)
+            previewDelegate.renderPreview(to: previewBase + "-dark.png", dark: true)
+            previewStep(1)
         }
     } else {
-        previewDelegate.selectSection("general")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             previewDelegate.renderPreview(to: previewBase + "-light.png", dark: false)
             previewApp.terminate(nil)
         }
@@ -3371,19 +2904,6 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
     if let raw = ProcessInfo.processInfo.environment["PREVIEW_SCROLL"], let value = Double(raw) {
         previewDelegate.renderScrolledPreview(to: previewBase + "-scrolled.png",
                                               offset: CGFloat(value))
-    } else if ProcessInfo.processInfo.environment["DEBUG_CAPTURE"] != nil {
-        NSApp.appearance = NSAppearance(named: .darkAqua)
-        previewDelegate.window.appearance = NSApp.appearance
-        previewDelegate.selectSection("general")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            debugCapture(to: previewBase + "-debug-dark.png")
-            NSApp.appearance = NSAppearance(named: .aqua)
-            previewDelegate.window.appearance = NSApp.appearance
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                debugCapture(to: previewBase + "-debug-light.png")
-                previewApp.terminate(nil)
-            }
-        }
     } else {
         previewStep(0)
     }

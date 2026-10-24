@@ -144,6 +144,97 @@ if __name__ == '__main__':
     unittest.main()
 
 
+class MasterSwitch(unittest.TestCase):
+    """界面只有一个总开关：后端要按顺序做完每一项，并如实报告跳过和失败。"""
+
+    def setUp(self):
+        self.calls = []
+
+    def record(self, name, result=None, error=None):
+        def call(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            if error is not None:
+                raise ValueError(error)
+            return result if result is not None else {}
+        return call
+
+    def test_enable_runs_official_first_then_every_feature_then_cli(self):
+        report = {'features': [{'id': identifier, 'available': True}
+                               for identifier in features.FEATURES]}
+        with patch.object(official, 'enable', self.record('official')), \
+             patch.object(official, 'status', return_value={'supported': True}), \
+             patch.object(features, 'report', return_value=report), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'enable', self.record('cli')):
+            result = backend.switch_all(True)
+        self.assertEqual([name for name, _, _ in self.calls],
+                         ['official'] + ['change'] * len(features.FEATURES) + ['cli'])
+        self.assertEqual([args[0] for name, args, _ in self.calls if name == 'change'],
+                         list(features.FEATURES))
+        self.assertTrue(result['on'])
+        self.assertNotIn('error', result)
+        self.assertTrue(all(step['state'] == 'done' for step in result['steps']))
+
+    def test_enable_stops_before_config_when_the_patch_fails(self):
+        with patch.object(official, 'enable', self.record('official', error='指纹不符')), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'enable', self.record('cli')):
+            result = backend.switch_all(True)
+        self.assertNotIn('change', [name for name, _, _ in self.calls])
+        self.assertFalse(result['on'])
+        self.assertIn('指纹不符', result['error'])
+        self.assertEqual(result['steps'][0]['state'], 'failed')
+
+    def test_missing_setting_is_skipped_and_named(self):
+        report = {'features': [{'id': identifier, 'available': identifier != 'browser'}
+                               for identifier in features.FEATURES]}
+        with patch.object(official, 'enable', self.record('official')), \
+             patch.object(official, 'status', return_value={'supported': True}), \
+             patch.object(features, 'report', return_value=report), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'enable', self.record('cli')):
+            result = backend.switch_all(True)
+        skipped = [step for step in result['steps'] if step['state'] == 'skipped']
+        self.assertEqual([step['id'] for step in skipped], ['browser'])
+        self.assertNotIn('browser', [args[0] for name, args, _ in self.calls if name == 'change'])
+        self.assertNotIn('error', result)
+
+    def test_restore_only_touches_items_with_a_recovery_record(self):
+        report = {'features': [{'id': identifier, 'canRestore': identifier == 'browser'}
+                               for identifier in features.FEATURES]}
+        with patch.object(features, 'report', return_value=report), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'restore', self.record('cli')), \
+             patch.object(official, 'disable', self.record('official')):
+            result = backend.switch_all(False)
+        self.assertEqual([(name, args[0] if args else None) for name, args, _ in self.calls],
+                         [('change', 'browser'), ('cli', 'official'), ('official', None)])
+        self.assertFalse(result['on'])
+        self.assertNotIn('error', result)
+
+    def test_restore_removes_configuration_before_the_patch(self):
+        """配置写入要求正式应用仍然校验通过，所以卸补丁必须排在最后。"""
+        report = {'features': [{'id': identifier, 'canRestore': True}
+                               for identifier in features.FEATURES]}
+        with patch.object(features, 'report', return_value=report), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'restore', self.record('cli')), \
+             patch.object(official, 'disable', self.record('official')):
+            backend.switch_all(False)
+        self.assertEqual(self.calls[-1][0], 'official')
+
+    def test_a_failing_item_does_not_hide_the_others(self):
+        with patch.object(features, 'report', return_value={'features': []}), \
+             patch.object(features, 'change', self.record('change')), \
+             patch.object(cli, 'restore', self.record('cli', error='CLI 未适配')), \
+             patch.object(official, 'disable', self.record('official')):
+            result = backend.switch_all(False)
+        states = {step['id']: step['state'] for step in result['steps']}
+        self.assertEqual(states['code-auto-dream'], 'failed')
+        self.assertEqual(states['official'], 'done')
+        self.assertIn('Code 自动整理', result['error'])
+
+
 class StorageRootMigration(unittest.TestCase):
     """0.3.16 改产品名后，旧状态目录要整体迁移过来，且绝不丢备份。"""
 

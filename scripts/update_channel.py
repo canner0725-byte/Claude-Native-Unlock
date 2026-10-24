@@ -34,7 +34,6 @@ import argparse
 import json
 import pathlib
 import plistlib
-import re
 import subprocess
 import sys
 import urllib.error
@@ -43,31 +42,16 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
+# 渠道公式、响应解析和版本比较只有一份，在 src/official_update.py 里：
+# 助手要在界面上做同样的检查，打包时也只能带上 src/ 里的模块。
+# 这个脚本额外负责本机应用的签名校验、备份列举和安装包可达性。
+from official_update import (  # noqa: E402
+    ARCHITECTURES, CHANNELS, DEFAULT_BASES, ChannelError, NetworkError,
+    compare_versions, parse_update_json, update_url)
+
 DEFAULT_APP = pathlib.Path('/Applications/Claude.app')
 OFFICIAL_BUNDLE = 'com.anthropic.claudefordesktop'
 OFFICIAL_TEAM = 'Q6L2SF6YDW'
-
-# 渠道基址。顺序就是官方源码 RQr() 的顺序：显式 updateApiBase → 应用配置的
-# API 基址 → 这两条默认值。调用方可以用 --base 覆盖，但默认不猜。
-DEFAULT_BASES = ('https://api.anthropic.com', 'https://releases.claude.com')
-
-# 渠道标识，抄自官方源码 AQr 表。stable 不带 channelUuid 参数。
-CHANNELS = {
-    'stable': None,
-    'latest': '77a14fc4-808e-4345-ac3e-090be671bf94',
-    'staggered': '51760d71-67e2-4366-9bf5-4221cda21f61',
-}
-
-# 官方源码 BQr：只有这三种架构会被承认。
-ARCHITECTURES = ('universal', 'arm64', 'x64')
-
-
-class ChannelError(ValueError):
-    """渠道不可用或响应结构不认识；调用方应当拒绝继续，而不是换个来源。"""
-
-
-class NetworkError(ChannelError):
-    """联网失败。和「结构不认识」分开，退出码不同。"""
 
 
 def run(*args):
@@ -118,57 +102,6 @@ def system_version():
     return value
 
 
-def update_url(base, version, channel='stable', arch='universal',
-               platform='darwin', os_version=None, device_id='probe-0000'):
-    """按官方公式拼出更新地址。参数名和顺序都跟官方一致。"""
-    if channel not in CHANNELS:
-        raise ChannelError('未知渠道：' + str(channel))
-    if arch not in ARCHITECTURES:
-        raise ChannelError('未知架构：' + str(arch))
-    if not version:
-        raise ChannelError('缺少版本号，拼不出更新地址')
-    if not os_version:
-        raise ChannelError('缺少系统版本，拼不出更新地址')
-    query = (f'device_id={device_id}&version={version}'
-             f'&os_version={os_version}')
-    uuid = CHANNELS[channel]
-    if uuid:
-        query += '&channelUuid=' + uuid
-    return f'{base}/api/desktop/{platform}/{arch}/squirrel/update?{query}'
-
-
-def parse_update_json(payload):
-    """解析 Squirrel.Mac json 服务的响应。
-
-    只认官方结构：顶层 currentRelease + releases[]，每条 updateTo 里有
-    version/url。对不上就抛——不猜、不把空结果当成功。
-    """
-    if not isinstance(payload, dict):
-        raise ChannelError('渠道响应不是 JSON 对象')
-    if 'currentRelease' not in payload or 'releases' not in payload:
-        raise ChannelError('渠道响应缺少 currentRelease/releases 字段')
-    releases = payload['releases']
-    if not isinstance(releases, list):
-        raise ChannelError('渠道响应的 releases 不是数组')
-    builds = []
-    for item in releases:
-        update = item.get('updateTo') if isinstance(item, dict) else None
-        if not isinstance(update, dict):
-            raise ChannelError('releases 条目缺少 updateTo')
-        version = update.get('version')
-        url = update.get('url')
-        if not version or not url:
-            raise ChannelError('updateTo 缺少 version 或 url')
-        builds.append({
-            'version': version,
-            'url': url,
-            'sha256': update.get('sha256'),
-            'size': update.get('size'),
-            'pub_date': update.get('pub_date'),
-            'name': update.get('name'),
-            'notes': update.get('notes'),
-        })
-    return {'currentRelease': payload['currentRelease'], 'builds': builds}
 
 
 def fetch(url, timeout=20):
@@ -202,18 +135,6 @@ def head_size(url, timeout=20):
     except Exception as error:
         raise NetworkError(f'联网失败（{type(error).__name__}）：{url}')
 
-
-def compare_versions(left, right):
-    """按数字段比较版本号，返回 -1/0/1。官方版本号是点分整数。"""
-    def parts(value):
-        return [int(p) for p in re.findall(r'\d+', str(value or ''))]
-    a, b = parts(left), parts(right)
-    for i in range(max(len(a), len(b))):
-        x = a[i] if i < len(a) else 0
-        y = b[i] if i < len(b) else 0
-        if x != y:
-            return -1 if x < y else 1
-    return 0
 
 
 def probe(app=DEFAULT_APP, offline=False, channel='stable', base=None,
