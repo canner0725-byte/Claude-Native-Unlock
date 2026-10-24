@@ -1,5 +1,16 @@
 # 版本记录
 
+## 0.3.37 — 2026-10-24
+
+- **只保留官方真正封印的开关，20 项裁到 7 项**。按官方 3.6556.2 主 chunk 逐条核对每个 flatKey 的**运行时判定**，而不是看策略 schema 里的 `default` 字段（那个字段只描述管理面板的显示方式）：
+  - 真封印（默认关闭，需写配置才可用）：`desktopHome`（官方 `zMe()` 要求 `chatSurface.enabled===!0`）、`builtinBrowserEnabled`（`K().builtinBrowser.enabled`，schema `default:!1`）、`autoModeEnabled`（`mPe()` 里 cowork 一侧要求 `===!0`）、`isDesktopExtensionEnabled`（`tXt()` 读 `extensions.enabled`，schema `default:!1`）、`toolSearchEnabled`（`vQt()` 未设置直接返回 `"off"`）、`skipWebFetchPreflight`（`FQt()` 只在 `===!0` 时跳过），加上走 CLI 后端的 Code 自动整理。
+  - 已移除的 14 项按证据分四类：**10 项官方默认开启**（定时任务、Cowork/Code 工作台、插件市场、上传插件、自建 Skills、保持唤醒、快速输入截图与附带文件、记住工具授权，运行时为 `!==!1`）；**2 项已被 `desktopHome:"standard"` 的 surfaceGrants 覆盖**（Chat 工作台、高级文件分析）；**1 项仅 1p/组织后端有效**（扩展目录，`p7r()` 要求 `hasOrgPolicyBackend()`，3P 下为 false）；**1 项是用户偏好而非部署封印**（隐藏新功能提示，`disableFeatureDiscovery`）。它们都不应再伪装成独立解锁开关。
+- **后端 `FEATURES` 同步裁到 6 项**，`effective()` 去掉 `scheduled-tasks` 分支；`change()`、恢复记录校验和原子写入逻辑未改。
+- **侧栏补满分区**：新增「功能」分组（工作台 / 工具与网络 / 扩展与插件 / Code），点分组名回到概览并滚到对应分组；6 个原生配置开关与 Code 自动整理仍在概览，符合既定的界面约定。
+- **修两处布局缺陷**：① 侧栏锚点滚动失效——文档视图受 Auto Layout 约束，直接改 `frame.origin` 会被下一次布局还原成 0，改为用 top 约束的 `constant` 承载滚动位置；② `sections.bottomAnchor` 原来用 `equalTo`，会把文档高度反推给分区、把内容少的分区撑成两倍行距，改成 `lessThanOrEqualTo` 并给 `sections` 加 `.required` 竖直抗拉伸。
+- 139 项公开测试通过（`FeatureCatalog` 改为断言完整 6 项清单，往返测试覆盖每一项并校验写入值的精确类型）；构建、签名、DMG/ZIP/SHA256、DMG 校验、ZIP 解压、安装启动检查通过。
+- **真实界面验收**：安装后的 0.3.37（build 50）已确认搜索定位、工作台与 Code 锚点、概览 7 个功能开关，以及补丁与更新、系统授权、快捷键、关于页面；预览构建已复核深色与浅色渲染。
+
 ## 0.3.36 — 2026-10-24
 
 - **修右侧面板整块发灰**（深色下显示成 #B5B5B4，浅色下同样泛灰）：根因是设置行的 1px 分隔线 `HairlineView` 用 `dirtyRect.fill()` 画线。视图被图层化后 AppKit 传进来的 `dirtyRect` 可能是整块图层（实测 768×540），于是每一条分隔线都把 5% 白色铺满整个滚动视口；概览页十几条线叠起来，正好把 #1A1A19 抬到 #A7A7A6。现在固定用 `bounds.intersection(dirtyRect)` 只画自己这一条。

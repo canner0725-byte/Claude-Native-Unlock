@@ -58,7 +58,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastError: String?
     var pendingClaudeRefresh = false
     var featureConfigWritable = false
-    var featureRestorable: [Bool] = Array(repeating: false, count: 21)
+    var featureRestorable: [Bool] = Array(repeating: false, count: 7)
 
     // 一键退出 Claude 并应用修改。
     var quittingClaude = false
@@ -90,62 +90,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 顺序必须和 native_features.FEATURES 完全一致，最后一项是走 CLI 后端的
     // Code 自动整理；tests/test_features.py 会逐项核对。
-    let featureIDs = ["file-analysis", "browser", "scheduled-tasks", "auto-approve",
+    //
+    // 这里只列官方第三方部署下真正默认关闭的项。官方默认就开启的功能
+    // （Cowork/Code 工作台、定时任务、插件市场、Skills、保持唤醒、快速输入、
+    // 记住授权等）本来就没有封印，列进来只会让界面显得能开开关却什么也没变。
+    let featureIDs = ["file-analysis", "browser", "auto-approve",
                       "desktop-extensions", "tool-search", "webfetch-preflight",
-                      "chat-tab", "cowork-tab", "code-tab", "advanced-file-analysis",
-                      "extension-directory", "plugin-marketplaces", "plugin-uploads",
-                      "skill-creation", "keep-awake", "quick-entry-screenshots",
-                      "quick-entry-files", "hide-announcements", "persistent-approvals",
                       "code-auto-dream"]
-    let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器", "官方定时任务",
+    let featureTitles = ["Chat 与高级文件分析", "官方内置浏览器",
                          "Cowork 自动审批选项", "插件里的桌面扩展", "MCP 工具按需加载",
-                         "WebFetch 免域名预检", "Chat 工作台", "Cowork 工作台",
-                         "Code 工作台", "高级文件分析", "扩展目录", "自建插件市场",
-                         "上传自建插件", "自建 Skills", "保持电脑唤醒", "快速输入截图",
-                         "快速输入附带文件", "隐藏新功能提示", "记住工具授权", "Code 自动整理"]
+                         "WebFetch 免域名预检", "Code 自动整理"]
     let featureDescriptions = [
         "Chat 使用标准工作台，启用官方高级文件分析。",
         "启用 Claude 官方内置浏览器（不是 Dia / Chrome）。",
-        "允许官方定时任务；是否执行仍由 Claude 决定。",
         "显示 Cowork 官方自动审批选项；动作审查保留。",
         "允许插件里打包的桌面扩展（.mcpb）加载；第三方部署没有组织策略后端时不能直接安装 .mcpb，Code 插件也不接受。签名检查仍按官方策略。",
         "MCP 工具改为按需加载，不再全部塞进上下文；网关不支持时走官方旧路径。",
         "跳过 Code 里 WebFetch 对 api.anthropic.com 的域名预检；抓取仍走官方 WebFetch。",
-        "在桌面端显示官方 Chat 工作台；模型仍走你配置的第三方 API。",
-        "显示官方 Cowork 工作台；任务执行和授权仍由 Claude 处理。",
-        "显示官方 Code 工作台：新版会话页、会话侧栏和嵌套会话。",
-        "允许 Chat 分析上传的文件；解析在官方本地工作台里完成。",
-        "显示官方桌面扩展目录入口；安装仍按官方签名策略。",
-        "允许添加自己的插件市场；市场内容由你提供。",
-        "允许上传自己打包的插件；加载仍走官方插件加载器。",
-        "允许创建和保存自己的 Skills；扫描与执行仍按官方策略。",
-        "任务运行期间允许 Claude 请求保持电脑唤醒；开关仍由官方界面控制。",
-        "允许快速输入窗口附带屏幕截图；截取哪块屏幕由你选择。",
-        "允许把其他应用里打开的文件附到快速输入。",
-        "隐藏官方新功能公告；不改变任何功能本身。",
-        "允许 MCP 工具使用「始终允许」；逐次审批仍然可用。",
         "只解除 Code 自动整理的可用性限制；用户开关保持。"
     ]
     /// 官方设置页式的分组：标题 + 该组里的功能 id（按界面顺序排列）。
     let featureGroups: [(String, [String])] = [
-        ("工作台", ["file-analysis", "chat-tab", "cowork-tab", "code-tab", "advanced-file-analysis"]),
-        ("工具与网络", ["browser", "scheduled-tasks", "auto-approve", "tool-search",
-                       "webfetch-preflight", "persistent-approvals"]),
-        ("扩展与插件", ["desktop-extensions", "extension-directory", "plugin-marketplaces",
-                       "plugin-uploads", "skill-creation"]),
-        ("外观与通知", ["keep-awake", "quick-entry-screenshots", "quick-entry-files",
-                       "hide-announcements"]),
+        ("工作台", ["file-analysis"]),
+        ("工具与网络", ["browser", "auto-approve", "tool-search", "webfetch-preflight"]),
+        ("扩展与插件", ["desktop-extensions"]),
         ("Code", ["code-auto-dream"])
     ]
+    /// 每个功能分组对应的侧栏 id，顺序和 featureGroups 一一对应。
+    let featureGroupSections = ["workbench", "network", "extensions", "code"]
+    let featureGroupSymbols = ["square.grid.2x2", "network", "puzzlepiece.extension",
+                               "chevron.left.forwardslash.chevron.right"]
+    /// 概览页里的分组容器：侧栏点分组名就滚到这里，开关本身始终留在概览首屏。
+    var featureGroupViews: [String: NSView] = [:]
+    /// 侧栏行的固定顺序；字典遍历顺序不固定，搜索命中时要靠它挑第一项。
+    var sidebarOrder: [String] = []
+    /// 按 featureIDs 顺序建好每一行：开关数组的下标必须和 featureIDs 对齐，
+    /// 所以不能按分组的顺序去建，只能先全建好再分发到各自分组。
+    lazy var featureRowViews: [NSView] = (0..<featureIDs.count).map { featureRow($0) }
     /// Code 自动整理在列表里的位置；它走 CLI 后端，不是 3P 配置项。
     var codeAutoDreamIndex: Int { featureIDs.firstIndex(of: "code-auto-dream") ?? featureIDs.count - 1 }
     var featureSwitches: [ClaudeSwitch] = []
     var featureLabels: [NSTextField] = []
     var featureHints: [NSTextField] = []
     var featureRows: [NSView] = []
-    var featureEnabled: [Bool] = Array(repeating: false, count: 21)
+    var featureEnabled: [Bool] = Array(repeating: false, count: 7)
     /// 当前 Claude 版本是否还有这个配置键；没有就禁用而不是装作能点。
-    var featureAvailable: [Bool] = Array(repeating: true, count: 21)
+    var featureAvailable: [Bool] = Array(repeating: true, count: 7)
     // 只在出错或尚未适配时显示，平时留空，避免每行都挂一句说明。
     let featureSummary = NSTextField(wrappingLabelWithString: "")
 
@@ -313,6 +303,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         addSidebarRow("general", title: "概览", symbol: "slider.horizontal.3", to: stack)
         addSidebarRow("patch", title: "补丁与更新", symbol: "arrow.triangle.2.circlepath", to: stack)
 
+        // 功能分组在侧栏各有入口：点一下回到概览并滚到该组。
+        // 开关本身始终留在概览首屏，侧栏这里是目录，不是另一个页面。
+        addSidebarHeader("功能", ids: featureGroupSections, to: stack)
+        for (index, entry) in featureGroups.enumerated() {
+            let id = featureGroupSections[index]
+            addSidebarRow(id, title: entry.0, symbol: featureGroupSymbols[index], to: stack) {
+                [weak self] in self?.jumpToFeatureGroup(id)
+            }
+        }
+
         addSidebarHeader("本机", ids: ["system", "about"], to: stack)
         addSidebarRow("system", title: "系统授权", symbol: "lock.shield", to: stack)
         addSidebarRow("about", title: "关于", symbol: "info.circle", to: stack)
@@ -377,27 +377,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         row.heightAnchor.constraint(equalToConstant: ClaudeTheme.Metric.controlHeight).isActive = true
         sidebarRows[id] = row
+        sidebarOrder.append(id)
     }
 
-    func selectSection(_ id: String) {
+    /// 侧栏的分组名是概览页里的锚点：回到概览并滚到该组，高亮留在分组名上。
+    func jumpToFeatureGroup(_ id: String) {
+        guard let group = featureGroupViews[id] else { return }
+        selectSection("general", highlight: id)
+        // 切页后要等布局完成，分组才有正确的 frame。
+        DispatchQueue.main.async {
+            guard let document = self.scrollView?.documentView else { return }
+            self.scrollView?.scrollToRect(group.convert(group.bounds, to: document))
+        }
+    }
+
+    func selectSection(_ id: String, highlight: String? = nil) {
         guard sectionViews[id] != nil else { return }
         selectedSection = id
+        let highlighted = highlight ?? id
         for (rowID, row) in sidebarRows {
-            row.isSelected = rowID == id
+            row.isSelected = rowID == highlighted
         }
         for (sectionID, view) in sectionViews {
             view.isHidden = sectionID != id
         }
-        contentTitleLabel?.stringValue = [
+        var titles = [
             "general": "概览",
             "patch": "补丁与更新",
             "system": "系统授权",
             "shortcuts": "快捷键",
             "about": "关于"
-        ][id] ?? ""
+        ]
+        for (index, groupTitle) in featureGroups.map({ $0.0 }).enumerated() {
+            titles[featureGroupSections[index]] = groupTitle
+        }
+        contentTitleLabel?.stringValue = titles[id] ?? ""
         // 等这次布局完成后再回到顶部；滚动容器高度刚变化时立即 scroll 会停在旧位置。
-        DispatchQueue.main.async {
-            self.scrollView?.scrollToTop()
+        // 锚点跳转要滚到分组，不能在这里再回顶部，否则会把目标位置覆盖掉。
+        if highlight == nil {
+            DispatchQueue.main.async {
+                self.scrollView?.scrollToTop()
+            }
         }
     }
 
@@ -471,6 +491,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sections.alignment = .leading
         sections.distribution = .fill
         sections.spacing = 0
+        // 内容短的分区不能被拉到视口高度：外层 .fill 会把多余高度摊给可见的分区，
+        // 「系统授权」这类只有两组的页面行距就会被撑成两倍。
+        sections.setContentHuggingPriority(.required, for: .vertical)
         sections.translatesAutoresizingMaskIntoConstraints = false
         doc.addSubview(sections)
         NSLayoutConstraint.activate([
@@ -484,7 +507,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sections.trailingAnchor.constraint(equalTo: doc.trailingAnchor,
                                                constant: -ClaudeTheme.Metric.contentInsetX),
             sections.topAnchor.constraint(equalTo: doc.topAnchor, constant: 4),
-            sections.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -40),
+            // 用「不超过」而不是「等于」：等于会把文档高度反推给分区，逼着它撑满视口。
+            sections.bottomAnchor.constraint(lessThanOrEqualTo: doc.bottomAnchor, constant: -40),
             doc.heightAnchor.constraint(greaterThanOrEqualTo: sections.heightAnchor, constant: 44)
         ])
 
@@ -534,25 +558,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.target = self
         refreshButton.action = #selector(refresh)
 
-        var featureViews: [Int: NSView] = [:]
-        for index in featureTitles.indices {
-            featureViews[index] = featureRow(index)
-        }
         featureSummary.font = ClaudeFont.caption()
         featureSummary.textColor = ClaudeTheme.warning
         featureSummary.isHidden = true
         featureSummary.maximumNumberOfLines = 3
         featureSummary.lineBreakMode = .byWordWrapping
 
-        // 按官方设置页的方式分成若干组，每组一个 15pt 标题和带分隔线的行。
+        // 概览首屏保留全部功能开关（用户明确要求），按官方设置页的方式分组：
+        // 每组一个 15pt 标题、带 1px 分隔线的行；侧栏的分组名是这些组的锚点。
         var groups: [NSView] = [featureSummary,
                                 settingsGroup("解锁", rows: [computerUse, versionRow])]
-        for (title, ids) in featureGroups {
-            let rows = ids.compactMap { id in
-                featureIDs.firstIndex(of: id).flatMap { featureViews[$0] }
+        for (index, entry) in featureGroups.enumerated() {
+            let rows = entry.1.compactMap { id in
+                featureIDs.firstIndex(of: id).map { featureRowViews[$0] }
             }
             guard !rows.isEmpty else { continue }
-            groups.append(settingsGroup(title, rows: rows))
+            let group = settingsGroup(entry.0, rows: rows)
+            featureGroupViews[featureGroupSections[index]] = group
+            groups.append(group)
         }
         groups.append(settingsGroup("操作", rows: [openRow, refreshRow]))
 
@@ -715,6 +738,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stack.alignment = .leading
         stack.distribution = .fill
         stack.spacing = 0
+        // 内容短的分区不能被拉高：外层 .fill 会把多余高度分给视图，
+        // 结果「系统授权」这种只有两组的页面行距被撑成两倍。
+        stack.setContentHuggingPriority(.required, for: .vertical)
 
         // 官方设置页的分组说明：13pt 次级文字，位于页面标题下方。
         let introLabel = NSTextField(wrappingLabelWithString: intro)
@@ -840,10 +866,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func filterSidebar() {
         let query = searchBox.field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // 命中某个开关时，它所在的分组页也要留下来，否则搜索完点进去是空的。
+        let hitIndex = query.isEmpty ? nil : featureTitles.firstIndex { title in
+            title.lowercased().contains(query)
+                || featureDescriptions[featureTitles.firstIndex(of: title) ?? 0].lowercased().contains(query)
+        }
+        let hitSection = hitIndex.flatMap { featureGroupSection(for: featureIDs[$0]) }
         var firstVisible: String?
-        for (id, row) in sidebarRows {
-            let matches = query.isEmpty || row.titleText.lowercased().contains(query)
-                || (id == "general" && featureTitles.contains { $0.lowercased().contains(query) })
+        for id in sidebarOrder {
+            guard let row = sidebarRows[id] else { continue }
+            let matches = query.isEmpty || row.titleText.lowercased().contains(query) || id == hitSection
             row.isHidden = !matches
             if matches, firstVisible == nil { firstVisible = id }
         }
@@ -853,19 +885,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let current = sidebarRows[selectedSection], current.isHidden, let id = firstVisible {
             selectSection(id)
         }
-        if !query.isEmpty, let index = featureTitles.firstIndex(where: {
-            $0.lowercased().contains(query) || featureDescriptions[featureTitles.firstIndex(of: $0) ?? 0].lowercased().contains(query)
-        }) {
-            selectSection("general")
+        if let index = hitIndex {
+            selectSection("general", highlight: featureGroupSection(for: featureIDs[index]))
             scrollToFeature(index)
         }
+    }
+
+    /// 某个开关属于哪个侧栏分区。
+    func featureGroupSection(for id: String) -> String? {
+        guard let group = featureGroups.firstIndex(where: { $0.1.contains(id) }),
+              featureGroupSections.indices.contains(group) else { return nil }
+        return featureGroupSections[group]
     }
 
     /// 搜索命中某个原生配置时，滚到那一行，而不是只换页面。
     func scrollToFeature(_ index: Int) {
         guard featureRows.indices.contains(index) else { return }
+        // 切页后要等布局完成，行才有正确的 frame。
         DispatchQueue.main.async {
-            self.featureRows[index].scrollToVisible(self.featureRows[index].bounds)
+            guard let document = self.scrollView?.documentView else { return }
+            let row = self.featureRows[index]
+            self.scrollView?.scrollToRect(row.convert(row.bounds, to: document))
         }
     }
 
@@ -2032,19 +2072,25 @@ final class PlainScrollView: NSView {
     private let clip = FlippedView()
     private var offset: CGFloat = 0
     private weak var document: NSView?
+    private var documentTop: NSLayoutConstraint?
 
     var documentView: NSView? {
         get { document }
         set {
             document?.removeFromSuperview()
+            documentTop?.isActive = false
             document = newValue
             guard let newValue else { return }
             newValue.translatesAutoresizingMaskIntoConstraints = false
             clip.addSubview(newValue)
+            // 文档位置用一条 top 约束的 constant 表示，而不是改 frame：
+            // 文档本身受 Auto Layout 管理，直接改 frame 会被下一次布局还原。
+            let top = newValue.topAnchor.constraint(equalTo: clip.topAnchor)
+            documentTop = top
             NSLayoutConstraint.activate([
                 newValue.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
                 newValue.trailingAnchor.constraint(equalTo: clip.trailingAnchor),
-                newValue.topAnchor.constraint(equalTo: clip.topAnchor),
+                top,
                 newValue.widthAnchor.constraint(equalTo: clip.widthAnchor)
             ])
         }
@@ -2073,11 +2119,13 @@ final class PlainScrollView: NSView {
     }
 
     private func applyOffset() {
-        guard let document else { return }
-        offset = min(max(0, offset), maximumOffset)
-        var frame = document.frame
-        frame.origin.y = -offset
-        document.frame = frame
+        guard document != nil else { return }
+        // 只夹住实际画出来的位置，不改写 offset 本身：切页时文档高度会短暂变小，
+        // 若把夹过的值写回去，刚设好的滚动目标就被抹成 0 了。
+        let clamped = min(max(0, offset), maximumOffset)
+        if documentTop?.constant != -clamped {
+            documentTop?.constant = -clamped
+        }
     }
 
     override func layout() {
@@ -2095,6 +2143,16 @@ final class PlainScrollView: NSView {
     func scrollToTop() {
         offset = 0
         applyOffset()
+    }
+
+    /// 把文档坐标里的一段滚进视口，顶部留 8pt 呼吸。
+    /// 目标位置存在 `offset` 里，布局完成、文档高度更新后由 `layout()` 再应用一次。
+    func scrollToRect(_ rect: NSRect) {
+        offset = rect.minY - 8
+        applyOffset()
+        #if PREVIEW
+        print("[scroll] target=\(offset) max=\(maximumOffset) doc=\(document?.frame.height ?? -1) bounds=\(bounds.height)")
+        #endif
     }
 }
 
@@ -2980,6 +3038,11 @@ extension AppDelegate {
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.appearance = NSApp.appearance
         window.contentView?.layoutSubtreeIfNeeded()
+        #if PREVIEW
+        if let scroll = previewDelegate.scrollView {
+            print("[render] docOrigin=\(scroll.documentView?.frame.origin.y ?? 0) docH=\(scroll.documentView?.frame.height ?? 0) boundsH=\(scroll.bounds.height)")
+        }
+        #endif
         window.displayIfNeeded()
         window.contentView?.subviews.forEach { $0.displayIfNeeded() }
         CATransaction.flush()
@@ -3039,12 +3102,23 @@ func debugCapture(to path: String) {
 }
 
 func previewStep(_ index: Int) {
-    let sections = ["general", "patch", "shortcuts", "about"]
-    let names = ["dark", "patch", "shortcuts", "about"]
+    // 每一页都渲染一张：侧栏分区多了以后，漏掉一页就等于漏掉一整个分组的核对。
+    let sections = ["general", "patch", "system", "shortcuts", "about"]
+    let names = ["dark", "patch", "system", "shortcuts", "about"]
+    // 概览页里的功能分组是锚点，各滚一次，确认侧栏点分组能落到对应位置。
+    let anchors = previewDelegate.featureGroupSections
     if index < sections.count {
         previewDelegate.selectSection(sections[index])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
             previewDelegate.renderPreview(to: previewBase + "-" + names[index] + ".png",
+                                          dark: true)
+            previewStep(index + 1)
+        }
+    } else if index - sections.count < anchors.count {
+        let anchor = anchors[index - sections.count]
+        previewDelegate.jumpToFeatureGroup(anchor)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            previewDelegate.renderPreview(to: previewBase + "-anchor-" + anchor + ".png",
                                           dark: true)
             previewStep(index + 1)
         }
