@@ -11,3 +11,6 @@ work/
 *.log
 *.env
 .env*
+
+# 子代理的临时 worktree，不属于仓库内容
+.claude/worktrees/
