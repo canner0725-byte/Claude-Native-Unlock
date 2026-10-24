@@ -295,6 +295,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         searchBox.onChange = { [weak self] in self?.filterSidebar() }
         searchBox.translatesAutoresizingMaskIntoConstraints = false
         stack.addArrangedSubview(searchBox)
+        // `-16` 是本文件里侧栏子视图的统一写法：内容区从左边距 16 开始、宽 = 侧栏宽 - 16，
+        // 与下面的导航行完全对齐。改成 `stack.width` 会让搜索框比导航行宽出 16pt 并左边越界
+        // （预览像素实测：左边界从 22pt 跑到 5pt）。搜索框内部四周另有 6pt 绘制留白，属设计。
         searchBox.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         searchBox.heightAnchor.constraint(equalToConstant: 32).isActive = true
         stack.setCustomSpacing(18, after: searchBox)
