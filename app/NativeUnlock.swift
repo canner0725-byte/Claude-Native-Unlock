@@ -589,13 +589,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func featureRow(_ index: Int) -> NSView {
-        let title = NSTextField(labelWithString: featureTitles[index])
-        title.font = ClaudeFont.body()
+        let title = ClaudeFont.label(featureTitles[index], font: ClaudeFont.body())
         title.textColor = ClaudeTheme.textPrimary
         title.toolTip = featureDescriptions[index]
 
-        let desc = NSTextField(wrappingLabelWithString: featureDescriptions[index])
-        desc.font = ClaudeFont.body()
+        let desc = ClaudeFont.label(featureDescriptions[index], font: ClaudeFont.body())
         desc.textColor = ClaudeTheme.textMuted
         desc.maximumNumberOfLines = 0
         desc.lineBreakMode = .byWordWrapping
@@ -779,8 +777,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         group.alignment = .leading
         group.distribution = .fill
         group.spacing = 0
-        let heading = NSTextField(labelWithString: title)
-        heading.font = ClaudeFont.heading()
+        let heading = ClaudeFont.label(title, font: ClaudeFont.heading())
         heading.textColor = ClaudeTheme.textPrimary
         heading.setContentHuggingPriority(.required, for: .vertical)
         group.addArrangedSubview(heading)
@@ -802,11 +799,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func settingsRow(title: String, description: String, control: NSView? = nil) -> NSView {
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = ClaudeFont.body()
+        let titleLabel = ClaudeFont.label(title, font: ClaudeFont.body())
         titleLabel.textColor = ClaudeTheme.textPrimary
-        let desc = NSTextField(wrappingLabelWithString: description)
-        desc.font = ClaudeFont.body()
+        let desc = ClaudeFont.label(description, font: ClaudeFont.body())
         desc.textColor = ClaudeTheme.textMuted
         desc.maximumNumberOfLines = 0
         desc.lineBreakMode = .byWordWrapping
@@ -816,8 +811,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func settingsRow(title: String, descriptionView: NSView, control: NSView? = nil) -> NSView {
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = ClaudeFont.body()
+        let titleLabel = ClaudeFont.label(title, font: ClaudeFont.body())
         titleLabel.textColor = ClaudeTheme.textPrimary
         return settingsRow(titleView: titleLabel, descriptionView: descriptionView,
                            extraViews: [], control: control)
@@ -1945,16 +1939,21 @@ enum ClaudeTheme {
         static let controlHeight: CGFloat = 32      // --cds-h-control
         static let navWidth: CGFloat = 232
         static let rowPaddingY: CGFloat = 12        // --cds-pad-md
-        static let rowLabelGap: CGFloat = 4         // gap-1
+        // CDS 的标题与描述是同一个文本块里的两行，靠行高衔接，没有额外间距；
+        // 这里留 0，否则每行多出 4pt，七行下来会把概览页顶出首屏。
+        static let rowLabelGap: CGFloat = 0
         static let groupGap: CGFloat = 40           // --cds-gap-xl
         static let headerGap: CGFloat = 16          // --cds-gap-md
         static let contentInsetX: CGFloat = 24      // px-xl
         static let contentInsetTop: CGFloat = 28
-        // 官方 `--cds-switch-h: calc(1.25rem * --cds-rem-scale)`，桌面端
-        // rem-scale = 16/17 → 1.25 × 16 × 16/17 ≈ 18.8pt；宽度取 1.8 倍。
-        // 组件宽度由官方组件库在 JS 里算，CSS 查不到，这一比值沿用真机截图。
-        static let switchHeight: CGFloat = 19
-        static let switchWidth: CGFloat = 34
+        // 官方 `--cds-switch-h: calc(1.25rem * var(--cds-rem-scale, 1))`。
+        // 包内 CSS 从未给 `--cds-rem-scale` 赋值，官方 `index.html` 也刻意不写
+        // 内联字号（注释原文："Deliberately no ... inline font size"），
+        // 于是 rem = 16px 恒等，开关高就是 1.25 × 16 = 20pt。
+        // 此前按 16/17 缩放写成 19pt 是没有依据的。
+        // 宽度官方由组件库在 JS 里算，CSS 查不到，仍按真机截图取 1.8 倍。
+        static let switchHeight: CGFloat = 20
+        static let switchWidth: CGFloat = 36
     }
 
     // surface-1 侧栏 / surface-2 内容面板；深色下内容比侧栏略亮。
@@ -2011,19 +2010,15 @@ enum ClaudeFont {
         }
     }
 
-    private static let faces: [NSFont.Weight: String] = [
-        .regular: "AnthropicSansVariable-TextRegular",
-        .medium: "AnthropicSansVariable-TextMedium",
-        .semibold: "AnthropicSansVariable-TextSemibold",
+    /// 官方 semibold 的 wght 是 580（CSS `--cds-font-weight-semibold: 580`），
+    /// 但字体里的 `TextSemibold` 具名实例落在 600（实测可变轴返回值）。
+    /// 直接取具名实例会让标题比官方略粗一档，所以这里按官方数值设轴，
+    /// 而不是挑最接近的实例名。
+    private static let weights: [NSFont.Weight: (name: String, wght: CGFloat)] = [
+        .regular: ("AnthropicSansVariable-TextRegular", 400),
+        .medium: ("AnthropicSansVariable-TextMedium", 500),
+        .semibold: ("AnthropicSansVariable-TextSemibold", 580),
     ]
-
-    static func ui(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
-        registerBundledFonts()
-        if let name = faces[weight], let font = NSFont(name: name, size: size) {
-            return font
-        }
-        return .systemFont(ofSize: size, weight: weight)
-    }
 
     // 与 CDS 字号一一对应：caption 12 / footnote 13 / body 14 / heading 15 / title 22。
     static func caption(_ weight: NSFont.Weight = .regular) -> NSFont { ui(12, weight) }
@@ -2031,6 +2026,74 @@ enum ClaudeFont {
     static func body(_ weight: NSFont.Weight = .regular) -> NSFont { ui(14, weight) }
     static func heading(_ weight: NSFont.Weight = .semibold) -> NSFont { ui(15, weight) }
     static func title() -> NSFont { ui(22, .semibold) }
+
+    /// CDS 的行高和字号不成固定比例（caption 12/17、body 14/20、title 22/28），
+    /// 而 `NSTextField` 只按字体自身度量排：14pt 排出来是 18pt 行高，比官方紧 2pt，
+    /// 多行说明会明显更挤。这里按官方 `--cds-leading-*` 给出对应行高。
+    static func leading(for size: CGFloat) -> CGFloat {
+        switch size {
+        case ..<12.5: return 17    // caption 12/17、footnote 13/17
+        case ..<16.5: return 20    // body 14/20、heading 15/20
+        default: return 28         // title 22/28
+        }
+    }
+
+    static func ui(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
+        registerBundledFonts()
+        guard let face = weights[weight],
+              let base = NSFont(name: face.name, size: size) else {
+            return .systemFont(ofSize: size, weight: weight)
+        }
+        // 视觉字号轴跟字号走，否则小字会拿到 16pt 那档的字距。
+        let descriptor = base.fontDescriptor.addingAttributes([
+            .variation: [NSNumber(value: 0x77676874): face.wght,   // 'wght'
+                         NSNumber(value: 0x6F70737A): size]        // 'opsz'
+        ])
+        return NSFont(descriptor: descriptor, size: size) ?? base
+    }
+
+    /// 按 CDS 行高排字的标签。
+    ///
+    /// `NSTextField` 没有 lineHeight，只能用段落样式；而段落样式挂在富文本上，
+    /// 谁再写一次 `stringValue = …` 就会被清掉，行高悄悄回到字体自身的 18pt。
+    /// 界面里标签文字是随时更新的（检测中 / 已开启 / 版本号…），逐个调用点重套
+    /// 一定会漏，所以把重套放进 setter 本身。
+    static func label(_ text: String = "", font: NSFont) -> CDSLabel {
+        let label = CDSLabel(labelWithString: text)
+        label.apply(font)
+        return label
+    }
+}
+
+/// 见 `ClaudeFont.label`：写入文字时自动带上官方行高。
+final class CDSLabel: NSTextField {
+    private var cdsFont: NSFont?
+    private var cdsStyle: NSParagraphStyle?
+
+    func apply(_ font: NSFont) {
+        cdsFont = font
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = ClaudeFont.leading(for: font.pointSize)
+        style.maximumLineHeight = style.minimumLineHeight
+        cdsStyle = style
+        self.font = font
+        write(stringValue)
+    }
+
+    /// 只有显式改了字体才需要同步行高；这里保持默认的 `font` 行为。
+    override var stringValue: String {
+        get { super.stringValue }
+        set { write(newValue) }
+    }
+
+    private func write(_ text: String) {
+        guard let font = cdsFont, let style = cdsStyle else {
+            super.stringValue = text
+            return
+        }
+        super.attributedStringValue = NSAttributedString(
+            string: text, attributes: [.font: font, .paragraphStyle: style])
+    }
 }
 
 /// 左侧栏底色：直接绘制，滚动/截图/打印时都不会丢。
@@ -2301,7 +2364,8 @@ final class SearchBoxView: NSView, NSTextFieldDelegate {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
+        // 官方输入框圆角 --cds-radius-sm，comfortable 密度下 .4375rem = 7pt。
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
         effectiveAppearance.performAsCurrentDrawingAppearance {
             ClaudeTheme.searchFill.setFill()
             path.fill()
@@ -2321,7 +2385,7 @@ final class SidebarRowView: NSView {
     let id: String
     let titleText: String
     private let iconView = NSImageView()
-    private let label = NSTextField(labelWithString: "")
+    private let label = ClaudeFont.label(font: ClaudeFont.body())
     private let onSelect: (String) -> Void
     private var hovered = false
     private var tracking: NSTrackingArea?
@@ -2345,7 +2409,6 @@ final class SidebarRowView: NSView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.contentTintColor = ClaudeTheme.textSecondary
         label.stringValue = title
-        label.font = ClaudeFont.body()
         label.textColor = ClaudeTheme.textSecondary
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(iconView)
