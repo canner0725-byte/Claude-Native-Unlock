@@ -85,7 +85,7 @@ def check_project_location():
     if inside:
         return item('project_location', '项目不在受隐私保护的目录',
                     PENDING,
-                    f'当前在 {inside}（macOS 会要求逐个程序授权这个目录）',
+                    f'当前在 {ROOT}，位于受保护的 {inside.name}（macOS 会要求逐个程序授权这个目录）',
                     f'移到 {DEVELOPER / "Claude-Native-Unlock"}，并同步改 AGENTS.md 第 5 条')
     return item('project_location', '项目不在受隐私保护的目录', READY, str(ROOT))
 
@@ -100,23 +100,33 @@ def check_signing_identity(core):
 
 
 def check_password_location(core):
+    """报告签名密码存在哪，并说明为什么这是已知的、暂时无解的风险。
+
+    这里**故意不报“待处理”**：2026-10-24 实测确认，登录钥匙串的 ACL 对
+    同用户进程不提供隔离，数据保护钥匙串需要的 entitlement 自签证书拿不到。
+    两条路都堵死，把它列成待处理只会让人反复尝试一个做不成的事。
+    风险本身写进 README，由用户决定要不要接受。
+    """
     where = core.signing_password_location()
-    if where == 'keychain':
-        return item('signing_password', '签名密码只在登录钥匙串里', READY,
-                    '条目由助手后端自己写入，别的程序读取要你确认')
     if where == 'plaintext':
-        return item('signing_password', '签名密码只在登录钥匙串里', PENDING,
-                    '仍是旧版的 0600 明文文件，任何同用户程序都能读',
-                    '解锁屏幕后开启一次补丁，助手会把它搬进钥匙串并删掉文件')
-    return item('signing_password', '签名密码只在登录钥匙串里', UNKNOWN,
+        return item('signing_password', '签名密码的保护（已知无解，非待办）', UNKNOWN,
+                    '密码以 0600 明文存放；登录钥匙串与数据保护钥匙串两条路都已实测否决',
+                    '无需操作。风险见 README「签名身份等于 Claude 的系统授权」')
+    if where == 'keychain':
+        # 理论上不该出现；出现了也要如实报告，不要假装是保护生效了。
+        return item('signing_password', '签名密码的保护（已知无解，非待办）', UNKNOWN,
+                    '密码在登录钥匙串里，但已实测该 ACL 不隔离同用户进程',
+                    '无需操作。风险见 README「签名身份等于 Claude 的系统授权」')
+    return item('signing_password', '签名密码的保护（已知无解，非待办）', UNKNOWN,
                 '既没有钥匙串条目也没有明文文件；下一次签名会退回 ad-hoc')
 
 
 def check_assistant_signing():
     """助手和后端是否用固定身份签名。
 
-    后端必须单独检查：钥匙串条目的 ACL 认的是**直接调用 Security 的那个
-    进程**，也就是后端可执行文件，不是外层 .app。
+    ad-hoc 的指定要求是 cdhash，助手每次重新构建都会变，macOS 会当成另一个
+    应用，用户的辅助功能与屏幕录制授权要重新确认一次。固定身份的要求只跟
+    证书有关，重建多少次都不变。
     """
     if not ASSISTANT_APP.exists():
         return item('assistant_signing', '助手用固定身份签名', UNKNOWN,
@@ -127,28 +137,41 @@ def check_assistant_signing():
     if not app_req or 'cdhash' in app_req:
         problems.append('助手本体是 ad-hoc 签名（指定要求是 cdhash）')
     if backend_req and 'cdhash' in backend_req:
-        problems.append('后端可执行文件是 ad-hoc 签名，密码条目会随重建失效')
+        problems.append('后端可执行文件是 ad-hoc 签名')
     if problems:
         return item('assistant_signing', '助手用固定身份签名', PENDING,
-                    '；'.join(problems),
-                    '建立固定身份后重新构建并安装助手')
+                    '；'.join(problems) + '；更新助手后系统授权要重新确认',
+                    '用 scripts/build.py 重新构建并安装到 /Applications')
     return item('assistant_signing', '助手用固定身份签名', READY, '助手与后端都是固定身份')
 
 
 def check_background_job():
-    """固定后台作业：先看有没有登记，不替用户创建。"""
-    plist = pathlib.Path.home() / 'Library/LaunchAgents/local.claude.native-unlock.maintenance.plist'
-    if plist.exists():
-        try:
-            data = plistlib.loads(plist.read_bytes())
-        except Exception:
-            return item('background_job', '固定后台作业已登记', PENDING,
-                        f'{plist.name} 存在但读不出来')
-        return item('background_job', '固定后台作业已登记', READY,
-                    f'{plist.name}：{data.get("Label", "")}')
-    return item('background_job', '固定后台作业已登记', PENDING,
-                '还没有固定作业；现在只能手工触发维护',
-                '确认维护代理验证通过后再登记，见 docs/MAINTENANCE_AGENT.md')
+    """固定后台作业：先看有没有登记，不替用户创建。
+
+    已登记还要看定义是否合格：`~/Library/LaunchAgents/` 里的 plist 是
+    launchd 直接读的，手改坏了不会有任何提示，只会静默不按计划跑。
+    """
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import maintenance_job as job
+    plist = job.INSTALLED
+    if not plist.exists():
+        staged = ('定义已生成，等你批准登记' if job.STAGED.exists()
+                  else '定义还没生成（运行 scripts/maintenance_job.py --write）')
+        return item('background_job', '固定后台作业已登记', PENDING,
+                    f'还没有登记；{staged}',
+                    '先通过零弹窗验证，再把定义拷进 ~/Library/LaunchAgents 并在登录项批准')
+    try:
+        data = plistlib.loads(plist.read_bytes())
+    except Exception:
+        return item('background_job', '固定后台作业已登记', PENDING,
+                    f'{plist.name} 存在但读不出来', '用 scripts/maintenance_job.py 重新生成')
+    problems = job.problems_in(data)
+    if problems:
+        return item('background_job', '固定后台作业已登记', PENDING,
+                    '已登记但定义不合格：' + '；'.join(problems),
+                    '用 scripts/maintenance_job.py 重新生成后覆盖')
+    return item('background_job', '固定后台作业已登记', READY,
+                f'{plist.name}：{data.get("Label", "")}')
 
 
 def check_maintenance_config():
@@ -183,23 +206,56 @@ def check_independent_cli():
 
 
 def check_third_party_denied():
-    """维护代理必须读不到 3P 配置；这里只报告路径，不改权限。"""
+    """维护代理必须读不到 3P 配置。
+
+    只报告“拒绝规则是否真的覆盖了这个路径”，不靠“配置文件存在”当结论：
+    配置存在不等于规则生效，上一版的教训就是一条无效规则让整份文件不加载。
+    """
     if not THIRD_PARTY.exists():
-        return item('third_party_denied', '维护代理读不到 3P 配置', UNKNOWN,
-                    '本机没有 3P 配置目录')
-    return item('third_party_denied', '维护代理读不到 3P 配置', PENDING,
-                f'{THIRD_PARTY} 存在；拒绝规则写在维护代理的配置里',
-                '运行 scripts/maintenance_setup.py --write，再用越界测试确认')
+        return item('third_party_denied', '维护代理读不到 3P 配置', READY,
+                    '本机没有 3P 配置目录；拒绝规则仍然在配置里')
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import maintenance_setup as setup
+    import maintenance_probe as probe
+    try:
+        data = json.loads(setup.SETTINGS_FILE.read_text())
+    except Exception as error:
+        return item('third_party_denied', '维护代理读不到 3P 配置', PENDING,
+                    f'维护代理配置读不出来：{error}',
+                    '运行 scripts/maintenance_setup.py --write 重新生成')
+    deny = data.get('permissions', {}).get('deny', [])
+    rule = probe.rule_matches(deny, 'Read', str(THIRD_PARTY / 'Local State'))
+    if not rule:
+        return item('third_party_denied', '维护代理读不到 3P 配置', PENDING,
+                    '拒绝规则没有覆盖 3P 配置目录',
+                    '运行 scripts/maintenance_setup.py --write 重新生成')
+    return item('third_party_denied', '维护代理读不到 3P 配置', READY, f'由 {rule} 挡住')
 
 
 def check_eagle():
-    """Eagle 素材库永远不进入维护范围；只确认它现在是否挂载。"""
-    if not PROTECTED_VOLUME.exists():
-        return item('eagle_protected', 'Eagle 素材库不在维护范围内', READY,
-                    f'{PROTECTED_VOLUME} 未挂载；拒绝规则仍会生效')
-    return item('eagle_protected', 'Eagle 素材库不在维护范围内', PENDING,
-                f'{PROTECTED_VOLUME} 已挂载；必须靠拒绝规则挡住',
-                '运行 scripts/maintenance_setup.py --write，再用越界测试确认')
+    """Eagle 素材库永远不进入维护范围。
+
+    盘挂着的时候，唯一挡得住的是拒绝规则本身——所以这里查规则，不查挂载。
+    """
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import maintenance_setup as setup
+    import maintenance_probe as probe
+    target = '/Volumes/T7/十六珠宝进姐短视频运营/十六珠宝素材库.library'
+    try:
+        data = json.loads(setup.SETTINGS_FILE.read_text())
+    except Exception as error:
+        return item('eagle_protected', 'Eagle 素材库不在维护范围内', PENDING,
+                    f'维护代理配置读不出来，无法确认挡得住：{error}',
+                    '运行 scripts/maintenance_setup.py --write 重新生成')
+    deny = data.get('permissions', {}).get('deny', [])
+    rule = probe.rule_matches(deny, 'Read', target)
+    if not rule:
+        return item('eagle_protected', 'Eagle 素材库不在维护范围内', PENDING,
+                    '拒绝规则没有覆盖 Eagle 素材库',
+                    '运行 scripts/maintenance_setup.py --write 重新生成')
+    mounted = '已挂载' if PROTECTED_VOLUME.exists() else '未挂载'
+    return item('eagle_protected', 'Eagle 素材库不在维护范围内', READY,
+                f'{PROTECTED_VOLUME} {mounted}；由 {rule} 挡住')
 
 
 def check_screen():
@@ -209,8 +265,8 @@ def check_screen():
                     '读不出屏幕锁定状态')
     if locked:
         return item('screen_state', '屏幕状态（决定哪些步骤要你在场）', PENDING,
-                    '屏幕已锁定：钥匙串读不到也不会弹框，涉及密码的步骤现在做不了',
-                    '解锁屏幕后再做迁移签名密码、给 Claude 授权')
+                    '屏幕已锁定：系统设置里勾选授权、登录项确认这些步骤都做不了',
+                    '解锁屏幕后再给 Claude 授权、批准后台作业')
     return item('screen_state', '屏幕状态（决定哪些步骤要你在场）', READY,
                 '屏幕已解锁，可以做需要你确认的步骤')
 

@@ -102,6 +102,133 @@ class SetupCheck(unittest.TestCase):
         self.assertIn('/usr/sbin/ioreg', source)
         self.assertNotIn("'/usr/bin/ioreg'", source)
 
+    def test_a_registered_job_is_checked_against_the_definition(self):
+        """“文件存在”不等于“作业合格”：手改坏的 plist 会静默不按计划跑。"""
+        import plistlib
+        import tempfile
+        import setup_check
+        import maintenance_job as job
+        with tempfile.TemporaryDirectory() as work:
+            installed = pathlib.Path(work) / 'installed.plist'
+            installed.write_bytes(plistlib.dumps({'Label': job.LABEL, 'RunAtLoad': True}))
+            original = job.INSTALLED
+            job.INSTALLED = installed
+            try:
+                result = setup_check.check_background_job()
+            finally:
+                job.INSTALLED = original
+        self.assertEqual(result['state'], setup_check.PENDING)
+        self.assertIn('不合格', result['detail'])
+
+
+class BackgroundJobDefinition(unittest.TestCase):
+    """后台作业的调度要求：每 6 小时、不唤醒电脑、不错过就丢、单实例。
+
+    这一组只校验**定义**，不登记、不加载、不执行 launchctl。
+    """
+
+    def setUp(self):
+        import maintenance_job
+        self.job = maintenance_job
+        self.data = maintenance_job.job_plist()
+
+    def test_definition_is_valid(self):
+        self.assertEqual(self.job.problems_in(self.data), [])
+
+    def test_runs_every_six_hours(self):
+        hours = sorted(entry['Hour'] for entry in self.data['StartCalendarInterval'])
+        self.assertEqual(hours, [0, 6, 12, 18])
+
+    def test_never_wakes_the_machine(self):
+        self.assertFalse(self.data.get('WakeSystem'))
+        self.assertFalse(self.data.get('RunAtLoad'))
+        self.assertFalse(self.data.get('KeepAlive'))
+
+    def test_does_not_touch_launch_agents(self):
+        """写定义不能落进 ~/Library/LaunchAgents——放进去就等于登记了。"""
+        self.assertNotEqual(self.job.STAGED.parent, self.job.INSTALLED.parent)
+        self.assertNotIn('Library/LaunchAgents', str(self.job.STAGED))
+        # 不 import subprocess 就没有能力去调 launchctl；比查字符串可靠。
+        source = (ROOT / 'scripts/maintenance_job.py').read_text()
+        self.assertNotIn('import subprocess', source)
+
+    def test_write_only_ever_creates_the_staged_file(self):
+        """真的跑一次 --write，确认它只碰 dist/，不碰已登记位置。"""
+        import contextlib
+        import io
+        import tempfile
+        with tempfile.TemporaryDirectory() as work:
+            staged = pathlib.Path(work) / 'staged.plist'
+            installed = pathlib.Path(work) / 'installed.plist'
+            original = (self.job.STAGED, self.job.INSTALLED)
+            self.job.STAGED, self.job.INSTALLED = staged, installed
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.job.write()
+            finally:
+                self.job.STAGED, self.job.INSTALLED = original
+            self.assertTrue(staged.exists(), '定义没有写出来')
+            self.assertFalse(installed.exists(), '写定义时碰了已登记位置')
+
+    def test_uses_its_own_config_directory(self):
+        env = self.data['EnvironmentVariables']
+        self.assertEqual(env['CLAUDE_CONFIG_DIR'], str(self.job.MAINTENANCE_CONFIG))
+        self.assertNotEqual(env['CLAUDE_CONFIG_DIR'], str(setup.HOME / '.claude'))
+
+
+class BackgroundJobGate(unittest.TestCase):
+    """外层脚本在零弹窗验证通过之前必须什么都不做。
+
+    这是“先验证、再登记”的兜底：就算有人提前登记了作业，没有闸门文件时
+    脚本也只会留一条日志就退出，不会去下载、签名或推分支。
+    """
+
+    def run_script(self, config, state):
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as work:
+            state = pathlib.Path(work) / 'state'
+            env = {'HOME': work, 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
+                   'CLAUDE_CONFIG_DIR': str(config), 'CNU_MAINTENANCE_STATE': str(state)}
+            done = subprocess.run(['/bin/sh', str(ROOT / 'scripts/maintenance_run.sh')],
+                                  capture_output=True, text=True, env=env, timeout=30)
+        return done, state
+
+    def test_does_nothing_without_the_gate(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as config:
+            done, state = self.run_script(config, None)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn('未通过零弹窗验证', done.stdout)
+        self.assertIn('跳过', done.stdout)
+
+    def test_even_with_the_gate_it_reports_the_flow_is_not_implemented(self):
+        """闸门开着也不能假装维护在工作——流程还没实现就如实说没实现。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as config:
+            pathlib.Path(config, 'verified').write_text('')
+            done, state = self.run_script(config, None)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn('尚未实现', done.stdout)
+
+    def test_a_stale_lock_does_not_block_forever(self):
+        """被 SIGKILL 打断会留下锁；不能因此永远跳过。"""
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as config, \
+                tempfile.TemporaryDirectory() as work:
+            state = pathlib.Path(work) / 'state'
+            (state / 'run.lock').mkdir(parents=True)
+            # 一个几乎肯定不存在的 pid：本机 pid 上限远小于这个数。
+            (state / 'run.lock' / 'pid').write_text('999999')
+            env = {'HOME': work, 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
+                   'CLAUDE_CONFIG_DIR': config, 'CNU_MAINTENANCE_STATE': str(state)}
+            done = subprocess.run(['/bin/sh', str(ROOT / 'scripts/maintenance_run.sh')],
+                                  capture_output=True, text=True, env=env, timeout=30)
+            self.assertIn('接管', done.stdout)
+            self.assertFalse((state / 'run.lock').exists(), '残留锁没有被清掉')
+
+
 
 class ProbeHonesty(unittest.TestCase):
     """动态层没跑就必须说没跑，不能因为静态层通过就当成通过。"""
