@@ -65,12 +65,17 @@ class PortableRuntime(unittest.TestCase):
                 backend.configure(root/'redirect')
             self.assertEqual(list((root/'real').iterdir()), [])
 
-    def test_unknown_desktop_cannot_receive_an_adapter(self):
+    def test_unknown_desktop_without_a_readable_asar_is_refused(self):
+        """没有 app.asar 就读不到功能表，结构校验不成立，仍然拒绝。
+
+        未登记版本本身不再是拒绝理由（用户 2026-10-25 明确要默认照常
+        解锁），但结构读不出来时同样不能放行。
+        """
         with tempfile.TemporaryDirectory() as temp:
             app = Path(temp)/'Claude.app'
             (app/'Contents').mkdir(parents=True)
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString':'99.0'}))
-            with self.assertRaisesRegex(ValueError,'Unknown version'):
+            with self.assertRaises(ValueError):
                 core.source_adapter(app)
 
 

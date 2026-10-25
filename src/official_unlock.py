@@ -22,6 +22,7 @@ import sys
 import time
 
 import native_unlock as core
+import asar_integrity as integrity
 
 TARGET = pathlib.Path('/Applications/Claude.app')
 STATE = core.WORK / 'official-install'
@@ -97,6 +98,8 @@ def verify_patched(app, data):
     for path, digest in data['installedFiles'].items():
         if core.sha((app / path).read_bytes()) != digest:
             raise ValueError('已安装文件发生变化；停止操作：' + path)
+    # 框架二进制太大，只核对节里那 66 字节；被改动过就当作安装损坏。
+    integrity.verify(app, data.get('frameworkIntegrity'))
     core.run('codesign', '--verify', '--deep', '--strict', str(app))
 
 
@@ -285,16 +288,14 @@ def status():
             core.verify_source(TARGET, adapter)
             result.update(supported=True, message='未开启 · 官方原版校验通过')
     except core.UnregisteredBuild:
-        # 未知构建只诊断、不写入：给出可交给维护侧的只读报告入口。
+        # 只在结构校验本身不成立时才会到这里（例如 app.asar 读不出来）。
+        # 版本没登记不再等于拒绝：签名和结构都对时走现场适配。
         result['diagnoseAvailable'] = bool(detected_version)
         result['unregisteredBuild'] = True
-        if detected_version is not None and not result['enabled']:
-            result['message'] = (
-                f'检测到 Claude {detected_version}，这个构建尚未登记规则；'
-                '只做只读诊断，不会修改 Claude。'
-            )
-        else:
-            result['message'] = '版本尚未登记；只做只读诊断，不会修改 Claude。'
+        result['message'] = (
+            f'检测到 Claude {detected_version}，但读不出它的功能表结构；'
+            '已停止修改，不会写入。'
+            if detected_version else '读不出这个构建的功能表结构；已停止修改。')
     except core.FingerprintMismatch:
         result['buildMismatch'] = True
         result['diagnoseAvailable'] = bool(detected_version)
@@ -302,7 +303,7 @@ def status():
     except Exception:
         if detected_version is not None and not result['enabled']:
             result['message'] = (
-                f'检测到 Claude {detected_version}，但这个版本或文件尚未适配；'
+                f'检测到 Claude {detected_version}，但签名、包标识或功能表结构有一项不符；'
                 '已停止修改。可以打开 Claude 或恢复官方备份。'
             )
         else:
@@ -330,6 +331,57 @@ def verify_gates(text, anchor, entries):
             raise ValueError('补丁写入后开关未生效；停止安装：' + key)
 
 
+def packed_files(header):
+    """按数据区里的实际顺序列出所有已打包文件（含共享同一段的重复项）。
+
+    官方 ASAR 会让内容相同的文件共用一段数据（例如同一份字体出现在多个
+    目录），所以同一 offset 可能对应多个路径。这里按 (offset, size) 去重，
+    保持它们在数据区里的先后顺序。
+    """
+    seen = {}
+    def walk(node, path=''):
+        for name, child in (node.get('files') or {}).items():
+            child_path = path + '/' + name if path else name
+            if 'files' in child:
+                walk(child, child_path)
+            elif 'offset' in child and not child.get('unpacked'):
+                key = (int(child['offset']), int(child.get('size', 0)))
+                seen.setdefault(key, []).append(child_path)
+    walk(header)
+    return [(off, size, paths) for (off, size), paths in
+            sorted(seen.items())]
+
+
+def repack(original, header, base, replaced):
+    """紧凑重排数据区：改写过的就地换内容，其余原样搬运，不留空洞。
+
+    返回 (新数据区, 新索引)。索引里每个被搬运的文件都会更新 offset，
+    共享同一段的多个路径保持共享，不会把一份数据复制成多份。
+    """
+    data = bytearray()
+    moved = {}
+    for offset, size, paths in packed_files(header):
+        # 这一段里只要有一个路径被改写，就用新内容替换整段。
+        # 官方不会让两个不同内容的文件共享同一段，所以这种替换是安全的。
+        new = next((replaced[p] for p in paths if p in replaced), None)
+        if new is None:
+            new = original[base + offset:base + offset + size]
+        moved[offset] = (len(data), len(new))
+        data.extend(new)
+    # 逐路径更新 offset/size；同一段的所有路径指向同一个新位置。
+    def walk(node, path=''):
+        for name, child in (node.get('files') or {}).items():
+            child_path = path + '/' + name if path else name
+            if 'files' in child:
+                walk(child, child_path)
+            elif 'offset' in child and not child.get('unpacked'):
+                new_offset, new_size = moved[int(child['offset'])]
+                child['offset'] = str(new_offset)
+                child['size'] = new_size
+    walk(header)
+    return data, header
+
+
 def build(app):
     """在应用副本上写入可用性条件，重算 ASAR 完整性并临时签名。
 
@@ -338,7 +390,10 @@ def build(app):
     """
     adapter = core.source_adapter(app)
     original, header, base = core.verify_source(app, adapter)
-    data = bytearray(original[base:])
+    # 这一版的嵌入式 ASAR 完整性校验是否启用、算法是否与已知一致。
+    # 必须在改 Info.plist 之前算：基准是**官方原版**的登记值。
+    # 校验没启用时返回空列表；算法对不上会直接抛错，不写入。
+    integrity_slots = integrity.enforcement(app, integrity.plist_integrity(app))
 
     # Computer Use 基础开关、系统版本上限（按登记范围计算），以及各版本自己
     # 的可用性条件。两张表都只做“不存在才插入”：官方已有相同定义时跳过，
@@ -349,6 +404,7 @@ def build(app):
         + core.main_availability(adapter)
     )
     gates = {}
+    replaced = {}
     for path in [adapter['main']]:
         old = core.content(original, header, base, path).decode()
         changed = core.insert_entries(old, adapter['featureAnchor'], entries, gates)
@@ -372,9 +428,15 @@ def build(app):
             verify_gates(changed, adapter['webFeatureAnchor'], web_entries)
         # 装了 node 时再把整份文件复核一遍，能发现表以外的损坏；没有 node 不影响。
         core.check_js(changed)
-        new = changed.encode()
-        node = core.node(header, path)
-        node['offset'], node['size'] = str(len(data)), len(new)
+        replaced[path] = changed.encode()
+
+    # 重新紧凑打包数据区：改写过的文件就地占位，其余按原顺序重新排。
+    # 不能像以前那样把新内容追加到末尾——官方那份会留在原地成为空洞，
+    # 而 Electron 的 ASAR 完整性校验要求数据区连续，遇到空洞直接
+    # `Failed to get integrity for validatable asar archive` 启动失败。
+    data, rebuilt = repack(original, header, base, replaced)
+    for path, new in replaced.items():
+        node = core.node(rebuilt, path)
         block = node.get('integrity', {}).get('blockSize', 4194304)
         node['integrity'] = {
             'algorithm': 'SHA256',
@@ -382,10 +444,9 @@ def build(app):
             'blockSize': block,
             'blocks': [core.sha(new[i:i+block]) for i in range(0, len(new), block)],
         }
-        data.extend(new)
 
     # 重新打包 ASAR：固定头 + 文件索引 + 所有文件内容。
-    raw = json.dumps(header, separators=(',', ':'), ensure_ascii=False).encode()
+    raw = json.dumps(rebuilt, separators=(',', ':'), ensure_ascii=False).encode()
     payload = ((len(raw)+7)//4)*4
     packed = struct.pack('<IIII', 4, payload+4, payload, len(raw)) + raw + b'\0'*(payload-4-len(raw)) + data
     (app / ASAR).write_bytes(packed)
@@ -396,6 +457,9 @@ def build(app):
     info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] = core.sha(raw)
     info_path.write_bytes(plistlib.dumps(info))
 
+    # 嵌入式校验启用时，Electron Framework 的摘要已经更新、它自己的签名
+    # 因此失效，必须先单独重签框架，再签外层。反过来做（只 `--deep` 签外层）
+    # 会让框架带着旧签名进包，启动校验照样失败。
     # 没有官方私钥，只能临时签名；去掉依赖官方身份的权限项，
     # 保留运行所需的最小项。系统权限可能需要用户重新绑定。
     ent = plistlib.loads(core.run('codesign', '-d', '--entitlements', ':-', str(app)).stdout)
@@ -404,11 +468,21 @@ def build(app):
     ent['com.apple.security.cs.disable-library-validation'] = True
     ent_path = STATE / 'entitlements.plist'
     ent_path.write_bytes(plistlib.dumps(ent))
+
+    written = None
+    if integrity_slots:
+        written = integrity.rewrite(app, info['ElectronAsarIntegrity'], integrity_slots)
+        # 动了框架就得整棵树一起重签：dyld 拒绝加载 Team ID 与宿主不同的库，
+        # 只签框架会让 Helper 继续带官方 Team ID，启动直接失败。
+        core.sign_bundle(core.nested_bundles(app), STATE)
     # 优先用固定的本地身份，这样更新后系统权限不用重新授权；没有就退回 ad-hoc。
     core.sign_app(app, ent_path)
 
-    return ({path: core.sha((app / path).read_bytes()) for path in [ASAR, *adapter['sourceFiles']]},
-            gates)
+    installed = {path: core.sha((app / path).read_bytes())
+                 for path in [ASAR, *adapter['sourceFiles']]}
+    # 框架二进制有 400+ MB，只记摘要与节位置，不把整份文件塞进安装记录。
+    record = written or None
+    return installed, gates, record
 
 
 def prepare_identity():
@@ -507,13 +581,14 @@ def enable():
     # 先记下官方原版的完整指纹：恢复以记录为准，不依赖内置登记表。
     original = original_build(TARGET)
     clone(TARGET, stage)
-    installed, gates = build(stage)
+    installed, gates, framework = build(stage)
     record = {
         'version': adapter['version'],
         'patchRevision': PATCH_REVISION,
         'backup': str(backup),
         'original': original,
         'installedFiles': installed,
+        'frameworkIntegrity': framework,
         'backgroundExperimental': True,
         'phase': 'prepared',
         'stage': str(stage),
@@ -573,12 +648,13 @@ def update():
     # 旧记录没有 `original` 时，从可信备份补上；恢复从此不再依赖登记表。
     original = previous.get('original') or original_build(backup)
     clone(backup, stage)
-    installed, gates = build(stage)
+    installed, gates, framework = build(stage)
     old = effective_record(TARGET, previous)
     record = dict(
         previous,
         original=original,
         installedFiles=installed,
+        frameworkIntegrity=framework,
         patchRevision=PATCH_REVISION,
         signingIdentity=core.app_signing_identity(stage),
         gates=gates,
@@ -767,7 +843,7 @@ def prepare_update():
         result['message'] = '当前已是完整官方原版，可以直接打开 Claude 安装官方更新。'
     else:
         result['message'] = (
-            '没有安装本工具的补丁，无需恢复。当前版本尚未适配；'
+            '没有安装本工具的补丁，无需恢复。'
             '可以直接更新，更新后请重新检测。'
         )
     return result
@@ -784,8 +860,6 @@ def launch():
     core.run('/usr/bin/open', str(TARGET))
     result = status()
     result['opened'] = True
-    if not result.get('supported'):
-        result['message'] = 'Claude 已打开。当前版本尚未适配，本工具不会修改它。'
     return result
 
 

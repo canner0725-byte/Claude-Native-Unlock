@@ -9,7 +9,7 @@
 不在这里实现任何 Computer Use、浏览器或模型功能，也不修改 Claude 的
 逐应用授权、系统权限、截图过滤、拒绝、中断或动作审查。
 """
-import hashlib, json, os, pathlib, plistlib, re, secrets, shutil, struct, subprocess, sys, tempfile
+import hashlib, json, os, pathlib, platform, plistlib, re, secrets, shutil, struct, subprocess, sys, tempfile
 
 import keychain
 
@@ -310,7 +310,12 @@ VERIFIED_SYSTEM = {
 
 
 def verified_system(adapter):
-    """返回这套构建已验证的 (架构, 系统版本)；没登记就是 (None, None)。"""
+    """返回这套构建已验证的 (架构, 系统版本)；没登记就是 (None, None)。
+
+    只读登记表。现场适配的构建不写进这里：它的验证环境是本机，由
+    `check_system` / `system_ceiling` 单独处理，免得把“本机是什么”当成
+    “登记过什么”。
+    """
     return VERIFIED_SYSTEM.get(adapter['version'], (None, None))
 
 
@@ -318,20 +323,35 @@ def system_name(value):
     return '.'.join(str(part) for part in value) if value else '未知'
 
 
-def system_ceiling(adapter):
-    """Computer Use 的系统版本上限：等于这套构建已验证的 macOS 主/次版本。
+def adapter_system(adapter):
+    """这套构建的验证环境：已登记的读登记表，现场适配的读本机记录。
 
-    上限只随登记表变化，不随系统升级自动抬高；系统升级后超出已验证范围
-    时保持官方行为，等静态检查和真机回归完成后再登记。
+    现场适配（`discovered`）的构建是本机按官方签名和结构现场认下来的，
+    它只在生成它的这台机器上使用，所以验证环境就是这台机器。
     """
-    _, version = verified_system(adapter)
+    registered = verified_system(adapter)
+    if registered != (None, None):
+        return registered
+    if adapter.get('discovered'):
+        return adapter.get('system') or (None, None)
+    return None, None
+
+
+def system_ceiling(adapter):
+    """Computer Use 的系统版本上限：等于这套构建的验证环境。
+
+    已登记构建的上限只随登记表变化，不随系统升级自动抬高；系统升级后
+    超出范围时保持官方行为。现场适配的构建本来就用本机版本做范围，
+    两者是同一个值。
+    """
+    _, version = adapter_system(adapter)
     if version is None:
-        raise BuildRefused('这个构建没有登记已验证的系统版本；停止修改。')
+        raise BuildRefused('这个构建没有可用的系统版本范围；停止修改。')
     return '{major:%d,minor:%d}' % (version[0], version[1])
 
 
 def check_platform(verified, machine, mac_version):
-    """架构和系统版本都必须在登记范围内，否则拒绝写入。
+    """架构和系统版本都必须在验证范围内，否则拒绝写入。
 
     `verified` 是 (架构, 版本元组)；`machine`/`mac_version` 由调用方传入
     （生产代码传 platform 的结果），这样测试可以在任何主机上给出确定的
@@ -339,7 +359,7 @@ def check_platform(verified, machine, mac_version):
     """
     architecture, version = verified or (None, None)
     if architecture is None:
-        raise BuildRefused('这个构建没有登记已验证的系统范围；停止修改。')
+        raise BuildRefused('这个构建没有可用的系统范围；停止修改。')
     actual = tuple(int(part) for part in re.findall(r'\d+', mac_version or ''))[:3]
     if machine != architecture or actual != tuple(version):
         raise BuildRefused(
@@ -348,8 +368,8 @@ def check_platform(verified, machine, mac_version):
 
 
 def check_system(adapter, machine, mac_version):
-    """Desktop 补丁的系统范围：按构建登记。"""
-    check_platform(verified_system(adapter), machine, mac_version)
+    """Desktop 补丁的系统范围：已登记的按登记表，现场适配的按本机。"""
+    check_platform(adapter_system(adapter), machine, mac_version)
 
 
 # 这些版本才有“新版 Code 工作台”相关界面；补丁 revision 5 起按版本判断。
@@ -372,6 +392,25 @@ RENDERER_AVAILABILITY = (
  '2149681774:{rule:"always",value:!0},'
  '2697147784:{rule:"always",value:!0},'
 )
+
+# 未登记版本现场适配时，主进程要强制打开的部署门。
+DISCOVERED_MAIN_GATES = (
+ '2371478310:{rule:"forced",value:!0},'
+ '857846362:{rule:"forced",value:!0},'
+ '2120747855:{rule:"forced",value:!0},'
+)
+
+
+def referenced_entries(javascript, entries):
+    """只保留这一版前端仍在读的键。
+
+    补回的开关是给前端按名字查的：前端整版不再读某个键时，补进去只是
+    死条目——既不能恢复功能，也把“补了什么”说得比实际多。所以按整个包
+    的 JS 文本过滤一次，只补还有读取点的键。
+    """
+    kept = [key + ':{' + body + '},' for key, body in split_entries(entries)
+            if re.search(r'(?<![0-9])' + key + r'(?![0-9])', javascript)]
+    return ''.join(kept)
 
 
 def adapters_for_version(version):
@@ -599,6 +638,11 @@ def discover_adapter(app):
         raise ValueError('Feature table not uniquely located')
     text = content(b, header, base, found[0]).decode('utf-8', 'replace')
     forced_anchor, always_anchor = feature_tables(text)
+    # 这一版还在读哪些键：整个包里所有已打包 JS 的文本。
+    javascript = '\n'.join(
+        content(b, header, base, path).decode('utf-8', 'replace')
+        for path, child in packed_js(header)
+        if int(child.get('size', 0)) <= PACKED_LIMIT)
     adapter = {
         'version': info.get('CFBundleShortVersionString'),
         'asarHash': digest,
@@ -607,11 +651,13 @@ def discover_adapter(app):
         'webFeatureAnchor': always_anchor,
         # 用和登记版本同一组条件；insert_entries 会跳过官方已强制成同样
         # 形状的项，遇到形状不同则拒绝，不覆盖官方语义。
-        'mainAvailability': ('2371478310:{rule:"forced",value:!0},'
-                             '857846362:{rule:"forced",value:!0},'
-                             '2120747855:{rule:"forced",value:!0},'),
+        'mainAvailability': referenced_entries(
+            javascript, DISCOVERED_MAIN_GATES),
         # 渲染进程表用 reject：表里已有的 when/follows 是官方语义，不能覆盖。
-        'webAvailability': RENDERER_AVAILABILITY,
+        # 只补这一版前端仍在读的键：官方整版删掉的键已经没人读，补进去只是
+        # 死条目，按“门从官方默认表消失时不自动补回”不补。
+        'webAvailability': referenced_entries(
+            javascript, RENDERER_AVAILABILITY),
         # 未登记构建没有固定文件指纹；安全性来自官方签名和结构校验。
         'files': {},
         'sourceFiles': {},
@@ -645,17 +691,22 @@ def registered_adapter(app):
 
 
 def source_adapter(app):
-    """按版本和 ASAR 指纹选择已登记的适配器；任何不符都拒绝。
+    """选择适配器：已登记版本认指纹，未登记的新版本按结构现场适配。
 
-    只认登记表里的固定指纹。版本没登记 → UnregisteredBuild（只允许只读诊断）；
-    版本登记了但构建内容不同 → FingerprintMismatch（可能被改过，绝不写入）。
-    不再按结构现场识别：自动适配会让“固定指纹”这条安全前提形同虚设。
+    用户 2026-10-25 明确：官方桌面端升级后，旧助手要默认照常解锁，不要
+    因为“这个版本还没登记”就失效。所以分两种情况：
+
+    - 版本登记过：只认固定指纹。构建内容不同 → FingerprintMismatch
+      （可能被改过，绝不写入）。
+    - 版本没登记：走 `discovered_adapter` 的三重校验（官方签名、包标识、
+      功能表结构）。任何一项不符都拒绝；通过就照常适配。
+
+    两者都不放松“失败即拒绝”：签名不是官方的、包标识不对、表找不到或
+    不唯一、目标门形状冲突，仍然一律停下。
     """
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     version = info['CFBundleShortVersionString']
     adapters = adapters_for_version(version)
-    if not adapters:
-        raise UnregisteredBuild('Unknown version; no patch applied')
     try:
         b, _, _ = read_asar(app / 'Contents/Resources/app.asar')
     except Exception:
@@ -664,8 +715,28 @@ def source_adapter(app):
     for adapter in adapters:
         if digest == adapter['asarHash']:
             return adapter
-    # 同一版本号可能有多种官方构建（universal / arm64）；登记过的都不匹配就是不符。
-    raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
+    if adapters:
+        # 同一版本号可能有多种官方构建（universal / arm64）；登记过的都不匹配就是不符。
+        raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
+    return discovered_adapter(app)
+
+
+def discovered_adapter(app):
+    """未登记版本：三重校验通过就现场适配；任何一项不符都拒绝。
+
+    校验顺序固定：先确认这是官方签名的 Claude（TeamIdentifier 与包标识），
+    再按功能表结构定位。签名不对时连结构都不看——避免把“结构像”的东西
+    当成可写入目标。
+
+    系统范围取本机：现场适配只发生在本机、也只装在本机，不存在把补丁
+    搬到别的机器上的情况。
+    """
+    verify_official_signature(app)
+    adapter = dict(discover_adapter(app))
+    adapter['system'] = (platform.machine(),
+                         tuple(int(part) for part in
+                               re.findall(r'\d+', platform.mac_ver()[0] or ''))[:3])
+    return adapter
 
 
 def verify_official_signature(app):
@@ -1016,13 +1087,12 @@ def signing_password():
     return None
 
 
-def sign_app(app, entitlements_path):
-    """用固定的本地身份签名；没有身份时退回 ad-hoc，并返回实际用到的身份。
+def _codesign_with_identity(target, entitlements_path=None, identity=None):
+    """内部：用给定身份签一个路径，不验签、不选身份。
 
-    解锁只发生在签名这一刻，签完立刻重新锁上：密码在内存里停留的时间
-    就是一次 codesign 的时长，平时钥匙串是锁着的。
+    解锁只用一次，签完立刻重新锁上：密码在内存里停留的时间就是一次
+    codesign 的时长，平时钥匙串是锁着的。
     """
-    identity = local_identity()
     if identity:
         keychain_path = signing_paths()[1]
         unlocked = False
@@ -1032,11 +1102,14 @@ def sign_app(app, entitlements_path):
                 raise ValueError('取不到签名钥匙串密码')
             run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain_path))
             unlocked = True
-            run('/usr/bin/codesign', '--force', '--sign', identity,
-                '--keychain', str(keychain_path), '--options', 'runtime',
-                '--entitlements', str(entitlements_path), str(app))
+            args = ['/usr/bin/codesign', '--force', '--sign', identity,
+                    '--keychain', str(keychain_path), '--options', 'runtime']
+            if entitlements_path:
+                args += ['--entitlements', str(entitlements_path)]
+            run(*args, str(target))
+            return True
         except Exception:
-            identity = None
+            return False
         finally:
             if unlocked:
                 # 锁失败不影响已完成的签名；这里只是尽量缩短暴露时间。
@@ -1044,7 +1117,82 @@ def sign_app(app, entitlements_path):
                     run('/usr/bin/security', 'lock-keychain', str(keychain_path))
                 except Exception:
                     pass
-    if not identity:
+    return False
+
+
+def nested_bundles(app):
+    """列出应用包里需要单独签名的嵌套代码，深的在前。
+
+    改了 Electron Framework 就必须整棵树用同一个身份重签：dyld 会拒绝
+    加载 Team ID 与宿主不一致的库（`mapping process and mapped file
+    (non-platform) have different Team IDs`），而只重签框架会让 Helper
+    仍带官方 Team ID。顺序要由内向外，外层签名才会盖住内层。
+    """
+    app = pathlib.Path(app)
+    found = []
+    for path in app.rglob('*'):
+        if path.is_symlink() or path == app:
+            continue
+        if path.suffix in ('.app', '.framework', '.dylib', '.node'):
+            # 框架内部的 dylib 也要签：它们各自带 Team ID，漏签会让框架
+            # 加载时报 `different Team IDs`。深的排在前面，先签里层，
+            # 外层的框架才会把已签好的内层一起封进去。
+            found.append(path)
+    return sorted(found, key=lambda p: len(p.parts), reverse=True)
+
+
+def _entitlements_of(target, work_dir):
+    """读回一个已签名路径的 entitlements，并加上库验证豁免。
+
+    两件事都不能少：
+
+    - **必须逐个继承原值**。Helper 少了 `allow-jit` 会直接
+      `Fatal process out of memory: Failed to reserve virtual memory for
+      CodeRange`，启动就死。
+    - **必须加上 `disable-library-validation`**。重签框架后它不再带官方
+      团队标识，硬运行时下 Helper 会拒绝加载，报
+      `mapping process and mapped file (non-platform) have different Team IDs`。
+
+    原来没有 entitlements 的路径也返回一份，只含库验证豁免。
+    """
+    result = run('/usr/bin/codesign', '-d', '--entitlements', ':-', str(target),
+                 timeout=60)
+    data = result.stdout
+    values = {}
+    if data and b'<?xml' in data:
+        try:
+            values = plistlib.loads(data)
+        except Exception:
+            values = {}
+    values['com.apple.security.cs.disable-library-validation'] = True
+    path = pathlib.Path(work_dir) / ('ent-' + sha(str(target).encode())[:16] + '.plist')
+    path.write_bytes(plistlib.dumps(values))
+    return path
+
+
+def sign_bundle(paths, work_dir):
+    """用与应用相同的身份重签嵌套代码，逐个保留它自己的 entitlements。
+
+    嵌入式 ASAR 摘要写在框架二进制里，改写就让它自己的签名失效；而 dyld
+    要求同一个进程和它加载的库能互相接受，所以框架和所有 Helper 必须一起
+    重签。先内后外，最后再签外层应用。
+    """
+    identity = local_identity()
+    for path in paths:
+        # 先读原 entitlements，再签——签完原来的就被覆盖了。
+        ent = _entitlements_of(path, work_dir)
+        if not _codesign_with_identity(path, ent, identity):
+            run('/usr/bin/codesign', '--force', '--sign', '-', '--options', 'runtime',
+                '--entitlements', str(ent), str(path))
+        run('/usr/bin/codesign', '--verify', '--strict', str(path))
+    return identity
+
+
+def sign_app(app, entitlements_path):
+    """用固定的本地身份签名；没有身份时退回 ad-hoc，并返回实际用到的身份。"""
+    identity = local_identity()
+    if not _codesign_with_identity(app, entitlements_path, identity):
+        identity = None
         run('/usr/bin/codesign', '--force', '--sign', '-', '--options', 'runtime',
             '--entitlements', str(entitlements_path), str(app))
     run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(app))

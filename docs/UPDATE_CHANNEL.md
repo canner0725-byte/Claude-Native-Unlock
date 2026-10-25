@@ -133,11 +133,35 @@ staggered 返回空 `releases` 是**正常形状**，不是错误：它表示「
 ## 5. 本次实测发现的真实情况
 
 **已验证**：官方 latest 渠道现在声明 **3.9683.0**，而本工具登记表最高只到
-**3.6556.2**。所以此刻如果用户切到 latest 渠道并安装官方更新，会进入
-`needs_adaptation`——工具会明确拒绝写入，而不是打个错补丁。
+**3.6556.2**。渠道探测让「有新版本了」在**用户遇到之前**就变成一条可读的结论。
 
-这正是这套机制存在的理由：渠道探测让「有新版本了，但还没适配」在**用户
-遇到之前**就变成一条可读的结论。
+**2026-10-25 更新**：未登记版本不再等于拒绝。用户明确要求官方升级后旧助手
+默认照常解锁，所以 3.9683.0 这类未登记构建会走 `discovered_adapter()` 的三重
+校验（官方签名、包标识、功能表结构），通过即现场适配。登记表仍然有价值：
+省掉结构识别，并提供跨机器一致的验证范围。
+
+### latest 渠道能不能由用户切换（已验证：不能）
+
+用户问过「我想用 latest 早期渠道咋办」。结论是**用户无法自行切换**，只有手动
+安装官方包一条路。官方渠道判定公式在 3.6556.2 和 3.9683.0 里完全一致：
+
+```
+staggered  若 autoUpdate.releaseChannel === "staggered"
+latest     否则若 preferences.ancientJournal === "latest"
+           且 GrowthBook 开关 "3424654946" 为开
+stable     其余
+```
+
+逐条核实过的拦截点：
+
+| 拦截点 | 实测结论 |
+|---|---|
+| `preferences.ancientJournal` | 属于 `HHa`（MAIN_ONLY_PREFERENCE_KEYS），渲染进程写不了；`requestAncientJournal` 这个 IPC 在整包 JS 里没有任何调用方 |
+| GrowthBook 开关 `3424654946` | 匿名 `/api/desktop/features` 返回 `on:false, source:"defaultValue"`；1P 的 `fcache` 没有这个键；3P 静态表（40 项）也没有；`CLAUDE_DEV_FORCE_GATES` 是空实现（`KKt(e,t){return new Set}`），改它无效 |
+| 设置界面 | About 窗口只读不写；3P 的 `releaseChannel` 设置只接受 `stable` / `staggered`，**没有 `latest`**；而且 `staggered` 比 stable 更慢，不是更快的早期渠道 |
+
+所以想让 Claude 跑 3.9683.0，只能下载官方包手动换装——也就是
+`scripts/install_staged_update.py` 做的事。
 
 ---
 
@@ -158,6 +182,23 @@ staggered 返回空 `releases` 是**正常形状**，不是错误：它表示「
   存在时才带）。本机未配置该项，未实测。
 - **未实现**：把渠道版本自动写进登记表。按固定规则，新版本必须先通过
   签名、包标识、功能表结构三重校验才允许适配，这一步不能自动化跳过。
+  （2026-10-25 起，未登记版本本身不再阻止适配——三重校验通过就现场适配；
+  登记仍然建议做，但不再是解锁的前置条件。）
+
+### 换装的执行方式（已验证）
+
+`official_unlock.enable()` 的 `check_idle()` 要求 Claude 完全退出，而会话内的
+shell 就在 Claude 进程树里，退出即断线。所以换装拆成两步：
+
+- 退出请求由用户自己发（⌘Q）。从会话里发 AppleEvent 也会被官方 before-quit
+  拦截器否决——实测日志是 `beforeQuit: handler fired` 紧跟
+  `vetoed by before-quit interceptor`，因为还有活跃会话。
+- 换装交给**脱离 Claude 进程树**的进程：`scripts/install_staged_update.py`
+  用 `nohup … & disown` 启动，实测 `PPID=1`，Claude 退出不会把它带走。
+
+它只做四件事：三重校验暂存构建 → 等 Claude 退出（有上限，绝不强制结束）→
+换装（失败退回原版）→ 调用后端 `official_unlock enable`。四条路径（正确输入、
+错误版本、错误 ASAR、非官方应用）都实测过。
 
 ---
 

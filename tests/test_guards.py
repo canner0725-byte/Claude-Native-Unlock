@@ -29,53 +29,88 @@ def make_asar(script: bytes) -> bytes:
             + raw + b'\0' * (payload - 4 - len(raw)) + script)
 
 
-def make_app(root: pathlib.Path, name: str, version: str, script: bytes) -> pathlib.Path:
+# 现场适配要求两张表都能唯一定位：主进程强制表与渲染进程下发项表。
+SHAPED_SCRIPT = (b'var X={1:{rule:"forced",value:!0}};'
+                 b'var W={2:{rule:"always",value:!0}};')
+
+
+def make_app(root: pathlib.Path, name: str, version: str, script: bytes,
+             bundle_id: str = 'com.anthropic.claudefordesktop') -> pathlib.Path:
+    """合成一个最小应用副本；包标识默认就是官方那个。"""
     app = root / name
     (app / 'Contents/Resources').mkdir(parents=True)
     (app / official.ASAR).write_bytes(make_asar(script))
-    (app / 'Contents/Info.plist').write_bytes(
-        plistlib.dumps({'CFBundleShortVersionString': version}))
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+        'CFBundleShortVersionString': version,
+        'CFBundleIdentifier': bundle_id}))
     return app
 
 
-class UnknownBuildIsDiagnoseOnly(unittest.TestCase):
-    """第五节 1：未知构建只诊断、不写入。"""
+class UnknownBuildIsAdaptedOnTheSpot(unittest.TestCase):
+    """未登记版本：三重校验通过就照常适配，任何一项不符都拒绝。
 
-    def test_unregistered_build_raises_a_typed_refusal(self):
+    用户 2026-10-25 明确：官方桌面端升级后，旧助手要默认照常解锁，不要
+    因为“这个版本还没登记”就失效。这条取代了 2026-10-24 的“未知构建只
+    诊断、不写入”——但“失败即拒绝”没有放松：签名、包标识、功能表结构
+    任何一项不对，仍然停下。
+    """
+
+    def test_unregistered_build_with_official_signature_is_adapted(self):
         with tempfile.TemporaryDirectory() as directory:
             app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
-                           '99.0', b'var X={1:{rule:"forced",value:!0}};')
-            with self.assertRaises(core.UnregisteredBuild):
-                core.source_adapter(app)
+                           '99.0', SHAPED_SCRIPT)
+            with patch.object(core, 'verify_official_signature'):
+                adapter = core.source_adapter(app)
+            self.assertEqual(adapter['version'], '99.0')
+            self.assertTrue(adapter['discovered'])
 
-    def test_unregistered_build_cannot_be_enabled(self):
+    def test_unregistered_build_without_official_signature_is_refused(self):
+        """签名不是官方的那一份时，连结构都不看。"""
         with tempfile.TemporaryDirectory() as directory:
             app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
-                           '99.0', b'var X={1:{rule:"forced",value:!0}};')
-            with patch.object(official, 'TARGET', app), \
-                 patch.object(official, 'STATE', pathlib.Path(directory).resolve() / 'state'), \
-                 patch.object(official, 'manifest', return_value=None), \
-                 patch.object(official, 'running', return_value=False), \
-                 patch.object(official, 'prepare_identity'), \
-                 patch.object(official, 'clone') as clone:
-                (pathlib.Path(directory).resolve() / 'state').mkdir()
-                result = official.status()
-                self.assertFalse(result['supported'])
-                self.assertTrue(result.get('unregisteredBuild'))
-                self.assertTrue(result['diagnoseAvailable'])
-                with self.assertRaises(core.UnregisteredBuild):
-                    official.enable()
-                clone.assert_not_called()
-
-    def test_unknown_build_never_opens_renderer_gates(self):
-        """旧行为会对未知构建直接打开 11 个渲染进程门：现在连适配器都拿不到。"""
-        with tempfile.TemporaryDirectory() as directory:
-            app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
-                           '99.0', b'var X={1:{rule:"forced",value:!0}};')
-            with patch.object(core, 'discover_adapter') as discover:
-                with self.assertRaises(core.UnregisteredBuild):
+                           '99.0', SHAPED_SCRIPT)
+            with patch.object(core, 'verify_official_signature',
+                              side_effect=ValueError('not official')):
+                with self.assertRaises(ValueError):
                     core.source_adapter(app)
-            discover.assert_not_called()
+
+    def test_unregistered_build_with_wrong_bundle_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
+                           '99.0', SHAPED_SCRIPT,
+                           bundle_id='com.example.notclaude')
+            with patch.object(core, 'verify_official_signature'):
+                with self.assertRaises(ValueError):
+                    core.source_adapter(app)
+
+    def test_unregistered_build_without_a_unique_table_is_refused(self):
+        """功能表定位不到或找到多份时拒绝，不猜一个写进去。"""
+        with tempfile.TemporaryDirectory() as directory:
+            app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
+                           '99.0', b'var X={1:{rule:"forced",value:!0}};'
+                                   b'var Y={2:{rule:"always",value:!0}};'
+                                   b'var Z={3:{rule:"forced",value:!0}};')
+            with patch.object(core, 'verify_official_signature'):
+                with self.assertRaises(ValueError):
+                    core.source_adapter(app)
+
+    def test_discovered_build_is_used_with_the_host_system_range(self):
+        """现场适配的构建用本机环境做系统范围，不写进登记表。"""
+        with tempfile.TemporaryDirectory() as directory:
+            app = make_app(pathlib.Path(directory).resolve(), 'Claude.app',
+                           '99.0', SHAPED_SCRIPT)
+            with patch.object(core, 'verify_official_signature'):
+                adapter = core.source_adapter(app)
+            self.assertEqual(core.verified_system(adapter), (None, None))
+            self.assertEqual(core.adapter_system(adapter), adapter['system'])
+
+    def test_dead_renderer_gates_are_not_reinserted(self):
+        """官方整版删掉的渲染进程键，前端已经不读，补进去只是死条目。"""
+        javascript = 'var X={3858164079:{rule:"always",value:!0}};read(3858164079)'
+        kept = core.referenced_entries(javascript, core.RENDERER_AVAILABILITY)
+        self.assertIn('3858164079', kept)
+        self.assertNotIn('1235690166', kept)
+        self.assertEqual(core.referenced_entries('nothing here', core.RENDERER_AVAILABILITY), '')
 
 
 class FingerprintMismatchRefuses(unittest.TestCase):

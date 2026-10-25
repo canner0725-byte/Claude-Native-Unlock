@@ -144,6 +144,47 @@ def gateway_domains():
     return domains
 
 
+# 维护代理自己的模型接入设置（base URL、模型名）。**不含密钥**：
+# 只放「连哪里、用哪个模型」，密钥由 apiKeyHelper 在运行时提供。
+GATEWAY_ENV_FILE = CONFIG_DIR / 'gateway.env'
+
+# 这些键才允许出现在 gateway.env 里。其余一律拒绝，防止有人把它当成
+# 偷偷塞密钥的地方——密钥只能走 apiKeyHelper。
+GATEWAY_ENV_ALLOWED = frozenset({
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_FABLE_MODEL',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
+    'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+})
+
+
+def gateway_env():
+    """读 gateway.env，返回可以放进 settings 的 env 字典。
+
+    只接受白名单里的键；出现别的一律抛错，不静默忽略——静默忽略会让人
+    以为配置生效了。文件不存在返回空字典。
+    """
+    if not GATEWAY_ENV_FILE.exists():
+        return {}
+    values = {}
+    for line in GATEWAY_ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            raise ValueError(f'gateway.env 这一行没有等号：{line[:40]}')
+        key, value = line.split('=', 1)
+        key = key.strip()
+        if key not in GATEWAY_ENV_ALLOWED:
+            raise ValueError(
+                f'gateway.env 里的 {key} 不在允许列表里；密钥请走 apiKeyHelper')
+        values[key] = value.strip()
+    return values
+
+
 def settings():
     """维护代理的 settings JSON。
 
@@ -180,6 +221,7 @@ def settings():
             },
         },
         'apiKeyHelper': str(KEY_FILE),
+        **({'env': gateway_env()} if gateway_env() else {}),
     }
 
 

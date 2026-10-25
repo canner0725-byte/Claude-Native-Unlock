@@ -1307,9 +1307,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "已准备官方更新"
         alert.informativeText =
             "现在可以打开 Claude，使用官方更新器下载并安装。\n\n" +
-            "更新完成后：\n" +
-            "1. 回到本工具点“重新检测”。\n" +
-            "2. 如果显示“尚未适配”，等待维护者发布对应版本；本工具不会修改未知版本。\n\n" +
+            "更新完成后回到本工具点“重新检测”即可：官方签名的正常版本会按现有规则" +
+            "照常解锁，不必等本工具专门适配。\n\n" +
             "如果 Claude 提示需要重新授权辅助功能或屏幕录制，按系统正常界面操作即可。"
         alert.addButton(withTitle: "知道了")
         alert.beginSheetModal(for: window)
@@ -1621,7 +1620,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if recoveryRequired {
             setStatus("安装中断 · 关闭开关即可恢复官方备份", color: ClaudeTheme.warning)
         } else if !supported {
-            setStatus(targetExists ? "此版本尚未适配 · 不会修改 Claude" : "未找到 Claude",
+            // 未登记版本不再是拒绝理由：签名和结构都对时会现场适配。
+            // 走到这里说明校验没过，所以文案要说清是“没通过校验”。
+            setStatus(targetExists ? "未通过官方校验 · 不会修改 Claude" : "未找到 Claude",
                       color: ClaudeTheme.warning)
         } else if !enabled {
             setStatus("未开启", color: ClaudeTheme.textSecondary)

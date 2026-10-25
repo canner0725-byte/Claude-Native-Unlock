@@ -339,7 +339,7 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'host_machine', return_value='arm64'), \
                  patch.object(official, 'host_mac_version', return_value='27.0.1'), \
                  patch.object(official, 'clone', side_effect=lambda source, destination: destination.mkdir()), \
-                 patch.object(official, 'build', return_value=({official.ASAR: 'new'}, {})), \
+                 patch.object(official, 'build', return_value=({official.ASAR: 'new'}, {}, None)), \
                  patch.object(pathlib.Path, 'rename', rename):
                 with self.assertRaisesRegex(OSError, 'simulated'):
                     official.update()
@@ -371,7 +371,13 @@ class OfficialSafety(unittest.TestCase):
                     operation()
             clone.assert_not_called()
 
-    def test_unknown_version_refuses_enable(self):
+    def test_unknown_version_without_a_readable_build_refuses_enable(self):
+        """结构读不出来时仍然拒绝开启，不会盲写。
+
+        未登记版本不再是拒绝理由：签名和结构都对时照常适配（见
+        test_guards.UnknownBuildIsAdaptedOnTheSpot）。这里只剩一个 Info.plist、
+        没有 app.asar，三重校验走不完，所以必须拒绝。
+        """
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory).resolve() / 'Claude.app'
             (target / 'Contents').mkdir(parents=True)
@@ -382,7 +388,7 @@ class OfficialSafety(unittest.TestCase):
                  patch.object(official, 'prepare_identity'), \
                  patch.object(official, 'clone') as clone:
                 self.assertFalse(official.status()['supported'])
-                with self.assertRaisesRegex(ValueError, 'Unknown version'):
+                with self.assertRaises(ValueError):
                     official.enable()
                 clone.assert_not_called()
 
@@ -624,17 +630,18 @@ class OfficialSafety(unittest.TestCase):
             self.assertFalse((pathlib.Path(core.__file__).resolve().parent.parent / 'work').exists(),
                              '测试不得在仓库里留下 work/ 目录')
 
-    def test_launch_opens_unsupported_official_build(self):
+    def test_launch_opens_any_installed_build(self):
+        """打开 Claude 不该因为校验没过就改口；它只是打开应用。"""
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory).resolve() / 'Claude.app'
             target.mkdir()
             with patch.object(official, 'TARGET', target), \
                  patch.object(official, 'status',
-                              return_value={'supported': False, 'message': '未适配'}), \
+                              return_value={'supported': False, 'message': '未通过校验'}), \
                  patch.object(official.core, 'run') as run:
                 result = official.launch()
             self.assertTrue(result['opened'])
-            self.assertIn('尚未适配', result['message'])
+            self.assertEqual(result['message'], '未通过校验')
             run.assert_called_once_with('/usr/bin/open', str(target))
 
     def test_launch_refuses_missing_application(self):
