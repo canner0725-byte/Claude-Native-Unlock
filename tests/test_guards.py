@@ -4,6 +4,7 @@
 的平台、系统版本或已安装的 Claude，任何主机上结果一致。
 """
 import json
+import os
 import pathlib
 import plistlib
 import subprocess
@@ -111,6 +112,72 @@ class UnknownBuildIsAdaptedOnTheSpot(unittest.TestCase):
         self.assertIn('3858164079', kept)
         self.assertNotIn('1235690166', kept)
         self.assertEqual(core.referenced_entries('nothing here', core.RENDERER_AVAILABILITY), '')
+
+    def test_gate_match_does_not_accept_a_longer_number(self):
+        """一个键只有作为完整数字串出现才算被读取。
+
+        旧实现用逐键正则保证这一点；改成一次性扫描后仍然要保证：
+        `10371760781` 里含有 `1037176078`，但那不是同一个门。
+        """
+        entries = '1037176078:{rule:"forced",value:!0},'
+        self.assertEqual(core.referenced_entries('read(1037176078)', entries),
+                         '1037176078:{rule:"forced",value:!0},')
+        self.assertEqual(core.referenced_entries('read(91037176078)', entries), '')
+        self.assertEqual(core.referenced_entries('read(10371760781)', entries), '')
+
+    def test_preview_tool_point_and_git_state_gates_are_unlocked(self):
+        """预览指示视图与它的渲染侧另一半、会话 Git/PR 状态巡检。
+
+        都是布尔门，读取点只决定能不能显示，不碰权限、审批或用户数据；
+        官方主表里没有它们，缺省即关闭。
+        """
+        for gate in ('1037176078', '2885273120', '959099749'):
+            self.assertIn(gate + ':{rule:"forced",value:!0},',
+                          core.DISCOVERED_MAIN_GATES)
+
+    def test_display_only_gates_are_unlocked(self):
+        """这一轮逐个读过读取点后加进来的纯显示门。
+
+        通知展示形式、加载失败时的离线小游戏、窗口标题前缀、托盘用量项、
+        AskUserQuestion 预览格式——门的真假只决定画不画或画成什么样子。
+        """
+        for gate in ('879583975', '543332958', '3052534774',
+                     '1109029378', '1412563253'):
+            self.assertIn(gate + ':{rule:"forced",value:!0},',
+                          core.DISCOVERED_MAIN_GATES)
+
+    def test_capability_gates_are_not_unlocked(self):
+        """能力扩张类的门不进来：Artifact 调宿主工具、MCP Apps 面板、
+        远程主机 routines。它们不是“解除部署可用性”，而是新增能力面。"""
+        for gate in ('2864556627', '513873720', '3485864475'):
+            self.assertNotIn(gate, core.DISCOVERED_MAIN_GATES)
+        # 写 MEMORY.md、账号切换、审批自动放行同样不进。
+        for gate in ('1197768857', '96101707', '4200321681'):
+            self.assertNotIn(gate, core.DISCOVERED_MAIN_GATES)
+
+    def test_permission_and_safety_gates_stay_closed(self):
+        """这三个门决不能被“顺手打开”。
+
+        `1447478638` / `4202409342` / `4200321681` 的读取点都在自动放行
+        路径上：值传给 lk() / KO() / HO() 决定要不要跳过用户确认。打开它们
+        等于绕开逐次审批，不是解除部署可用性。
+        """
+        for gate in ('1447478638', '4202409342', '4200321681'):
+            self.assertNotIn(gate, core.DISCOVERED_MAIN_GATES)
+
+    def test_negated_kill_switch_gates_stay_closed(self):
+        """只在取反位置出现的门是开关闸：为真意味着关掉某项保护。"""
+        for gate in ('4293378213', '762798616', '1278239935', '583643792'):
+            self.assertNotIn(gate, core.DISCOVERED_MAIN_GATES)
+
+    def test_dev_build_only_gates_stay_closed(self):
+        """YPr() 包着的门在打包版里恒为 unavailable，写进去也没用。"""
+        for gate in ('1928275548', '3142047527'):
+            self.assertNotIn(gate, core.DISCOVERED_MAIN_GATES)
+
+    def test_tool_disallow_gate_stays_closed(self):
+        """`478602036` 的值会追加进 disallowedTools，是能力裁剪不是显示。"""
+        self.assertNotIn('478602036', core.DISCOVERED_MAIN_GATES)
 
 
 class FingerprintMismatchRefuses(unittest.TestCase):
@@ -394,3 +461,64 @@ class ProtocolVersionIsExplicit(unittest.TestCase):
         self.assertIn('traceback.print_exc()', source)
         self.assertLess(source.index('traceback.print_exc()'),
                         source.index("emit({'error': '操作未完成"))
+
+
+class AdapterCacheDoesNotWeakenFingerprints(unittest.TestCase):
+    """适配器缓存只省掉重复读取，不能变成“被改过也放行”。"""
+
+    def setUp(self):
+        core._ADAPTER_CACHE.clear()
+        core.DISCOVERY_CACHE.clear()
+
+    def tearDown(self):
+        core._ADAPTER_CACHE.clear()
+        core.DISCOVERY_CACHE.clear()
+
+    def _app(self, root):
+        """未登记版本，走现场适配（三条校验都通过）。"""
+        return make_app(root, 'Claude.app', '99.0', SHAPED_SCRIPT)
+
+    def test_changed_asar_invalidates_the_cache_entry(self):
+        """文件一变，缓存的键就不同，不会继续返回旧适配器。"""
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(pathlib.Path(directory).resolve())
+            target = app / official.ASAR
+            with patch.object(core, 'verify_official_signature'):
+                first = core.source_adapter(app)
+                stat = target.stat()
+                data = bytearray(target.read_bytes())
+                data[-1] ^= 0x01          # 改内容，大小不变
+                target.write_bytes(bytes(data))
+                os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+                second = core.source_adapter(app)
+            self.assertIsNot(first, second)
+            self.assertNotEqual(first['asarHash'], second['asarHash'])
+
+    def test_same_file_hits_the_cache(self):
+        """文件没变时不重复读：返回同一个适配器对象。"""
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(pathlib.Path(directory).resolve())
+            with patch.object(core, 'verify_official_signature'):
+                self.assertIs(core.source_adapter(app), core.source_adapter(app))
+
+    def test_content_change_with_same_size_and_mtime_is_caught_on_write(self):
+        """缓存按大小与修改时间判断；两者都没变时缓存命中，
+
+        但真正的写入路径 `verify_source()` 会重新读内容核对 SHA-256。
+        这里模拟“改了内容却把大小和时间都还原”，确认写入前仍然拒绝。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            app = self._app(pathlib.Path(directory).resolve())
+            target = app / official.ASAR
+            with patch.object(core, 'verify_official_signature'):
+                cached = core.source_adapter(app)
+                stat = target.stat()
+                data = bytearray(target.read_bytes())
+                data[-1] ^= 0xFF
+                target.write_bytes(bytes(data))
+                # 把大小和时间都恢复，让缓存键与之前完全一致
+                os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertIs(core.source_adapter(app), cached)   # 确实命中缓存
+                # 写入前必须重新核对内容
+                with self.assertRaises(core.FingerprintMismatch):
+                    core.verify_source(app, cached)

@@ -398,18 +398,73 @@ DISCOVERED_MAIN_GATES = (
  '2371478310:{rule:"forced",value:!0},'
  '857846362:{rule:"forced",value:!0},'
  '2120747855:{rule:"forced",value:!0},'
+ # 预览面板的 tool-point 提示视图。读取点只有一处：Xfi() 里
+ # `if (Zb(gate)) listener(...)`，回调只调 Kpi() 把指示器画到容器上，
+ # 不写任何参数、不碰权限或审批。官方表里没有这个键，缺省即关闭。
+ #
+ # 这一对要一起开：`Yfi("view",...)` 把指示器画到预览容器里，
+ # `Yfi("renderer",...)` 才把工具动作（点击、悬停、滚动、拖拽）的坐标
+ # 送过来。只开 view 那一半，容器建好了却收不到点位，等于没开。
+ # 两个 ID 都只出现在注册表参数里，没有 `Zb("...")` 字面量调用点。
+ '1037176078:{rule:"forced",value:!0},'
+ '2885273120:{rule:"forced",value:!0},'
+ # 会话 Git/PR 状态巡检（ccdGitEngine / sessionPrOwnership 两个界面项
+ # 都由它决定）。回调是只读的 getGitStateSnapshot 与 forge 状态轮询
+ # （headSha、openReviewComments、yourTurn 这些字段），不下发任何写操作。
+ # 同样不在官方表里，缺省关闭。
+ '959099749:{rule:"forced",value:!0},'
+ # 下面五个是这一轮逐个读过读取点后认定的纯显示项。判断口径统一：门的
+
+ # 真假只决定「画不画 / 显示成什么」，不进入权限、审批、沙箱或安全判定，
+ # 也不写用户数据。凡是读取点落在权限链路上的，一律不开（见 docs 里的
+ # 排除清单，读一次就能明白为什么）。
+ #
+ # 通知展示形式：jq() 用它是为了在没显式配 notificationLevels 时，
+ # 从「只弹横幅」或「只点角标」里选一个。返回的是 {banner,badge} 两个布尔。
+ '879583975:{rule:"forced",value:!0},'
+ # 主界面加载失败时的离线小游戏提示。唯一读取点在 u7n() 里：
+ # `e==="load_failed" && c7n() ? {...r, offlineGame:!0} : r`。也就是说
+ # 它只在界面已经加载失败时给错误页多带一个字段，别的地方不读。
+ '543332958:{rule:"forced",value:!0},'
+ # 窗口标题是否带页面标题前缀。qKa() 只有两个引用，都在 JKa() 里，
+ # 结果只喂给 window.setTitle()。
+ '3052534774:{rule:"forced",value:!0},'
+ # 托盘「用量限制」菜单项。y0() 决定是否启动用量轮询并画出那一项；
+ # 服务端没数据时 Rji() 直接返回 false，不产生任何请求之外的动作。
+ '1109029378:{rule:"forced",value:!0},'
+ # AskUserQuestion 的预览用 HTML 还是纯文本：读取点只往 toolConfig 里塞
+ # `previewFormat:"html"`。提问卡片不是审批卡，不经过 permission broker。
+ '1412563253:{rule:"forced",value:!0},'
 )
 
 
-def referenced_entries(javascript, entries):
-    """只保留这一版前端仍在读的键。
+_DIGITS = re.compile(r'(?<![0-9])([0-9]{6,})(?![0-9])')
 
-    补回的开关是给前端按名字查的：前端整版不再读某个键时，补进去只是
-    死条目——既不能恢复功能，也把“补了什么”说得比实际多。所以按整个包
-    的 JS 文本过滤一次，只补还有读取点的键。
+
+def referenced_entries(javascript, entries):
+    """只保留这一版前端还会用到的键。
+
+    补回的开关是给前端按名字查的：前端整版不再提到某个键时，补进去只是
+    死条目——既不能恢复功能，也把“补了什么”说得比实际多。
+
+    判定看的是「这个门号还在不在包里的 JS 文本中」，而不是某个具体的调用
+    形状。这样才不漏：同一个门的读取有四种写法，`Zb("123")`（主 chunk）、
+    `.b2("123")`（其余 chunk 经 `exports.b2` 拿到同一个函数）、先存常量
+    再读 `var X="123"; Zb(X)`（3.9683.0 有 50 个）、以及登记进注册表后被
+    动态取用 `Yfi("renderer","123",fn)`（没有字面量调用点）。只认第一种
+    会把后三种当成死条目。
+
+    代价是这个判定偏宽：门号若只出现在别的数字上下文里也会被保留，于是
+    可能补进一条没人读的死条目。方向是安全的——多写一条无人读取的表项
+    不改变任何行为，而漏掉一条会让本该恢复的功能悄悄不生效。
+
+    实现上不逐个键跑正则：整包 JS 有 3300 多万字符，每个键都从头扫一遍
+    会退化成秒级。先一次性把数字字面量收成集合，再逐个键查表——
+    这样一次遍历就够，键的数量不再影响耗时。
     """
+    seen = set(_DIGITS.findall(javascript))
     kept = [key + ':{' + body + '},' for key, body in split_entries(entries)
-            if re.search(r'(?<![0-9])' + key + r'(?![0-9])', javascript)]
+            if key in seen]
     return ''.join(kept)
 
 
@@ -612,6 +667,12 @@ def web_availability(adapter):
 
 DISCOVERY_CACHE = {}
 
+# ASAR 路径 + 大小 + 修改时间 → 适配器。状态检测每次都要选适配器，而重算
+# 63 MB 的 SHA-256 要一秒多；这个缓存只影响“读”，写入前 `verify_source()`
+# 仍会拿完整内容核对，不会因为缓存而放过被改过的构建。
+_ADAPTER_CACHE = {}
+_ADAPTER_CACHE_LIMIT = 8
+
 
 def discover_adapter(app):
     """未登记版本：按官方身份和功能表结构做**只读**定位。
@@ -703,22 +764,39 @@ def source_adapter(app):
 
     两者都不放松“失败即拒绝”：签名不是官方的、包标识不对、表找不到或
     不唯一、目标门形状冲突，仍然一律停下。
+
+    适配器按 ASAR 的「大小 + 修改时间」缓存：这两个都变才可能换构建。
+    状态检测每次调用都要走这里，而重算 63 MB 的 SHA-256 要一秒多——缓存
+    命中时直接返回，不必再读整份文件。指纹本身没有被削弱：真要写入时
+    `verify_source()` 会拿完整内容重新核对一遍。
     """
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     version = info['CFBundleShortVersionString']
     adapters = adapters_for_version(version)
+    target = app / 'Contents/Resources/app.asar'
     try:
-        b, _, _ = read_asar(app / 'Contents/Resources/app.asar')
+        stat = target.stat()
+    except OSError:
+        raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
+    cache_key = (str(target), stat.st_size, stat.st_mtime_ns)
+    cached = _ADAPTER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        b, _, _ = read_asar(target)
     except Exception:
         raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
     digest = sha(b)
     for adapter in adapters:
         if digest == adapter['asarHash']:
+            _ADAPTER_CACHE[cache_key] = adapter
             return adapter
     if adapters:
         # 同一版本号可能有多种官方构建（universal / arm64）；登记过的都不匹配就是不符。
         raise FingerprintMismatch('ASAR fingerprint mismatch; no patch applied')
-    return discovered_adapter(app)
+    adapter = discovered_adapter(app)
+    _ADAPTER_CACHE[cache_key] = adapter
+    return adapter
 
 
 def discovered_adapter(app):

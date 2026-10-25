@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""一次性设置的只读体检：逐项报告“已就绪 / 待处理 / 无法自动判断”。
+"""本机设置的只读体检：逐项报告“已就绪 / 待处理 / 无法自动判断”。
 
-对应《维护方案 修订版 v2》第六节的一次性设置清单。这个脚本**不改任何东西**：
-不建身份、不装后台作业、不碰钥匙串、不碰系统设置。它只读，给出每项的真实现状
-和下一步该由谁做——能在终端判断的自动判断，需要你在场点一次的明确写出来。
+这个脚本**不改任何东西**：不建身份、不装后台作业、不碰钥匙串、不碰系统设置。
+它只读，给出每项的真实现状和下一步该由谁做——能在终端判断的自动判断，
+需要你在场点一次的明确写出来。
+
+维护代理（独立 CLI、独立配置目录、launchd 后台作业）已于 1.0.0 从项目中移除，
+相应的检查项一并删除。
 
 用法：
     python3 scripts/setup_check.py            # 人读的清单
@@ -154,117 +157,15 @@ def check_assistant_signing():
     return item('assistant_signing', '助手用固定身份签名', READY, '助手与后端都是固定身份')
 
 
-def check_background_job():
-    """固定后台作业：先看有没有登记，不替用户创建。
-
-    已登记还要看定义是否合格：`~/Library/LaunchAgents/` 里的 plist 是
-    launchd 直接读的，手改坏了不会有任何提示，只会静默不按计划跑。
-    """
-    sys.path.insert(0, str(ROOT / 'scripts'))
-    import maintenance_job as job
-    plist = job.INSTALLED
-    if not plist.exists():
-        staged = ('定义已生成，等你批准登记' if job.STAGED.exists()
-                  else '定义还没生成（运行 scripts/maintenance_job.py --write）')
-        return item('background_job', '固定后台作业已登记', PENDING,
-                    f'还没有登记；{staged}',
-                    '先通过零弹窗验证，再把定义拷进 ~/Library/LaunchAgents 并在登录项批准')
-    try:
-        data = plistlib.loads(plist.read_bytes())
-    except Exception:
-        return item('background_job', '固定后台作业已登记', PENDING,
-                    f'{plist.name} 存在但读不出来', '用 scripts/maintenance_job.py 重新生成')
-    problems = job.problems_in(data)
-    if problems:
-        return item('background_job', '固定后台作业已登记', PENDING,
-                    '已登记但定义不合格：' + '；'.join(problems),
-                    '用 scripts/maintenance_job.py 重新生成后覆盖')
-    return item('background_job', '固定后台作业已登记', READY,
-                f'{plist.name}：{data.get("Label", "")}')
-
-
-def check_maintenance_config():
-    """维护代理的独立配置目录、密钥文件和沙箱设置。"""
-    config = pathlib.Path.home() / '.claude-maintenance'
-    if not config.is_dir():
-        return item('maintenance_config', '维护代理有独立配置目录', PENDING,
-                    f'{config} 不存在',
-                    '运行 scripts/maintenance_setup.py --write 生成（不写入任何密钥）')
-    mode = oct(config.stat().st_mode & 0o777)
-    if mode != '0o700':
-        return item('maintenance_config', '维护代理有独立配置目录', PENDING,
-                    f'{config} 权限是 {mode}，应为 0o700',
-                    f'chmod 700 {config}')
-    return item('maintenance_config', '维护代理有独立配置目录', READY, str(config))
-
-
-def check_independent_cli():
-    """维护代理必须用独立安装的官方 CLI，不能用被本项目打过补丁的那份。"""
-    patched = THIRD_PARTY / 'claude-code'
-    candidates = [pathlib.Path.home() / '.local/bin/claude',
-                  pathlib.Path('/opt/homebrew/bin/claude'),
-                  pathlib.Path('/usr/local/bin/claude')]
-    found = next((p for p in candidates if p.exists()), None)
-    if not found:
-        return item('independent_cli', '有独立安装的官方 CLI', UNKNOWN,
-                    '没在常见位置找到 claude 命令')
-    if patched.exists() and patched in found.resolve().parents:
-        return item('independent_cli', '有独立安装的官方 CLI', PENDING,
-                    f'{found} 指向被本项目打过补丁的那份，会和 check_idle() 互相卡住')
-    return item('independent_cli', '有独立安装的官方 CLI', READY, str(found))
-
-
-def check_third_party_denied():
-    """维护代理必须读不到 3P 配置。
-
-    只报告“拒绝规则是否真的覆盖了这个路径”，不靠“配置文件存在”当结论：
-    配置存在不等于规则生效，上一版的教训就是一条无效规则让整份文件不加载。
-    """
-    if not THIRD_PARTY.exists():
-        return item('third_party_denied', '维护代理读不到 3P 配置', READY,
-                    '本机没有 3P 配置目录；拒绝规则仍然在配置里')
-    sys.path.insert(0, str(ROOT / 'scripts'))
-    import maintenance_setup as setup
-    import maintenance_probe as probe
-    try:
-        data = json.loads(setup.SETTINGS_FILE.read_text())
-    except Exception as error:
-        return item('third_party_denied', '维护代理读不到 3P 配置', PENDING,
-                    f'维护代理配置读不出来：{error}',
-                    '运行 scripts/maintenance_setup.py --write 重新生成')
-    deny = data.get('permissions', {}).get('deny', [])
-    rule = probe.rule_matches(deny, 'Read', str(THIRD_PARTY / 'Local State'))
-    if not rule:
-        return item('third_party_denied', '维护代理读不到 3P 配置', PENDING,
-                    '拒绝规则没有覆盖 3P 配置目录',
-                    '运行 scripts/maintenance_setup.py --write 重新生成')
-    return item('third_party_denied', '维护代理读不到 3P 配置', READY, f'由 {rule} 挡住')
-
-
 def check_eagle():
-    """Eagle 素材库永远不进入维护范围。
+    """Eagle 素材库是受保护数据，报告它现在是否挂载。
 
-    盘挂着的时候，唯一挡得住的是拒绝规则本身——所以这里查规则，不查挂载。
+    维护代理已经移除，这里不再查它的拒绝规则；只如实说明盘在不在，
+    免得以后有人以为脚本会碰它。
     """
-    sys.path.insert(0, str(ROOT / 'scripts'))
-    import maintenance_setup as setup
-    import maintenance_probe as probe
-    target = '/Volumes/T7/十六珠宝进姐短视频运营/十六珠宝素材库.library'
-    try:
-        data = json.loads(setup.SETTINGS_FILE.read_text())
-    except Exception as error:
-        return item('eagle_protected', 'Eagle 素材库不在维护范围内', PENDING,
-                    f'维护代理配置读不出来，无法确认挡得住：{error}',
-                    '运行 scripts/maintenance_setup.py --write 重新生成')
-    deny = data.get('permissions', {}).get('deny', [])
-    rule = probe.rule_matches(deny, 'Read', target)
-    if not rule:
-        return item('eagle_protected', 'Eagle 素材库不在维护范围内', PENDING,
-                    '拒绝规则没有覆盖 Eagle 素材库',
-                    '运行 scripts/maintenance_setup.py --write 重新生成')
     mounted = '已挂载' if PROTECTED_VOLUME.exists() else '未挂载'
-    return item('eagle_protected', 'Eagle 素材库不在维护范围内', READY,
-                f'{PROTECTED_VOLUME} {mounted}；由 {rule} 挡住')
+    return item('eagle_protected', 'Eagle 素材库位置', READY,
+                f'{PROTECTED_VOLUME} {mounted}；本工具不读写该位置')
 
 
 def check_screen():
@@ -300,10 +201,6 @@ def collect():
         check_password_location(core),
         check_assistant_signing(),
         check_screen(),
-        check_background_job(),
-        check_maintenance_config(),
-        check_independent_cli(),
-        check_third_party_denied(),
         check_eagle(),
     ]
     counts = {state: sum(1 for c in checks if c['state'] == state)
@@ -324,7 +221,7 @@ def render(result):
     counts = result['counts']
     lines += ['', f"已就绪 {counts[READY]} · 待处理 {counts[PENDING]} · 无法判断 {counts[UNKNOWN]}"]
     if not result['ready']:
-        lines.append('无人值守维护尚未就绪：待处理项完成后重新运行本脚本。')
+        lines.append('还有待处理项：完成后重新运行本脚本。')
     return '\n'.join(lines)
 
 

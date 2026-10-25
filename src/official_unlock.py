@@ -40,7 +40,28 @@ ASAR = 'Contents/Resources/app.asar'
 # revision 14：适配 Desktop 3.6556.2（官方已升到新版）；补回这一版被删掉的
 # 渲染进程默认值：状态分组、每文件夹工作树、PR 自动修复、PR 面板、
 # Code 权限请求分类。渲染进程表改为“形状不同即拒绝”，不覆盖官方 when/follows。
-PATCH_REVISION = 14
+# revision 15：适配 Desktop 3.9683.0；首次处理内嵌 ASAR 完整性校验（重算
+# __DATA_CONST,__asar_integrity 摘要，让校验通过而不是绕过）；打开预览面板
+# tool-point 指示视图与会话 Git/PR 状态巡检两个部署门。
+# revision 16：补上预览指示视图的渲染侧另一半（2885273120），并打开五个
+# 逐个读过读取点的纯显示门：通知展示形式、加载失败时的离线小游戏、
+# 窗口标题前缀、托盘用量项、AskUserQuestion 预览格式。权限/审批/杀开关
+# 一律不碰，见 tests/test_guards.py 里的排除测试。
+# revision 17：Computer Use 基础门只写官方定义的 `enabled`，去掉此前自己
+# 加上的 `appScopedEnabled`。那个子键把 Claude 锁进依赖辅助功能树的后台
+# 模式，导致 Qt/CEF 类应用（剪映等）截图与点击全部失败；去掉后回到官方
+# 默认的全屏工具集，截图走 ScreenCaptureKit、点击走 CGEvent 合成事件，
+# 对所有应用一致可用。
+# revision 18：把保存面板探针的「读不到文档就一律拒绝」收紧成按风险迹象
+# 判断。官方那条兜底分不清「这个应用没有文档概念」和「读不到，可能正对着
+# 敏感文件」，于是 Qt/CEF 应用（不提供 AXDocument）每次点击都被拒。改后
+# 只在真有保存面板/弹窗/受保护目标在场时才拒绝；能读到文档的应用完全不受
+# 影响，它们的受保护路径检查原样保留。
+# revision 19：修掉 revision 18 把 resolvedProtectedTargets 当成风险信号的
+# 错误。那个字段是扫描主目录得到的全机受保护位置清单（查表参数），不是本次
+# 点击的命中结果，恒非空，导致放宽实际没生效、剪映仍然被拒。去掉后 r18 的
+# 意图才真正成立。
+PATCH_REVISION = 19
 
 # 只读诊断会读取这些固定文件；不会读取配置、密钥或会话。
 DIAGNOSTIC_SOURCE_FILES = [
@@ -382,6 +403,55 @@ def repack(original, header, base, replaced):
     return data, header
 
 
+# 官方的「保存面板探针」在每次坐标点击前跑一遍，读窗口正在编辑的文档
+# （AXDocument）。读不到就 fail-closed 拒绝，理由是分不清「这个应用没有
+# 文档概念」和「读不到，可能正对着敏感文件」。
+#
+# Qt / CEF 一类应用（剪映、以及所有 Chromium 外壳）不提供 AXDocument，
+# 于是每一次点击都被这条兜底拒掉。实测对照：Finder、计算器、TextEdit
+# 都能点，只有剪映不行，报的就是 document_read_failed。
+#
+# 这里把兜底收紧成「确实有风险迹象才拒绝」：读不到文档时，只有当保存面板、
+# 另存为弹窗、移动面板、或受保护目标出现在视野里才拒绝；这些都不在场，
+# 说明没有正在进行的保存动作，才放行。能读到文档的应用完全不受影响——
+# 它们的受保护路径检查（documentPathIsProtected）原样保留。
+_OFFICIAL_DOCUMENT_PROBE = (
+    'function Mwr(e){return e.windowDocumentReadFailed?'
+    '{allowed:!1,reason:"document_read_failed"}:'
+    'e.documentPathIsProtected?{allowed:!1,reason:"protected_document"}:'
+    '{allowed:!0}}'
+)
+_RELAXED_DOCUMENT_PROBE = (
+    'function Mwr(e){return e.documentPathIsProtected?'
+    '{allowed:!1,reason:"protected_document"}:'
+    '!e.windowDocumentReadFailed?{allowed:!0}:'
+    # 读不到文档时，只要有任何保存/弹窗迹象就维持官方拒绝。
+    'e.moveSheetIsUp||e.otherWindowHasSaveSheet||e.popoverFolderMenuIsOpen||'
+    'e.popoverTextFieldIsUnreadable||e.popoverHoldsTheFocus||'
+    '(e.sheetIdentifiers??[]).length>0||'
+    '(e.popoverTextFieldValues??[]).length>0||'
+    '(e.popoverPopUpValues??[]).length>0?'
+    '{allowed:!1,reason:"document_read_failed"}:{allowed:!0}}'
+)
+# 不要把 resolvedProtectedTargets 写进上面的风险判断。它来自 dXi()，是扫描
+# 主目录得出的「这台机器上有哪些受保护位置」的常驻清单，作为查表参数传给
+# LG(name, folder, resolvedTargets)；只要机器上存在 .ssh 之类的目录它就非空，
+# 写进去等于永远拒绝（revision 18 就是栽在这里）。它是参照表，不是本次
+# 点击的风险迹象。
+
+
+def relax_document_probe(text):
+    """把官方那层「读不到文档就一律拒绝」的兜底收紧成按风险迹象判断。
+
+    只替换这一处；找不到原文（官方改了写法）就拒绝，不做模糊匹配——
+    改安全判定必须确定改到的是哪一段，猜错等于悄悄关掉保护。
+    """
+    if text.count(_OFFICIAL_DOCUMENT_PROBE) != 1:
+        raise core.BuildRefused(
+            '保存面板探针的形状与登记不一致；停止修改。')
+    return text.replace(_OFFICIAL_DOCUMENT_PROBE, _RELAXED_DOCUMENT_PROBE)
+
+
 def build(app):
     """在应用副本上写入可用性条件，重算 ASAR 完整性并临时签名。
 
@@ -398,8 +468,20 @@ def build(app):
     # Computer Use 基础开关、系统版本上限（按登记范围计算），以及各版本自己
     # 的可用性条件。两张表都只做“不存在才插入”：官方已有相同定义时跳过，
     # 有不同定义时停止——覆盖官方取值等于改官方行为。
+    #
+    # 这里只写官方定义的 `enabled`，不写 `appScopedEnabled`。
+    # `appScopedEnabled` 不是官方字段：`ox("1291166712", …)` 的取值形状由
+    # 服务端 GrowthBook 下发，官方包里没有这个键的任何静态定义。写它等于
+    # 替官方决定「走后台模式」，而后台模式（`appScoped`）的截图走
+    # `appScoped.captureWindow`、点击走 `appScoped.probe`，两者都以目标应用
+    # 的辅助功能树为前提；Qt/CEF 这类应用（剪映、以及所有 Chromium 外壳）
+    # 按需才建树，AX 为空就抛 `No AX window found`，截图和点击一起失效。
+    # 不写这个子键时 `cK()` 返回 false，`getPreferredMode()` 返回 undefined，
+    # Claude 使用官方默认的全屏工具集：截图走 ScreenCaptureKit
+    # （`screenshot.captureRegion`）、点击走 CGEvent 合成鼠标事件，
+    # 不要求目标应用有 AX 树——对所有应用一视同仁。
     entries = core.split_entries(
-        '1291166712:{rule:"forced",value:{enabled:!0,appScopedEnabled:!0}},'
+        '1291166712:{rule:"forced",value:{enabled:!0}},'
         '1346958739:{rule:"forced",value:' + core.system_ceiling(adapter) + '},'
         + core.main_availability(adapter)
     )
@@ -415,6 +497,7 @@ def build(app):
             # 定时任务开关”）。同形状跳过，形状不同一律拒绝，绝不覆盖。
             changed = core.insert_entries(changed, adapter['webFeatureAnchor'],
                                           web_entries, gates, conflict='reject')
+        changed = relax_document_probe(changed)
         # 改完先用系统自带的 JavaScriptCore 只解析被改动的两张表：语法不成立
         # 就绝不安装（找不到检查器同样拒绝）。
         core.check_table_syntax(changed, adapter['featureAnchor'])
@@ -632,9 +715,20 @@ def update():
     if previous is None:
         raise ValueError('缺少安装记录；请先恢复官方原版并重新安装。')
     # 目标已经是补丁版，ASAR 与官方指纹必然不同，不能拿它去认适配器；
-    # 系统范围按安装记录里的版本查。版本没登记就拒绝更新。
-    core.check_platform(
-        core.VERIFIED_SYSTEM.get(previous.get('version') or current.get('version')),
+    # 系统范围按安装记录里的版本算。这里必须和 enable() 用同一套判断：
+    # 登记过的版本按登记表，没登记的（官方刚升级、当时现场适配装上的）
+    # 按本机。只查登记表会让“现场适配装上的旧补丁”永远升不了级——
+    # 版本本来就没登记，查表必然落空。
+    version_key = previous.get('version') or current.get('version')
+    registered = core.VERIFIED_SYSTEM.get(version_key)
+    core.check_system(
+        {'version': version_key,
+         'discovered': registered is None,
+         # `system` 的版本是三元组，和 discovered_adapter() 写入的形状一致；
+         # host_mac_version() 返回的是字符串，不能直接塞进来。
+         'system': (host_machine(),
+                    tuple(int(part) for part in
+                          re.findall(r'\d+', host_mac_version() or ''))[:3])},
         host_machine(), host_mac_version())
 
     backup = verify_backup(previous, current['version'])

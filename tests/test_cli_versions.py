@@ -55,7 +55,6 @@ class CliVersionSelection(unittest.TestCase):
 
     def test_42304_2_desktop_version_is_supported(self):
         """2.42304.2 仍内置 2.1.299 的 CLI 清单，沿用同一个适配器。"""
-        self.assertIn(cli.core.ADAPTER_42304_2['version'], cli.SUPPORTED_DESKTOP_VERSIONS)
         self.add_version('2.1.299', cli.ADAPTER_21299['subdir'])
         desktop = self.root / 'Claude.app'
         (desktop / 'Contents').mkdir(parents=True)
@@ -68,16 +67,45 @@ class CliVersionSelection(unittest.TestCase):
         self.assertTrue(result['supported'])
         self.assertEqual(result['version'], '2.1.299')
 
-    def test_unsupported_desktop_version_has_specific_message(self):
+    def test_unregistered_desktop_version_still_reports_the_cli(self):
+        """桌面端没登记不该让 Code 这一栏失效。
+
+        桌面端版本不是这一栏的准入条件：CLI 补丁认的是 CLI 二进制指纹和
+        官方签名。以前这里是一张固定白名单，官方升一次桌面端就整栏报
+        “尚未适配”，哪怕 CLI 补丁装得好好的。
+        """
         self.add_version('2.1.299', cli.ADAPTER_21299['subdir'])
         desktop = self.root / 'Claude.app'
         (desktop / 'Contents').mkdir(parents=True)
         (desktop / 'Contents/Info.plist').write_bytes(
             plistlib.dumps({'CFBundleShortVersionString': '9.9.9'}))
-        with patch.object(cli.core, 'APP', desktop):
+        self.assertNotIn('9.9.9', cli.core.VERIFIED_SYSTEM)
+        with patch.object(cli.core, 'APP', desktop), \
+             patch.object(cli, 'verify_source'), \
+             patch.object(cli, 'running', return_value=False):
             result = cli.status('test')
-        self.assertFalse(result['supported'])
-        self.assertIn('Desktop 9.9.9 尚未适配', result['message'])
+        self.assertTrue(result['supported'])
+        self.assertEqual(result['desktopVersion'], '9.9.9')
+        self.assertNotIn('尚未适配', result['message'])
+
+    def test_unregistered_desktop_uses_host_system_range(self):
+        """没登记的桌面端按本机系统范围校验，登记过的按登记表。"""
+        desktop = self.root / 'Claude.app'
+        (desktop / 'Contents').mkdir(parents=True)
+        (desktop / 'Contents/Info.plist').write_bytes(
+            plistlib.dumps({'CFBundleShortVersionString': '9.9.9'}))
+        adapter = cli.desktop_adapter(desktop)
+        self.assertTrue(adapter['discovered'])
+        self.assertEqual(adapter['system'][0], cli.host_machine())
+        self.assertEqual(
+            adapter['system'][1],
+            tuple(int(p) for p in cli.host_mac_version().split('.'))[:3])
+        # 登记过的桌面端不标 discovered，系统范围回到登记表。
+        registered = self.root / 'Claude2.app'
+        (registered / 'Contents').mkdir(parents=True)
+        (registered / 'Contents/Info.plist').write_bytes(plistlib.dumps(
+            {'CFBundleShortVersionString': cli.core.ADAPTER_36556['version']}))
+        self.assertFalse(cli.desktop_adapter(registered)['discovered'])
 
 
 if __name__ == '__main__':

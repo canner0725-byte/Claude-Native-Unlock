@@ -171,6 +171,48 @@ class OfficialSafety(unittest.TestCase):
             self.assertEqual(official.update(), current)
             clone.assert_not_called()
 
+    def test_unregistered_version_can_still_be_updated(self):
+        """现场适配装上的旧补丁必须能升级。
+
+        官方升级到没登记的版本时，enable() 会按本机范围现场适配装上补丁；
+        之后 update() 如果只查 VERIFIED_SYSTEM 登记表，那个版本本来就没登记，
+        查表必然落空，会一直报“没有可用的系统范围”而升不了级。两条路径必须
+        用同一套判断。
+        """
+        unregistered = '3.9683.0'
+        self.assertIsNone(official.core.VERIFIED_SYSTEM.get(unregistered))
+        current = {'enabled': True, 'supported': True, 'patchRevision': 14,
+                   'version': unregistered}
+        # 走到 build() 之前就必须已经确认“系统范围可用”。这里让 build 抛一个
+        # 独有异常，用它证明前置检查全部通过；否则异常类型会是 BuildRefused。
+        class ReachedBuild(Exception):
+            pass
+
+        def refuse(_stage):
+            raise ReachedBuild
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            state = root / 'state'
+            state.mkdir()
+            target = root / 'Claude.app'
+            target.mkdir()
+            with patch.object(official, 'status', return_value=current), \
+                 patch.object(official, 'check_idle'), \
+                 patch.object(official, 'prepare_identity'), \
+                 patch.object(official, 'manifest',
+                              return_value={'version': unregistered}), \
+                 patch.object(official, 'verify_backup'), \
+                 patch.object(official, 'verify_patched'), \
+                 patch.object(official, 'build', side_effect=refuse), \
+                 patch.object(official, 'clone'), \
+                 patch.object(official, 'original_build',
+                              return_value={'asarHash': 'x', 'sourceFiles': {}}), \
+                 patch.object(official, 'STATE', state), \
+                 patch.object(official, 'TARGET', target):
+                with self.assertRaises(ReachedBuild):
+                    official.update()
+
     def test_prepare_update_restores_patch_and_keeps_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory).resolve() / 'Claude.app'
@@ -951,6 +993,56 @@ class FeatureTableEditing(unittest.TestCase):
                 official.prune_old_state(keep)
             self.assertEqual(sorted(p.name for p in state.iterdir()),
                              ['official-backup-1.app'])
+
+
+class DocumentProbeRelaxation(unittest.TestCase):
+    """保存面板探针的放行条件必须只放宽「没有保存动作在场」的那一种。
+
+    官方原来的写法是「读不到窗口文档就一律拒绝」。Qt/CEF 类应用不提供
+    AXDocument，于是每次坐标点击都被拒。这里收紧成按风险迹象判断：只有
+    保存面板、另存为弹窗、移动面板、或受保护目标在场时才维持拒绝。
+    """
+
+    def test_only_the_registered_shape_is_rewritten(self):
+        text = 'x' + official._OFFICIAL_DOCUMENT_PROBE + 'y'
+        out = official.relax_document_probe(text)
+        self.assertNotIn(official._OFFICIAL_DOCUMENT_PROBE, out)
+        self.assertIn(official._RELAXED_DOCUMENT_PROBE, out)
+
+    def test_unknown_shape_is_refused(self):
+        """官方改了写法就必须停下，不能猜着改安全判定。"""
+        with self.assertRaises(official.core.BuildRefused):
+            official.relax_document_probe('function Mwr(e){return 1}')
+
+    def test_duplicate_shape_is_refused(self):
+        """出现两次说明匹配到了不该改的地方，同样停下。"""
+        twice = official._OFFICIAL_DOCUMENT_PROBE * 2
+        with self.assertRaises(official.core.BuildRefused):
+            official.relax_document_probe(twice)
+
+    def test_protected_document_still_refused(self):
+        """能读到文档、且路径受保护时，拒绝逻辑原样保留。"""
+        self.assertIn('e.documentPathIsProtected?'
+                      '{allowed:!1,reason:"protected_document"}',
+                      official._RELAXED_DOCUMENT_PROBE)
+
+    def test_save_sheet_still_refused(self):
+        """读不到文档但有保存面板迹象时，仍然拒绝。"""
+        for marker in ['moveSheetIsUp', 'otherWindowHasSaveSheet',
+                       'popoverFolderMenuIsOpen', 'popoverTextFieldIsUnreadable',
+                       'popoverHoldsTheFocus', 'sheetIdentifiers',
+                       'popoverTextFieldValues', 'popoverPopUpValues']:
+            self.assertIn(marker, official._RELAXED_DOCUMENT_PROBE)
+
+    def test_machine_wide_target_list_is_not_a_risk_signal(self):
+        """resolvedProtectedTargets 是查表参数，不是本次点击的命中结果。
+
+        它来自 dXi()，是扫描主目录得出的全机受保护位置清单，机器上有 .ssh
+        之类的目录就恒非空。把它写进风险判断等于永远拒绝——revision 18 就是
+        这么失效的，所以这里反向守住：它不能再出现在放行判定里。
+        """
+        self.assertNotIn('resolvedProtectedTargets',
+                         official._RELAXED_DOCUMENT_PROBE)
 
 
 class FutureBuildCompatibility(unittest.TestCase):

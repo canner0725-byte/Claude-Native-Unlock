@@ -92,14 +92,32 @@ ADAPTER_21308 = {
 ADAPTERS = {adapter['version']: adapter
             for adapter in (ADAPTER_21295, ADAPTER_21299, ADAPTER_21304,
                             ADAPTER_21308)}
-SUPPORTED_DESKTOP_VERSIONS = {
-    core.VERSION,
-    core.ADAPTER_37337['version'],
-    core.ADAPTER_42304['version'],
-    core.ADAPTER_42304_2['version'],
-    core.ADAPTER_31623['version'],
-    core.ADAPTER_36556['version'],
-}
+
+
+def desktop_adapter(desktop):
+    """把桌面端版本包成 `check_system` 认识的最小适配器。
+
+    这里以前是一张固定的桌面版本白名单，不在表里就直接报“尚未适配”。
+    官方每升一次桌面端，Code 这一栏就整体失效，哪怕 CLI 补丁装得好好的
+    —— 和官方补丁 update() 里那个只看登记表的 bug 是同一类。桌面端版本
+    本来就不是这一栏的准入条件：CLI 补丁认的是 CLI 二进制指纹和官方签名，
+    由 `locations()` 选中的 CLI 版本和 `verify_source()` 决定。
+
+    系统范围沿用统一规则：登记过的桌面端读登记表，没登记的按本机
+    （现场适配只在本机、也只装在本机）。
+    """
+    version = plistlib.loads(
+        (desktop / 'Contents/Info.plist').read_bytes()
+    ).get('CFBundleShortVersionString', 'unknown')
+    return {
+        'version': version,
+        'discovered': version not in core.VERIFIED_SYSTEM,
+        # `system` 的版本是三元组，和 discovered_adapter() 写入的形状一致；
+        # host_mac_version() 返回的是字符串，不能直接塞进来。
+        'system': (host_machine(),
+                   tuple(int(part) for part in
+                         re.findall(r'\d+', host_mac_version() or ''))[:3]),
+    }
 
 
 def adapter_for_version(version):
@@ -328,11 +346,8 @@ def status(profile):
         'scope': 'Code Auto-dream availability only (CLI ' + adapter['version'] + ')',
     }
     try:
-        desktop_info = plistlib.loads((desktop / 'Contents/Info.plist').read_bytes())
-        desktop_version = desktop_info.get('CFBundleShortVersionString', 'unknown')
-        if desktop_version not in SUPPORTED_DESKTOP_VERSIONS:
-            result['message'] = 'Desktop ' + desktop_version + ' 尚未适配；停止修改'
-            return result
+        desktop_version = desktop_adapter(desktop)['version']
+        result['desktopVersion'] = desktop_version
         record = read_record(state)
         if record and record.get('version') != adapter['version']:
             raise ValueError('Recovery record version mismatch')
@@ -384,15 +399,12 @@ def enable(profile):
         return current
     if not current['supported'] or current.get('recoveryRequired'):
         raise ValueError('Unsupported or interrupted installation; restore first')
-    # Desktop 更新后不能把旧 CLI 适配器套到新版本。
-    info = plistlib.loads((desktop / 'Contents/Info.plist').read_bytes())
-    desktop_version = info.get('CFBundleShortVersionString', 'unknown')
-    if desktop_version not in SUPPORTED_DESKTOP_VERSIONS:
-        raise ValueError('Desktop ' + desktop_version + ' 尚未适配；停止修改')
+    # Desktop 更新后不能把旧 CLI 适配器套到新版本：适配器由 locations()
+    # 按 CLI 版本选中，指纹由 verify_source() 核对，两者都和桌面端版本无关。
+    adapter_desktop = desktop_adapter(desktop)
     check_idle(target, desktop)
-    # 已验证的系统范围跟着 Desktop 构建登记；CLI 适配器只描述二进制指纹。
-    core.check_platform(core.VERIFIED_SYSTEM.get(desktop_version),
-                        host_machine(), host_mac_version())
+    # 系统范围：登记过的桌面端读登记表，没登记的按本机。
+    core.check_system(adapter_desktop, host_machine(), host_mac_version())
     verify_source(target, adapter)
     if state.stat().st_dev != target.parent.stat().st_dev:
         raise ValueError('Backup must be on the same volume')
@@ -402,7 +414,7 @@ def enable(profile):
     installed = build(stage, state, adapter)
     record = {
         'version': adapter['version'],
-        'desktopVersion': info['CFBundleShortVersionString'],
+        'desktopVersion': adapter_desktop['version'],
         'sourceHash': adapter['sourceHash'],
         'scope': 'availability only; native user switch, timing, permissions and runner unchanged',
         'backup': str(backup),

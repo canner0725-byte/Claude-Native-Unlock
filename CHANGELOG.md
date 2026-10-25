@@ -1,5 +1,87 @@
 # 版本记录
 
+# 1.0.0 · 2026-10-25
+
+## 移除从未启用的维护代理
+
+删除 `scripts/maintenance_setup.py`、`scripts/maintenance_probe.py`、
+`scripts/maintenance_job.py`、`scripts/maintenance_run.sh` 与
+`tests/test_maintenance.py`。这套东西是《维护方案 修订版 v2》里定义的无人值守
+维护代理（独立 CLI、独立 `CLAUDE_CONFIG_DIR`、launchd 后台作业、沙箱拒绝规则），
+按 AGENTS.md 的约定**一直未安装、未授权运行**，本项目暂不需要。
+
+`scripts/setup_check.py` 里与之绑定的四项检查（后台作业、维护配置目录、
+独立 CLI、3P 拒绝规则）一并删除；Eagle 那一项改为只报告挂载状态，不再依赖
+已删除的模块。`setup_check.py` 其余检查（项目位置、签名身份、密码位置、
+助手签名、屏幕状态）保留。
+
+**效果**：公开测试从 337 项变为 307 项，全部通过。此前长期存在的
+`test_maintenance.MaintenanceSettings.test_gateway_is_allowlisted_without_being_written_into_the_repo`
+失败（`gateway_domains()` 含 `127.0.0.1`）随该测试一起消失——它不是被修好的，
+是被移除的；这个功能本身已经不在了。
+
+**未改**：补丁、检测、安装、恢复、更新提醒、界面全部不动，能力没有减少。
+
+# 未发布 · 0.3.48（补丁 revision 19）
+
+## Computer Use：让不提供 `AXDocument` 的应用也能点击（revision 17–19）
+
+**用户报的问题**：剪映等 Qt/CEF 应用在 Computer Use 里点不动，其它应用正常。
+
+**revision 17 —— 根因一：补丁自己造的。** 此前的基础门写成
+`1291166712:{rule:"forced",value:{enabled:!0,appScopedEnabled:!0}}`。
+官方**从来没有定义 `appScopedEnabled`**（官方备份里这个键整条都不存在）。
+`iK()` 只读 `enabled`，`cK()` 读 `appScopedEnabled`，我们那个子键把 Claude
+锁进了依赖辅助功能树的后台模式：截图走 `appScoped.captureWindow`、点击走
+`appScoped.probe`/`dispatchRaw`，Qt/CEF 应用没有 AX 窗口树，于是
+`No AX window found`。改成只写官方定义的 `enabled` 后回到全屏工具集，
+截图走 ScreenCaptureKit、点击走 CGEvent 合成事件。**已验证**：装好后日志为
+`raw={"enabled":true} → enabled=true … appScoped=false`，17 个 `app_*` 后台
+工具消失，`app-cu-helper` 不再运行，剪映截图恢复正常。
+
+**revision 18 —— 根因二：官方那条兜底分不清两类情况。** 即使走全屏工具集，
+坐标点击前仍有 `W()` → `Wt()` → `Gt()` → `e.mA()`（即 `Mwr()`）这一层：
+读不到窗口文档就一律拒绝，理由是“可能正对着敏感文件”。Qt/CEF 应用不提供
+`AXDocument`，`windowDocumentReadFailed` 恒为真，于是每次点击都返回
+“Could not verify which document this window is editing.”。这一层在官方原版里
+就是这么写的，**不是补丁引入的**（已在官方未打补丁的备份里逐字核对）。
+
+按用户明确授权（“改，我接受风险”）把 `Mwr()` 收紧成按风险迹象判断：只有
+保存面板、另存为/移动面板、弹窗文件夹菜单、弹窗文本框不可读或有值、弹窗持有
+焦点、有 sheet 标识时才维持拒绝；这些都不在场才放行。`documentPathIsProtected`
+（编辑受保护路径）原样保留在最前面。
+
+**revision 19 —— 修掉 revision 18 自己的错。** r18 把
+`resolvedProtectedTargets` 也写进了风险条件，结果实机点剪映仍然被拒。查证：
+该字段来自 `fXi()` → `dXi()`，是**扫描主目录得出的全机受保护位置清单**
+（作为查表参数传给 `LG(name, folder, resolvedTargets)`）；机器上有 `.ssh`
+之类的目录它就恒非空。它是参照表，不是本次点击的命中结果。去掉后 r18 的
+意图才真正成立。新增反向测试 `test_machine_wide_target_list_is_not_a_risk_signal`
+守住这一点。
+
+**放宽了什么、保留了什么（如实记录，不写成“只是可用性调整”）**：
+
+- 放宽：窗口文档读不出来、且视野里没有任何保存/弹窗迹象时，从“一律拒绝”
+  改为放行。
+- 保留：能读到文档时，受保护路径照旧拒绝；任何保存面板/另存为/移动面板/
+  弹窗在场时照旧拒绝；逐应用授权、系统权限检查、截图过滤、用户拒绝、
+  中断、动作审查全部未改。
+- 代价：如果某个应用既不提供 `AXDocument`、又正开着一个探针看不见的保存
+  面板，这一次点击可能不被拦。用户已知悉并接受该风险。
+
+**验证状态（已验证，本机实机）**：
+
+- JavaScriptCore 实跑 11 个场景全部符合预期；单元测试新增 6 项；`scripts/state.py --check` 一致。
+- 安装后回读 `/Applications/Claude.app` 的 ASAR，确认 `Mwr()` 里已无
+  `resolvedProtectedTargets`，`patchRevision` 与 `availableRevision` 均为 19。
+- **剪映（Qt/CEF，无 `AXDocument`）实机点击成功**：点左侧「素材」标签，返回
+  `Clicked.`（r17/r18 下是 “Could not verify which document this window is editing.”），
+  界面确实从「音频」面板切到「素材」面板。
+- **普通应用不受影响**：TextEdit 打开合成文本，点击正文 `Clicked.`。
+- **受保护路径仍然拒绝**：TextEdit 打开 `~/.ssh/` 下的合成文件，点击返回
+  “Pointer input into this window is not allowed: it is editing a protected file …”。
+  测试用的合成文件与目录已清理，未触碰用户真实内容。
+
 # 未发布 · 3.9683.0 完整性校验已破解，补丁可正常运行
 
 Claude Desktop 3.9683.0 是第一个真正启用嵌入式 ASAR 完整性校验的版本。校验摘要
@@ -35,6 +117,79 @@ UTF-8 字节，不加分隔符，整体取 SHA-256。对官方 3.9683.0 现算�
 - **待办**：本轮结束时 Claude 仍在运行，**正式安装未执行**——`/Applications/Claude.app`
   仍是官方原版、未打补丁。等 Claude 退出后由助手安装并验收，之后再登记
   `VERIFIED_SYSTEM`。详见 `docs/ASAR_INTEGRITY_39683.md`。
+
+## 修掉 Code 自动整理在未登记桌面端上的假失效
+
+**症状**：桌面端升到 3.9683.0 后，助手的 Code 自动整理一栏显示
+`Desktop 3.9683.0 尚未适配；停止修改`，但 CLI 补丁其实装得好好的
+（`function K4t(){return!0}` 在，原谓词已消失，备份校验通过）。
+
+**根因**：`native_cli_unlock` 里有一张固定的桌面版本白名单
+`SUPPORTED_DESKTOP_VERSIONS`，`status()` 和 `enable()` 都先查它。这和刚修掉的
+`official_unlock.update()` 只看 `VERIFIED_SYSTEM` 是同一类缺陷——把“桌面端
+登记过没有”当成了这一栏的准入条件。
+
+**为什么这个前提本身就不成立**：CLI 补丁认的是 **CLI 二进制的固定指纹**和
+官方签名，由 `locations()` 按 CLI 版本选适配器、`verify_source()` 逐字节核对。
+桌面端版本只决定 CLI 装在哪个目录，不决定补丁能不能打。
+
+**改法**：删掉白名单，换成 `desktop_adapter(desktop)`，把桌面端版本包成
+`check_system()` 认识的最小适配器——登记过的读 `VERIFIED_SYSTEM`，没登记的
+按本机（和 Desktop 补丁同一套规则）。`status()` 现在会回报 `desktopVersion`。
+
+**失败即拒绝没有放松**：CLI 版本未适配、二进制指纹不符、包标识不对、签名不是
+`Q6L2SF6YDW`、系统范围不符，任何一项不成立仍然停下。
+
+**已验证**：本机实跑 `native_cli_unlock status` 从「尚未适配」变成
+`enabled:true / supported:true / desktopVersion:"3.9683.0"`；新增两项回归测试
+（未登记桌面端仍能报出 CLI、系统范围按本机取），`tests/test_cli_versions.py`
+7 项全过；全套 331 项中仅剩改动前就存在的维护网关白名单用例。
+
+## 补丁 revision 16：能开的部署门全开
+
+上一版审计只扫了 `Zb("digits")` 一种读取写法，把表外门说成 76 个；实际有
+四种通道，433 个门号、413 个在表外。重扫之后按「门的真假只决定画不画」
+逐条判定，补丁从 5 个主进程门扩到 **11 个**。
+
+- **修掉的漏判**：同一版包里，其余 70 多个 chunk 是通过 `exports.b2` 拿到
+  同一个读门函数的（带缺省值的叫 `Qb` / `x2`），另有 50 个键先存常量再读，
+  还有 2 个只以 `Yfi("view"/"renderer","id",fn)` 登记进注册表。只认
+  `Zb("…")` 会漏掉 234 个键。
+- **缺省语义决定是不是封印**：`Zb` 缺省返回 false（真封印），
+  `Qb(id,!0)` 缺省返回 true（本来就开着，写了没意义）。本版封印集合 319 个。
+- **新增 6 个门**（每个都读过全部读取点）：
+  - `2885273120` —— 预览 tool-point 指示的渲染侧，是 `1037176078` 的成对
+    另一半；只开 view 那一半，容器建好却收不到工具动作坐标。
+  - `879583975` —— 通知展示形式（横幅 / 角标）。
+  - `543332958` —— 主界面加载失败时的离线小游戏提示。
+  - `3052534774` —— 窗口标题是否带页面标题前缀。
+  - `1109029378` —— 托盘「用量限制」菜单项。
+  - `1412563253` —— AskUserQuestion 预览用 HTML 还是纯文本。
+- **明确不开的**：`4200321681` / `1447478638` / `4202409342` 三个的读取点都在
+  `{behavior:"allow"}` 之前，打开等于绕开逐次审批；只在取反位置出现的 16 个
+  是开关闸；`1928275548` / `3142047527` 被 `YPr()` 包着，打包版恒 unavailable；
+  `478602036` 的值会追加进 `disallowedTools`，是能力裁剪。全部写进
+  `tests/test_guards.py` 的排除测试，防止以后被“顺手打开”。
+- **顺带核实**：`dYt()` 在本版恒返回空 Set，`CLAUDE_DEV_FORCE_GATES` 环境变量
+  通道已失效，写表是唯一可行路径。
+- **已验证（官方原版副本实测）**：`build()` 插入 11 个、覆盖 **0 个**、跳过 2 个
+  （官方已是同形状 `forced:!0`）；回读改后 ASAR 的 13 个目标键全部解析成预期
+  值，表条目 141 → 152；`Info.plist` 的 `ElectronAsarIntegrity` 哈希与 ASAR 头
+  现算值一致；两处 `__asar_integrity` 节哨兵匹配、摘要与 plist 现算值一致；
+  `codesign -v` 对主包与 4 个 Helper 全部通过。
+- **已验证（安装后运行时，同日补做）**：补丁经助手自己的「更新补丁」流程装进
+  `/Applications/Claude.app`（`official_unlock update exit=0`，一次成功，无重试）。
+  从装好的包里现读 `$ln` 表、用系统 JavaScriptCore 按运行时 `Zb()` 语义求值，
+  **13/13 个门全部为真**。Computer Use 链路完整：`[chicago] → enabled=true`，
+  `cu-live-preview` / `cu-side-panel` / `cu-esc` / `cu-app-indicator` / `cu-glow` /
+  `cu-teach` / `cu-notifications` 全部 initialized，`computer_use.node` 加载成功。
+  `IP()` 快照里 `askUserQuestionHtmlPreview` 与 `promptSuggestionsSetting` 为 true。
+  托盘用量监听器与 `plan-usage-tray-open`、`githubPollTelemetrySummary` 处理器均已注册。
+  辅助功能权限保持 enabled，无重新授权提示。
+- **未验证**：窗口标题前缀的实际标题文本（无屏幕录制授权，读不到 `kCGWindowName`）；
+  通知形式与离线小游戏（触发条件本轮未发生）；预览 tool-point 指示器的可见效果
+  （未构造真实工具动作场景）；Computer Use 实机截图点击（本会话工具禁止操作
+  Claude 自身窗口）。
 
 # 0.3.44 — 2026-10-25
 
